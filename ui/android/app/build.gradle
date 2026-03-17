@@ -1,0 +1,5 @@
+dependencies {
+    implementation(fileTree(dir: 'libs', include: ['*.aar']))
+    implementation("io.libp2p:jvm-libp2p:1.2.2-RELEASE")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.1")
+}
