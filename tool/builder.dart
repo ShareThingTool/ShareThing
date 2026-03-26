@@ -1,10 +1,11 @@
 import 'dart:io';
+import 'dart:ffi';
 import 'package:path/path.dart' as p;
 import 'package:http/http.dart' as http; 
 import 'package:archive/archive_io.dart'; 
 
 void main(List<String> args) async {
-  final target = args.isNotEmpty ? args[0] : 'linux-x64';
+  final target = args.isNotEmpty ? args[0] : _detectHostTarget();
   final platform = target.split('-')[0];
   final arch = target.contains('-') ? target.split('-')[1] : 'x64';
 
@@ -17,7 +18,7 @@ void main(List<String> args) async {
   final flutterContext = await resolveFlutter("ui");
 
   List<String> buildArgs = [];
-  
+
   if (flutterContext.args.contains("flutter")) {
     buildArgs.add("flutter");
   }
@@ -29,11 +30,29 @@ void main(List<String> args) async {
 
   await run("Building Flutter UI", flutterContext.executable, buildArgs, dir: "ui");
   await injectJRE(target);
-  
+
 
   print("\n------------------------------------------");
   print("Build Complete!");
   print("Find your app in: ui/build/$platform/$arch/release/bundle\n");
+}
+
+String _detectHostTarget() {
+  String platform;
+  if (Platform.isMacOS) {
+    platform = 'mac';
+  } else if (Platform.isLinux) {
+    platform = 'linux';
+  } else if (Platform.isWindows) {
+    platform = 'windows';
+  } else {
+    throw UnsupportedError('Unsupported platform');
+  }
+
+  final abi = Abi.current().toString().toLowerCase();
+  final arch = abi.contains('arm') ? 'aarch64' : 'x64';
+
+  return '$platform-$arch';
 }
 
 class ToolContext {

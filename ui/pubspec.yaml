@@ -23,5 +23,3 @@ flutter:
   uses-material-design: true
   assets:
     - assets/engine/p2p_engine.jar
-
-

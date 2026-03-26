@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:path/path.dart' as p;
+import 'package:flutter/services.dart';
 
 class EngineManager {
 
@@ -13,11 +14,18 @@ class EngineManager {
 
   Process? _engineProcess;
   final Map<String, Completer<Map<String, dynamic>>> _pendingRequests = {};
-  
+
   final _eventController = StreamController<Map<String, dynamic>>.broadcast();
   Stream<Map<String, dynamic>> get updates => _eventController.stream;
 
   bool get isAlive => _engineProcess != null;
+
+  Future<String> _prepareJar() async {
+    final bytes = await rootBundle.load('assets/engine/p2p_engine.jar');
+    final file = File('${Directory.systemTemp.path}/p2p_engine.jar');
+    await file.writeAsBytes(bytes.buffer.asUint8List());
+    return file.path;
+  }
 
   Future<void> start() async {
     if (isAlive) {
@@ -25,9 +33,49 @@ class EngineManager {
       return;
     }
 
-    final String rootDir = p.dirname(Platform.resolvedExecutable);
-    final String javaBin = p.join(rootDir, 'data', 'flutter_assets', 'assets', 'jre', 'bin', Platform.isWindows ? 'java.exe' : 'java');
-    final String jarPath = p.join(rootDir, 'data', 'flutter_assets', 'assets', 'engine', 'p2p_engine.jar');
+    final String jarPath = await _prepareJar();
+
+    Future<String?> findSystemJava() async {
+      try {
+        final javaHome = Platform.environment['JAVA_HOME'];
+        if (javaHome != null && javaHome.isNotEmpty) {
+          final candidate = p.join(javaHome, 'bin', 'java');
+          if (await File(candidate).exists()) {
+            return candidate;
+          }
+        }
+
+        if (Platform.isMacOS) {
+          var result = await Process.run('/usr/libexec/java_home', ['-v', '17']);
+          var javaHome = (result.stdout as String).trim();
+
+          if (javaHome.isEmpty) {
+            result = await Process.run('/usr/libexec/java_home', []);
+            javaHome = (result.stdout as String).trim();
+          }
+
+          if (javaHome.isNotEmpty) {
+            final candidate = p.join(javaHome, 'bin', 'java');
+            return candidate;
+          }
+        }
+
+        final result = await Process.run('/usr/bin/java', ['-version']);
+        final output = (result.stderr as String);
+        if (output.contains('17')) return '/usr/bin/java';
+      } catch (_) {}
+
+      return null;
+    }
+
+    final String? systemJava = await findSystemJava();
+    print("SYSTEM JAVA DETECTED: $systemJava");
+
+    if (systemJava == null) {
+      throw Exception("Java 17 not found on system. Aborting instead of using broken bundled JRE.");
+    }
+
+    final String javaBin = systemJava;
 
     print("$blue DEBUG:$reset [Engine] Booting JAR at: $jarPath");
     print("$blue DEBUG:$reset [Engine] Using JRE at: $javaBin");
@@ -40,16 +88,16 @@ class EngineManager {
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen((line) {
-            print("$green INCOMING $reset: $line"); 
-            _handleIncomingMessage(line);
-          });
+        print("$green INCOMING $reset: $line");
+        _handleIncomingMessage(line);
+      });
 
       _engineProcess!.stderr
           .transform(utf8.decoder)
           .transform(const LineSplitter())
           .listen((line) {
-            print("$red KOTLIN STDERR $reset: $line");
-          });
+        print("$red KOTLIN STDERR $reset: $line");
+      });
 
       _engineProcess!.exitCode.then((code) {
         print("$blue DEBUG: $reset [Engine] Process exited with code: $code");
@@ -93,7 +141,7 @@ class EngineManager {
 
     final request = {'requestId': id, 'type': type, ...?params};
     final rawJson = jsonEncode(request);
-    
+
     print("OUTGOING (ID: $id): $rawJson");
 
     if (_engineProcess != null) {

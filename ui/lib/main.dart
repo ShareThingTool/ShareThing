@@ -42,7 +42,7 @@ class _ShareThingAppState extends State<ShareThingApp> {
     _engineManager.stop();
     super.dispose();
   }
-
+ 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
