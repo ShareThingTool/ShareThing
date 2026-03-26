@@ -13,6 +13,8 @@ class EngineManager {
   static const String reset = '\u001b[0m';
 
   Process? _engineProcess;
+  Socket? _socket;
+  StreamSubscription? _socketSub;
   final Map<String, Completer<Map<String, dynamic>>> _pendingRequests = {};
 
   final _eventController = StreamController<Map<String, dynamic>>.broadcast();
@@ -139,7 +141,57 @@ class EngineManager {
     }
   }
 
-  Future<Map<String, dynamic>> sendCommand(String type, [Map<String, dynamic>? params]) {
+  Future<Map<String, dynamic>> sendCommand(String type, [Map<String, dynamic>? params]) async {
+    print("SENDING COMMAND: $type with $params");
+    if (Platform.isAndroid) {
+      if (_socket == null) {
+        _socket = await Socket.connect('127.0.0.1', 4001);
+
+        _socketSub = _socket!
+            .cast<List<int>>()
+            .transform(utf8.decoder)
+            .transform(const LineSplitter())
+            .listen((line) {
+              try {
+                final msg = jsonDecode(line);
+                if (msg is Map<String, dynamic>) {
+                  if (msg.containsKey("requestId")) {
+                    final id = msg["requestId"];
+                    if (_pendingRequests.containsKey(id)) {
+                      _pendingRequests[id]!.complete(msg);
+                      _pendingRequests.remove(id);
+                    }
+                  } else {
+                    _eventController.add(msg);
+                  }
+                }
+              } catch (e) {
+                print("Socket parse error: $e");
+              }
+            });
+      }
+
+      final id = DateTime.now().microsecondsSinceEpoch.toString();
+      final completer = Completer<Map<String, dynamic>>();
+      _pendingRequests[id] = completer;
+
+      final payload = {
+        "requestId": id,
+        "type": type,
+        if (params != null) ...params,
+      };
+
+      _socket!.writeln(jsonEncode(payload));
+
+      return completer.future.timeout(
+        const Duration(seconds: 10),
+        onTimeout: () {
+          _pendingRequests.remove(id);
+          throw TimeoutException("Engine failed to respond to $type");
+        },
+      );
+    }
+
     final id = DateTime.now().microsecondsSinceEpoch.toString();
     final completer = Completer<Map<String, dynamic>>();
     _pendingRequests[id] = completer;
@@ -166,19 +218,38 @@ class EngineManager {
     );
   }
 
+  Future<void> sendFile(String path, String peerAddr) async {
+    final file = File(path);
+    final bytes = await file.readAsBytes();
+
+    final encoded = base64Encode(bytes);
+    final name = file.uri.pathSegments.last;
+
+    await sendCommand("connect", {
+      "multiaddr": peerAddr,
+      "type": "send_file",
+      "filename": name,
+      "data": encoded,
+    });
+  }
+
   void stop() {
     if (_engineProcess != null) {
       print("$blue DEBUG: $reset [Engine]  Stopping process...");
       _engineProcess!.kill();
       _engineProcess = null;
+      _socketSub?.cancel();
+      _socket?.destroy();
+      _socket = null;
     }
   }
 
   Future<void> _startViaPlatformChannel() async {
-    const platform = MethodChannel('engine');
+    final platform = MethodChannel('engine');
 
     try {
-      await platform.invokeMethod('startEngine');
+      final result = await platform.invokeMethod('startEngine');
+      print("Engine result: $result");
     } catch (e) {
       print("Platform channel error: $e");
     }
