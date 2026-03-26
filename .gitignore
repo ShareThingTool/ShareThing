@@ -38,6 +38,7 @@ ui/ios/.generated/
 ui/linux/flutter/ephemeral/
 ui/windows/flutter/ephemeral/
 ui/macos/Flutter/ephemeral/
+ui/macos/jre/
 
 *.so
 *.apk

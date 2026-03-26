@@ -33,6 +33,11 @@ class EngineManager {
       return;
     }
 
+    if (Platform.isAndroid) {
+      await _startViaPlatformChannel();
+      return;
+    }
+
     final String jarPath = await _prepareJar();
 
     Future<String?> findSystemJava() async {
@@ -166,6 +171,16 @@ class EngineManager {
       print("$blue DEBUG: $reset [Engine]  Stopping process...");
       _engineProcess!.kill();
       _engineProcess = null;
+    }
+  }
+
+  Future<void> _startViaPlatformChannel() async {
+    const platform = MethodChannel('engine');
+
+    try {
+      await platform.invokeMethod('startEngine');
+    } catch (e) {
+      print("Platform channel error: $e");
     }
   }
 }
