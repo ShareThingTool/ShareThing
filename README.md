@@ -52,7 +52,7 @@ Before running the UI, you must compile the Kotlin engine to generate the necess
     flutter run
     ```
 
-    ### 🤖 Building the Android Engine (go-libp2p)
+### 🤖 Building the Android Engine (go-libp2p)
 
 Android does not support JVM-based libp2p, so a separate Go bridge is used instead.
 This must be built once and copied into the Flutter project before running on Android.
