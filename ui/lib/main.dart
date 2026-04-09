@@ -129,6 +129,10 @@ class _MyHomePageState extends State<MyHomePage> {
       final id = await widget.engine.sendCommand('get_id');
       final port = await widget.engine.sendCommand('get_port');
 
+      print("ID RESPONSE: $id");
+      print("PORT RESPONSE: $port");
+
+
       setState(() {
         _nodeId = id['data'];
         _port = port['data'].toString();
@@ -219,23 +223,20 @@ class _MyHomePageState extends State<MyHomePage> {
         onPressed: () async {
           try {
             if (_running) {
-              await widget.engine.sendCommand("stop_node");
-
-              setState(() {
-                _nodeId = "Unknown";
-                _running = false;
-              });
+              setState(() { _running = false; _nodeId = "Unknown"; });
             } else {
               await widget.engine.start();
-              await widget.engine.sendCommand('start_node', {'port': 4001});
 
-              final response = await widget.engine.sendCommand('get_id');
+              final id = await widget.engine.sendCommand('get_id');
               final port = await widget.engine.sendCommand('get_port');
+
+              print("ID RESPONSE: $id");
+              print("PORT RESPONSE: $port");
 
               setState(() {
                 _running = true;
-                _nodeId = response['data'] ?? "Error";
-                _port = port['data']?.toString() ?? "0";
+                _nodeId = id['data'] ?? "Unknown";
+                _port = port['data']?.toString() ?? "Unknown";
               });
             }
           } catch (e) {

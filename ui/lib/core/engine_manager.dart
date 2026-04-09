@@ -6,252 +6,146 @@ import 'package:flutter/services.dart';
 
 class EngineManager {
 
-  static const String red = '\u001b[31m';
-  static const String green = '\u001b[32m';
-  static const String blue = '\u001b[34m';
-  static const String yellow = '\u001b[33m';
-  static const String reset = '\u001b[0m';
+  static const _channel = MethodChannel('engine');
 
+  // Desktop only
   Process? _engineProcess;
-  Socket? _socket;
-  StreamSubscription? _socketSub;
   final Map<String, Completer<Map<String, dynamic>>> _pendingRequests = {};
 
   final _eventController = StreamController<Map<String, dynamic>>.broadcast();
   Stream<Map<String, dynamic>> get updates => _eventController.stream;
 
-  bool get isAlive => _engineProcess != null;
+  bool get isAlive => Platform.isAndroid ? _androidStarted : _engineProcess != null;
+  bool _androidStarted = false;
 
-  Future<String> _prepareJar() async {
-    final bytes = await rootBundle.load('assets/engine/p2p_engine.jar');
-    final file = File('${Directory.systemTemp.path}/p2p_engine.jar');
-    await file.writeAsBytes(bytes.buffer.asUint8List());
-    return file.path;
-  }
+  // ─── Start ────────────────────────────────────────────────────────────────
 
   Future<void> start() async {
-    if (isAlive) {
-      print("$blue DEBUG: [Engine] Start requested, but engine is already alive.");
-      return;
-    }
-
     if (Platform.isAndroid) {
-      await _startViaPlatformChannel();
+      if (_androidStarted) return;
+      final result = await _channel.invokeMethod<Map>('startEngine');
+      print("Engine result: $result");
+      _androidStarted = true;
+
+      await Future.delayed(const Duration(seconds: 2));
+      _eventController.add({'type': 'event', 'event': 'node_started'});
       return;
     }
 
-    final String jarPath = await _prepareJar();
-
-    Future<String?> findSystemJava() async {
-      try {
-        final javaHome = Platform.environment['JAVA_HOME'];
-        if (javaHome != null && javaHome.isNotEmpty) {
-          final candidate = p.join(javaHome, 'bin', 'java');
-          if (await File(candidate).exists()) {
-            return candidate;
-          }
-        }
-
-        if (Platform.isMacOS) {
-          var result = await Process.run('/usr/libexec/java_home', ['-v', '17']);
-          var javaHome = (result.stdout as String).trim();
-
-          if (javaHome.isEmpty) {
-            result = await Process.run('/usr/libexec/java_home', []);
-            javaHome = (result.stdout as String).trim();
-          }
-
-          if (javaHome.isNotEmpty) {
-            final candidate = p.join(javaHome, 'bin', 'java');
-            return candidate;
-          }
-        }
-
-        final result = await Process.run('/usr/bin/java', ['-version']);
-        final output = (result.stderr as String);
-        if (output.contains('17')) return '/usr/bin/java';
-      } catch (_) {}
-
-      return null;
-    }
-
-    final String? systemJava = await findSystemJava();
-    print("SYSTEM JAVA DETECTED: $systemJava");
-
-    if (systemJava == null) {
-      throw Exception("Java 17 not found on system. Aborting instead of using broken bundled JRE.");
-    }
-
-    final String javaBin = systemJava;
-
-    print("$blue DEBUG:$reset [Engine] Booting JAR at: $jarPath");
-    print("$blue DEBUG:$reset [Engine] Using JRE at: $javaBin");
-
-    try {
-      _engineProcess = await Process.start(javaBin, ['-jar', jarPath]);
-      print("$blue DEBUG: $reset [Engine] Process started. PID: ${_engineProcess!.pid}");
-
-      _engineProcess!.stdout
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .listen((line) {
-        print("$green INCOMING $reset: $line");
-        _handleIncomingMessage(line);
-      });
-
-      _engineProcess!.stderr
-          .transform(utf8.decoder)
-          .transform(const LineSplitter())
-          .listen((line) {
-        print("$red KOTLIN STDERR $reset: $line");
-      });
-
-      _engineProcess!.exitCode.then((code) {
-        print("$blue DEBUG: $reset [Engine] Process exited with code: $code");
-        _engineProcess = null;
-        _eventController.add({'type': 'engine_stopped', 'exitCode': code});
-      });
-    } catch (e) {
-      print("$blue DEBUG: $reset [Engine] Failed to start process: $e");
-      _eventController.add({'type': 'error', 'message': e.toString()});
-    }
-  }
-
-  void _handleIncomingMessage(String line) {
-    if (line.trim().isEmpty) return;
-
-    try {
-      final Map<String, dynamic> msg = jsonDecode(line);
-      final String? id = msg['requestId'];
-
-      if (id != null) {
-        if (_pendingRequests.containsKey(id)) {
-          print("$blue DEBUG: $reset [Bridge] Completing request ID: $id");
-          _pendingRequests[id]!.complete(msg);
-          _pendingRequests.remove(id);
-        } else {
-          print("$blue DEBUG: $reset [Bridge] Received response for unknown/expired ID: $id");
-        }
-      } else {
-        print("$blue DEBUG: $reset [Bridge] Processing spontaneous event: ${msg['type']}");
-        _eventController.add(msg);
-      }
-    } catch (e) {
-      print("$blue DEBUG: $reset [Bridge] Non-JSON or Malformed output: $line");
-    }
+    if (_engineProcess != null) return;
+    await _startDesktopProcess();
   }
 
   Future<Map<String, dynamic>> sendCommand(String type, [Map<String, dynamic>? params]) async {
     print("SENDING COMMAND: $type with $params");
+
     if (Platform.isAndroid) {
-      if (_socket == null) {
-        _socket = await Socket.connect('127.0.0.1', 4001);
-
-        _socketSub = _socket!
-            .cast<List<int>>()
-            .transform(utf8.decoder)
-            .transform(const LineSplitter())
-            .listen((line) {
-              try {
-                final msg = jsonDecode(line);
-                if (msg is Map<String, dynamic>) {
-                  if (msg.containsKey("requestId")) {
-                    final id = msg["requestId"];
-                    if (_pendingRequests.containsKey(id)) {
-                      _pendingRequests[id]!.complete(msg);
-                      _pendingRequests.remove(id);
-                    }
-                  } else {
-                    _eventController.add(msg);
-                  }
-                }
-              } catch (e) {
-                print("Socket parse error: $e");
-              }
-            });
-      }
-
-      final id = DateTime.now().microsecondsSinceEpoch.toString();
-      final completer = Completer<Map<String, dynamic>>();
-      _pendingRequests[id] = completer;
-
-      final payload = {
-        "requestId": id,
-        "type": type,
-        if (params != null) ...params,
-      };
-
-      _socket!.writeln(jsonEncode(payload));
-
-      return completer.future.timeout(
-        const Duration(seconds: 10),
-        onTimeout: () {
-          _pendingRequests.remove(id);
-          throw TimeoutException("Engine failed to respond to $type");
-        },
-      );
+      // All commands go through the MethodChannel — no sockets
+      final args = <String, dynamic>{'type': type, ...?params};
+      final result = await _channel.invokeMethod<Map>('command', args);
+      return Map<String, dynamic>.from(result ?? {});
     }
 
+    // Desktop: send JSON over stdin
     final id = DateTime.now().microsecondsSinceEpoch.toString();
     final completer = Completer<Map<String, dynamic>>();
     _pendingRequests[id] = completer;
 
     final request = {'requestId': id, 'type': type, ...?params};
-    final rawJson = jsonEncode(request);
-
-    print("OUTGOING (ID: $id): $rawJson");
-
-    if (_engineProcess != null) {
-      _engineProcess!.stdin.writeln(rawJson);
-    } else {
-      print("$blue DEBUG: $reset [Bridge] Attempted to send command while engine was null.");
-      completer.completeError("Engine not running");
-    }
+    _engineProcess?.stdin.writeln(jsonEncode(request));
 
     return completer.future.timeout(
       const Duration(seconds: 10),
       onTimeout: () {
-        print("$blue DEBUG: [Bridge] $reset TIMEOUT waiting for response to ID: $id");
         _pendingRequests.remove(id);
         throw TimeoutException("Engine failed to respond to $type in 10s");
       },
     );
   }
 
+  // ─── Send file ────────────────────────────────────────────────────────────
+
   Future<void> sendFile(String path, String peerAddr) async {
     final file = File(path);
     final bytes = await file.readAsBytes();
-
     final encoded = base64Encode(bytes);
     final name = file.uri.pathSegments.last;
 
-    await sendCommand("connect", {
+    await sendCommand("send_file", {
       "multiaddr": peerAddr,
-      "type": "send_file",
       "filename": name,
       "data": encoded,
     });
   }
 
+  // ─── Stop ─────────────────────────────────────────────────────────────────
+
   void stop() {
-    if (_engineProcess != null) {
-      print("$blue DEBUG: $reset [Engine]  Stopping process...");
-      _engineProcess!.kill();
+    if (Platform.isAndroid) {
+      _androidStarted = false;
+      return;
+    }
+    _engineProcess?.kill();
+    _engineProcess = null;
+  }
+
+  // ─── Desktop process (macOS/Linux) ────────────────────────────────────────
+
+  Future<void> _startDesktopProcess() async {
+    final bytes = await rootBundle.load('assets/engine/p2p_engine.jar');
+    final file = File('${Directory.systemTemp.path}/p2p_engine.jar');
+    await file.writeAsBytes(bytes.buffer.asUint8List());
+
+    final javaBin = await _findJava();
+    if (javaBin == null) throw Exception("Java 17 not found");
+
+    _engineProcess = await Process.start(javaBin, ['-jar', file.path]);
+
+    _engineProcess!.stdout
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen(_handleDesktopMessage);
+
+    _engineProcess!.stderr
+        .transform(utf8.decoder)
+        .transform(const LineSplitter())
+        .listen((line) => print("ENGINE STDERR: $line"));
+
+    _engineProcess!.exitCode.then((code) {
       _engineProcess = null;
-      _socketSub?.cancel();
-      _socket?.destroy();
-      _socket = null;
+      _eventController.add({'type': 'engine_stopped', 'exitCode': code});
+    });
+  }
+
+  void _handleDesktopMessage(String line) {
+    if (line.trim().isEmpty) return;
+    try {
+      final msg = jsonDecode(line) as Map<String, dynamic>;
+      final id = msg['requestId'] as String?;
+      if (id != null && _pendingRequests.containsKey(id)) {
+        _pendingRequests[id]!.complete(msg);
+        _pendingRequests.remove(id);
+      } else {
+        _eventController.add(msg);
+      }
+    } catch (_) {
+      print("ENGINE: $line");
     }
   }
 
-  Future<void> _startViaPlatformChannel() async {
-    final platform = MethodChannel('engine');
-
+  Future<String?> _findJava() async {
     try {
-      final result = await platform.invokeMethod('startEngine');
-      print("Engine result: $result");
-    } catch (e) {
-      print("Platform channel error: $e");
-    }
+      final home = Platform.environment['JAVA_HOME'];
+      if (home != null) {
+        final candidate = p.join(home, 'bin', 'java');
+        if (await File(candidate).exists()) return candidate;
+      }
+      if (Platform.isMacOS) {
+        final r = await Process.run('/usr/libexec/java_home', ['-v', '17']);
+        final home = (r.stdout as String).trim();
+        if (home.isNotEmpty) return p.join(home, 'bin', 'java');
+      }
+    } catch (_) {}
+    return null;
   }
 }
