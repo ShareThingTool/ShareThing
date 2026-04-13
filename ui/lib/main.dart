@@ -1,48 +1,19 @@
-import 'package:flutter/material.dart';
-import 'dart:ui';
+import 'dart:async';
 import 'dart:io';
+
+import 'package:flutter/material.dart';
+
 import 'core/engine_manager.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
-  runApp(const ShareThingApp());
+  runApp(ShareThingApp());
 }
 
-class ShareThingApp extends StatefulWidget {
-  const ShareThingApp({super.key});
+class ShareThingApp extends StatelessWidget {
+  ShareThingApp({super.key, EngineManager? engine}) : engine = engine ?? EngineManager();
 
-  @override
-  State<ShareThingApp> createState() => _ShareThingAppState();
-}
-
-class _ShareThingAppState extends State<ShareThingApp> {
-  final EngineManager _engineManager = EngineManager();
-  late final AppLifecycleListener _lifecycleListener;
-
-  @override
-  void initState() {
-    super.initState();
-    _startEngine();
-
-    _lifecycleListener = AppLifecycleListener(
-      onExitRequested: () async {
-        _engineManager.stop();
-        return AppExitResponse.exit;
-      },
-    );
-  }
-
-  Future<void> _startEngine() async {
-    await _engineManager.start();
-    if (mounted) setState(() {});
-  }
-
-  @override
-  void dispose() {
-    _lifecycleListener.dispose();
-    _engineManager.stop();
-    super.dispose();
-  }
+  final EngineManager engine;
 
   @override
   Widget build(BuildContext context) {
@@ -52,198 +23,298 @@ class _ShareThingAppState extends State<ShareThingApp> {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueGrey),
         useMaterial3: true,
       ),
-      home: MyHomePage(engine: _engineManager),
+      home: MyHomePage(engine: engine),
     );
   }
 }
+
 class MyHomePage extends StatefulWidget {
-  final EngineManager engine;
   const MyHomePage({super.key, required this.engine});
+
+  final EngineManager engine;
 
   @override
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  bool _running = false;
-  String _nodeId = "Unknown";
-  String _port = "0";
   final TextEditingController _peerController = TextEditingController();
-  String _localIp = "Unknown";
+  StreamSubscription<Map<String, dynamic>>? _engineSubscription;
+
+  bool _running = false;
+  bool _busy = true;
+  String _nodeId = 'Unavailable';
+  String _endpoint = 'Unavailable';
+  String _localIp = 'Unavailable';
+  String? _statusMessage = 'Starting engine...';
+  String? _errorMessage;
 
   @override
   void initState() {
     super.initState();
-
-    widget.engine.updates.listen((event) {
-      if (!mounted) return;
-
-      if (event['type'] == 'event') {
-        if (event['event'] == 'node_started') {
-          setState(() {
-            _running = true;
-          });
-        }
-
-        if (event['event'] == 'node_stopped') {
-          setState(() {
-            _running = false;
-          });
-        }
-
-        if (event['event'] == 'file_received') {
-          final name = event['filename'] ?? "unknown";
-          print("File received: $name");
-
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Received file: $name")),
-          );
-        }
-      }
-    });
-
-    _init();
-    _loadLocalIp();
+    _engineSubscription = widget.engine.updates.listen(_handleEngineEvent);
+    unawaited(_bootstrap());
   }
+
+  @override
+  void dispose() {
+    _engineSubscription?.cancel();
+    _peerController.dispose();
+    unawaited(widget.engine.stop());
+    super.dispose();
+  }
+
+  Future<void> _bootstrap() async {
+    unawaited(_loadLocalIp());
+    await _startEngine();
+  }
+
   Future<void> _loadLocalIp() async {
     try {
-      for (var interface in await NetworkInterface.list()) {
-        for (var addr in interface.addresses) {
-          if (addr.type == InternetAddressType.IPv4 && !addr.isLoopback) {
+      final interfaces = await NetworkInterface.list();
+      for (final interface in interfaces) {
+        for (final address in interface.addresses) {
+          if (address.type == InternetAddressType.IPv4 && !address.isLoopback) {
+            if (!mounted) return;
             setState(() {
-              _localIp = addr.address;
+              _localIp = address.address;
             });
             return;
           }
         }
       }
-    } catch (e) {
-      print("IP error: $e");
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _localIp = 'Unavailable';
+      });
     }
   }
 
-  Future<void> _init() async {
+  void _handleEngineEvent(Map<String, dynamic> event) {
+    if (!mounted || event['type'] != 'event') return;
+
+    switch (event['event']) {
+      case 'node_started':
+        setState(() {
+          _running = true;
+          _statusMessage = 'Engine online';
+        });
+        break;
+      case 'node_stopped':
+        setState(() {
+          _running = false;
+          _busy = false;
+          _statusMessage = 'Engine stopped';
+        });
+        break;
+      case 'file_received':
+        final name = event['filename']?.toString() ?? 'unknown';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Received file: $name')),
+        );
+        break;
+    }
+  }
+
+  Future<void> _startEngine() async {
+    if (_busy && _running) return;
+
+    setState(() {
+      _busy = true;
+      _errorMessage = null;
+      _statusMessage = 'Starting engine...';
+    });
+
     try {
       await widget.engine.start();
-
       final id = await widget.engine.sendCommand('get_id');
-      final port = await widget.engine.sendCommand('get_port');
+      final endpoint = await widget.engine.sendCommand('get_port');
 
-      print("ID RESPONSE: $id");
-      print("PORT RESPONSE: $port");
-
-
+      if (!mounted) return;
       setState(() {
-        _nodeId = id['data'];
-        _port = port['data'].toString();
+        _running = true;
+        _nodeId = id['data']?.toString() ?? 'Unavailable';
+        _endpoint = endpoint['data']?.toString() ?? 'Unavailable';
+        _statusMessage = 'Engine online';
       });
-    } catch (e) {
-      print("ERROR: $e");
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _running = false;
+        _errorMessage = '$error';
+        _statusMessage = 'Engine unavailable';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
     }
+  }
+
+  Future<void> _stopEngine() async {
+    setState(() {
+      _busy = true;
+      _errorMessage = null;
+      _statusMessage = 'Stopping engine...';
+    });
+
+    await widget.engine.stop();
+
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _running = false;
+      _nodeId = 'Unavailable';
+      _endpoint = 'Unavailable';
+      _statusMessage = 'Engine stopped';
+    });
+  }
+
+  Future<void> _connectToPeer() async {
+    final address = _peerController.text.trim();
+    if (address.isEmpty) return;
+
+    setState(() {
+      _busy = true;
+      _errorMessage = null;
+    });
+
+    try {
+      await widget.engine.sendCommand('connect', {'multiaddr': address});
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Connected to $address')),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = '$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  Widget _buildStatusCard(BuildContext context) {
+    final theme = Theme.of(context);
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  _running ? Icons.dns : Icons.portable_wifi_off,
+                  color: _running ? Colors.green : theme.colorScheme.error,
+                ),
+                const SizedBox(width: 12),
+                Text(
+                  _running ? 'Node Online' : 'Node Offline',
+                  style: theme.textTheme.titleLarge,
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            SelectableText('Peer ID: $_nodeId'),
+            const SizedBox(height: 8),
+            Text('${widget.engine.endpointLabel}: $_endpoint'),
+            const SizedBox(height: 8),
+            Text('Local IPv4: $_localIp'),
+            if (_statusMessage != null) ...[
+              const SizedBox(height: 12),
+              Text(_statusMessage!),
+            ],
+            if (_errorMessage != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                _errorMessage!,
+                style: TextStyle(color: theme.colorScheme.error),
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPeerActions(BuildContext context) {
+    if (!widget.engine.supportsPeerConnections &&
+        !widget.engine.supportsFileTransfers) {
+      return const Card(
+        child: Padding(
+          padding: EdgeInsets.all(20),
+          child: Text(
+            'Peer connect and file transfer controls are not wired for the desktop engine yet.',
+          ),
+        ),
+      );
+    }
+
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Peer Actions',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+            const SizedBox(height: 16),
+            if (widget.engine.supportsPeerConnections) ...[
+              TextField(
+                controller: _peerController,
+                decoration: const InputDecoration(
+                  labelText: 'Peer multiaddr',
+                  hintText: '/ip4/192.168.1.20/tcp/4001/p2p/...',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              FilledButton(
+                onPressed: _busy || !_running ? null : _connectToPeer,
+                child: const Text('Connect'),
+              ),
+              const SizedBox(height: 12),
+            ],
+            if (!widget.engine.supportsFileTransfers)
+              const Text(
+                'File transfer is not connected to the Flutter bridge yet.',
+              ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('ShareThing P2P')),
-      body: StreamBuilder<Map<String, dynamic>>(
-        stream: widget.engine.updates,
-        builder: (context, snapshot) {
-          final bool isRunning = _running;
-
-          return Center(
-            child: Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Icon(
-                  isRunning ? Icons.dns : Icons.portable_wifi_off,
-                  size: 64,
-                  color: isRunning ? Colors.green : Colors.red,
-                ),
-                const SizedBox(height: 20),
-                Text(
-                  isRunning ? "Node Online" : "Node Offline",
-                  style: Theme.of(context).textTheme.headlineSmall,
-                ),
-                if (isRunning) ...[
-                  const SizedBox(height: 10),
-                  Text("Peer ID: $_nodeId"),
-                  Text("Listening on Port $_port"),
-                ],
-                const SizedBox(height: 20),
-                Padding(
-                  padding: const EdgeInsets.all(16),
-                  child: TextField(
-                    controller: _peerController,
-                    decoration: const InputDecoration(
-                      labelText: "Peer address (e.g. 192.168.1.23:4001)",
-                      border: OutlineInputBorder(),
-                    ),
-                  ),
-                ),
-                ElevatedButton(
-                  onPressed: () async {
-                    final addr = _peerController.text.trim();
-                    if (addr.isEmpty) return;
-
-                    try {
-                      final res = await widget.engine.sendCommand("connect", {
-                        "multiaddr": addr,
-                      });
-                      print("Connect result: $res");
-                    } catch (e) {
-                      print("Connect failed: $e");
-                    }
-                  },
-                  child: const Text("Connect"),
-                ),
-                ElevatedButton(
-                  onPressed: () async {
-                    final addr = _peerController.text.trim();
-                    if (addr.isEmpty) return;
-
-                    try {
-                      final path = "/sdcard/Download/test.txt";
-                      await widget.engine.sendFile(path, addr);
-                      print("File sent");
-                    } catch (e) {
-                      print("Send failed: $e");
-                    }
-                  },
-                  child: const Text("Send File"),
-                ),
-                const SizedBox(height: 10),
-                Text("Your IP: $_localIp"),
-              ],
-            ),
-          );
-        },
+      appBar: AppBar(title: const Text('ShareThing')),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            _buildStatusCard(context),
+            const SizedBox(height: 16),
+            _buildPeerActions(context),
+          ],
+        ),
       ),
       floatingActionButton: FloatingActionButton.extended(
-        onPressed: () async {
-          try {
-            if (_running) {
-              setState(() { _running = false; _nodeId = "Unknown"; });
-            } else {
-              await widget.engine.start();
-
-              final id = await widget.engine.sendCommand('get_id');
-              final port = await widget.engine.sendCommand('get_port');
-
-              print("ID RESPONSE: $id");
-              print("PORT RESPONSE: $port");
-
-              setState(() {
-                _running = true;
-                _nodeId = id['data'] ?? "Unknown";
-                _port = port['data']?.toString() ?? "Unknown";
-              });
-            }
-          } catch (e) {
-            print("Engine toggle failed: $e");
-          }
-        },
-        label: Text(_running ? "Stop Engine" : "Start Engine"),
+        onPressed: _busy ? null : (_running ? _stopEngine : _startEngine),
+        label: Text(_running ? 'Stop Engine' : 'Start Engine'),
         icon: Icon(_running ? Icons.stop : Icons.play_arrow),
       ),
     );
