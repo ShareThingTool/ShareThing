@@ -876,7 +876,7 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
             const SizedBox(height: 12),
             const Text(
-              'Friends are stored locally as peerId-to-nickname mappings. Routing data comes from the node, not from Dart.',
+              'Friends are stored locally as peer ID and nickname entries.',
             ),
             const SizedBox(height: 16),
             if (_friends.isEmpty)
@@ -982,7 +982,7 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
             const SizedBox(height: 12),
             const Text(
-              'Discovery is handled by the node. Dart only renders the discovered peer state.',
+              'Nearby peers appear here when they become discoverable.',
             ),
             const SizedBox(height: 16),
             if (peers.isEmpty)
