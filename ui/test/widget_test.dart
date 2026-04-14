@@ -5,6 +5,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:sharething/core/engine_manager.dart';
 import 'package:sharething/features/discovery/discovered_peer.dart';
 import 'package:sharething/features/discovery/local_discovery_service.dart';
+import 'package:sharething/features/file_transfer/file_transfer_entry.dart';
+import 'package:sharething/features/file_transfer/local_file_transfer_service.dart';
 import 'package:sharething/features/friends/friend.dart';
 import 'package:sharething/features/friends/friends_repository.dart';
 import 'package:sharething/features/settings/app_settings.dart';
@@ -110,6 +112,7 @@ class FakeLocalDiscoveryService implements LocalDiscoveryService {
     required String peerId,
     required String nickname,
     required String shareAddress,
+    required int? fileTransferPort,
     required List<String> capabilities,
   }) async {
     lastStartedPeerId = peerId;
@@ -125,6 +128,46 @@ class FakeLocalDiscoveryService implements LocalDiscoveryService {
   }
 }
 
+class FakeLocalFileTransferService implements LocalFileTransferService {
+  final _controller = StreamController<List<FileTransferEntry>>.broadcast();
+
+  String? lastPeerId;
+  String? lastPeerLabel;
+  String? lastHostAddress;
+  int? lastPort;
+  String? lastFilePath;
+
+  @override
+  Stream<List<FileTransferEntry>> get transfers => _controller.stream;
+
+  @override
+  int? get listeningPort => 47290;
+
+  @override
+  Future<void> start({
+    required String peerId,
+    required String nickname,
+  }) async {}
+
+  @override
+  Future<void> stop() async {}
+
+  @override
+  Future<void> sendFile({
+    required String peerId,
+    required String peerLabel,
+    required String hostAddress,
+    required int port,
+    required String filePath,
+  }) async {
+    lastPeerId = peerId;
+    lastPeerLabel = peerLabel;
+    lastHostAddress = hostAddress;
+    lastPort = port;
+    lastFilePath = filePath;
+  }
+}
+
 void _setLargeSurface(WidgetTester tester) {
   tester.view.physicalSize = const Size(1200, 2200);
   tester.view.devicePixelRatio = 1;
@@ -135,12 +178,14 @@ ShareThingApp _buildApp({
   FriendsRepository? friendsRepository,
   SettingsRepository? settingsRepository,
   FakeLocalDiscoveryService? discoveryService,
+  FakeLocalFileTransferService? fileTransferService,
 }) {
   return ShareThingApp(
     engine: engine,
     friendsRepository: friendsRepository ?? InMemoryFriendsRepository(),
     settingsRepository: settingsRepository ?? InMemorySettingsRepository(),
     discoveryService: discoveryService ?? FakeLocalDiscoveryService(),
+    fileTransferService: fileTransferService ?? FakeLocalFileTransferService(),
   );
 }
 
@@ -256,6 +301,8 @@ void main() {
         peerId: 'bob-peer',
         nickname: 'Bob',
         shareAddress: '/ip4/192.168.1.55/tcp/4101/p2p/bob-peer',
+        hostAddress: '192.168.1.55',
+        fileTransferPort: 47290,
         platform: 'linux',
         capabilities: const ['tcp-connect', 'lan-announcement'],
         lastSeen: DateTime.now(),

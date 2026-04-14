@@ -67,6 +67,14 @@ class AppStoragePaths {
     return directory;
   }
 
+  Future<Directory> receivedFilesDirectory() async {
+    final directory = Directory(
+      p.join((await dataDirectory()).path, 'received'),
+    );
+    await directory.create(recursive: true);
+    return directory;
+  }
+
   String _userHome() {
     return Platform.environment['HOME'] ??
         Platform.environment['USERPROFILE'] ??

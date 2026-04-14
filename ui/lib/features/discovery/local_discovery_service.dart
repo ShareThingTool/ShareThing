@@ -11,6 +11,7 @@ abstract class LocalDiscoveryService {
     required String peerId,
     required String nickname,
     required String shareAddress,
+    required int? fileTransferPort,
     required List<String> capabilities,
   });
 
@@ -40,6 +41,7 @@ class UdpLocalDiscoveryService implements LocalDiscoveryService {
     required String peerId,
     required String nickname,
     required String shareAddress,
+    required int? fileTransferPort,
     required List<String> capabilities,
   }) async {
     _selfPeerId = peerId;
@@ -48,6 +50,7 @@ class UdpLocalDiscoveryService implements LocalDiscoveryService {
       'peerId': peerId,
       'nickname': nickname,
       'shareAddress': shareAddress,
+      'fileTransferPort': fileTransferPort,
       'platform': Platform.operatingSystem,
       'capabilities': capabilities,
     };
@@ -126,6 +129,11 @@ class UdpLocalDiscoveryService implements LocalDiscoveryService {
         }
 
         final platform = payload['platform']?.toString() ?? 'unknown';
+        final fileTransferPort = switch (payload['fileTransferPort']) {
+          int value => value,
+          String value => int.tryParse(value),
+          _ => null,
+        };
         final capabilities =
             (payload['capabilities'] as List<dynamic>? ?? const [])
                 .map((capability) => capability.toString())
@@ -135,6 +143,8 @@ class UdpLocalDiscoveryService implements LocalDiscoveryService {
           peerId: peerId,
           nickname: nickname,
           shareAddress: shareAddress,
+          hostAddress: datagram.address.address,
+          fileTransferPort: fileTransferPort,
           platform: platform,
           capabilities: capabilities,
           lastSeen: DateTime.now(),

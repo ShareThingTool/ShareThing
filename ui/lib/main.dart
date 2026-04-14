@@ -7,6 +7,8 @@ import 'package:flutter/services.dart';
 import 'core/engine_manager.dart';
 import 'features/discovery/discovered_peer.dart';
 import 'features/discovery/local_discovery_service.dart';
+import 'features/file_transfer/file_transfer_entry.dart';
+import 'features/file_transfer/local_file_transfer_service.dart';
 import 'features/friends/friend.dart';
 import 'features/friends/friends_repository.dart';
 import 'features/settings/app_settings.dart';
@@ -24,15 +26,19 @@ class ShareThingApp extends StatelessWidget {
     FriendsRepository? friendsRepository,
     SettingsRepository? settingsRepository,
     LocalDiscoveryService? discoveryService,
+    LocalFileTransferService? fileTransferService,
   }) : engine = engine ?? EngineManager(),
        friendsRepository = friendsRepository ?? JsonFriendsRepository(),
        settingsRepository = settingsRepository ?? JsonSettingsRepository(),
-       discoveryService = discoveryService ?? UdpLocalDiscoveryService();
+       discoveryService = discoveryService ?? UdpLocalDiscoveryService(),
+       fileTransferService =
+           fileTransferService ?? HttpLocalFileTransferService();
 
   final EngineManager engine;
   final FriendsRepository friendsRepository;
   final SettingsRepository settingsRepository;
   final LocalDiscoveryService discoveryService;
+  final LocalFileTransferService fileTransferService;
 
   @override
   Widget build(BuildContext context) {
@@ -47,6 +53,7 @@ class ShareThingApp extends StatelessWidget {
         friendsRepository: friendsRepository,
         settingsRepository: settingsRepository,
         discoveryService: discoveryService,
+        fileTransferService: fileTransferService,
       ),
     );
   }
@@ -91,12 +98,14 @@ class MyHomePage extends StatefulWidget {
     required this.friendsRepository,
     required this.settingsRepository,
     required this.discoveryService,
+    required this.fileTransferService,
   });
 
   final EngineManager engine;
   final FriendsRepository friendsRepository;
   final SettingsRepository settingsRepository;
   final LocalDiscoveryService discoveryService;
+  final LocalFileTransferService fileTransferService;
 
   @override
   State<MyHomePage> createState() => _MyHomePageState();
@@ -106,11 +115,14 @@ class _MyHomePageState extends State<MyHomePage> {
   final TextEditingController _peerController = TextEditingController();
   StreamSubscription<Map<String, dynamic>>? _engineSubscription;
   StreamSubscription<List<DiscoveredPeer>>? _discoverySubscription;
+  StreamSubscription<List<FileTransferEntry>>? _transferSubscription;
 
   List<FriendEntry> _friends = const [];
   List<DiscoveredPeer> _discoveredPeers = const [];
+  List<FileTransferEntry> _transfers = const [];
   Map<String, _FriendPresence> _friendStatuses = const {};
   AppSettings _settings = AppSettings.defaults();
+  final Set<String> _notifiedCompletedTransfers = {};
 
   bool _running = false;
   bool _busy = true;
@@ -139,6 +151,9 @@ class _MyHomePageState extends State<MyHomePage> {
     _discoverySubscription = widget.discoveryService.peers.listen(
       _handleDiscoveredPeers,
     );
+    _transferSubscription = widget.fileTransferService.transfers.listen(
+      _handleTransfers,
+    );
     unawaited(_bootstrap());
   }
 
@@ -146,8 +161,10 @@ class _MyHomePageState extends State<MyHomePage> {
   void dispose() {
     _engineSubscription?.cancel();
     _discoverySubscription?.cancel();
+    _transferSubscription?.cancel();
     _peerController.dispose();
     unawaited(widget.discoveryService.stop());
+    unawaited(widget.fileTransferService.stop());
     unawaited(widget.engine.stop());
     super.dispose();
   }
@@ -262,12 +279,14 @@ class _MyHomePageState extends State<MyHomePage> {
           _busy = false;
           _statusMessage = 'Engine stopped';
           _discoveredPeers = const [];
+          _transfers = const [];
           _friendStatuses = {
             for (final friend in _friends)
               friend.peerId: _FriendPresence.unknown,
           };
         });
         unawaited(widget.discoveryService.stop());
+        unawaited(widget.fileTransferService.stop());
         break;
       case 'file_received':
         final name = event['filename']?.toString() ?? 'unknown';
@@ -287,6 +306,29 @@ class _MyHomePageState extends State<MyHomePage> {
     for (final peer in peers) {
       if (_friends.any((friend) => friend.peerId == peer.peerId)) {
         unawaited(_cacheFriendAddress(peer.peerId, peer.shareAddress));
+      }
+    }
+  }
+
+  void _handleTransfers(List<FileTransferEntry> transfers) {
+    if (!mounted) return;
+    setState(() {
+      _transfers = transfers;
+    });
+
+    for (final transfer in transfers) {
+      if (transfer.direction == FileTransferDirection.incoming &&
+          transfer.status == FileTransferStatus.completed &&
+          transfer.localPath != null &&
+          !_notifiedCompletedTransfers.contains(transfer.id)) {
+        _notifiedCompletedTransfers.add(transfer.id);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Received ${transfer.fileName} into ${transfer.localPath}',
+            ),
+          ),
+        );
       }
     }
   }
@@ -317,18 +359,30 @@ class _MyHomePageState extends State<MyHomePage> {
         _shareAddress == 'Unavailable' ||
         _shareAddress.isEmpty) {
       await widget.discoveryService.stop();
+      await widget.fileTransferService.stop();
       if (!mounted) return;
       setState(() {
         _discoveredPeers = const [];
+        _transfers = const [];
       });
       return;
     }
+
+    await widget.fileTransferService.start(
+      peerId: _nodeId,
+      nickname: _settings.nickname,
+    );
 
     await widget.discoveryService.start(
       peerId: _nodeId,
       nickname: _settings.nickname,
       shareAddress: _shareAddress,
-      capabilities: const ['tcp-connect', 'lan-announcement'],
+      fileTransferPort: widget.fileTransferService.listeningPort,
+      capabilities: const [
+        'tcp-connect',
+        'lan-announcement',
+        'lan-file-transfer',
+      ],
     );
   }
 
@@ -382,6 +436,7 @@ class _MyHomePageState extends State<MyHomePage> {
     });
 
     await widget.discoveryService.stop();
+    await widget.fileTransferService.stop();
     await widget.engine.stop();
 
     if (!mounted) return;
@@ -392,6 +447,7 @@ class _MyHomePageState extends State<MyHomePage> {
       _shareAddress = 'Unavailable';
       _statusMessage = 'Engine stopped';
       _discoveredPeers = const [];
+      _transfers = const [];
       _friendStatuses = {
         for (final friend in _friends) friend.peerId: _FriendPresence.unknown,
       };
@@ -477,6 +533,60 @@ class _MyHomePageState extends State<MyHomePage> {
     }
 
     await _connectToPeer(address: address, peerId: friend.peerId);
+  }
+
+  Future<void> _sendFileToPeer({
+    required String peerId,
+    required String peerLabel,
+    required String hostAddress,
+    required int? port,
+  }) async {
+    if (port == null) {
+      setState(() {
+        _errorMessage =
+            'No local file-sharing route is available for $peerLabel yet.';
+      });
+      return;
+    }
+
+    final filePath = await pickFileForTransfer();
+    if (filePath == null || filePath.isEmpty) {
+      return;
+    }
+
+    setState(() {
+      _busy = true;
+      _errorMessage = null;
+    });
+
+    try {
+      await widget.fileTransferService.sendFile(
+        peerId: peerId,
+        peerLabel: peerLabel,
+        hostAddress: hostAddress,
+        port: port,
+        filePath: filePath,
+      );
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Sent ${filePath.split(Platform.pathSeparator).last} to $peerLabel',
+          ),
+        ),
+      );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = '$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
   }
 
   String? _validateFriend(
@@ -885,6 +995,23 @@ class _MyHomePageState extends State<MyHomePage> {
                 icon: const Icon(Icons.link),
                 label: const Text('Connect'),
               ),
+              FilledButton.tonalIcon(
+                key: ValueKey('friend-send-${friend.peerId}'),
+                onPressed:
+                    _busy ||
+                        !_running ||
+                        discoveredPeer == null ||
+                        discoveredPeer.fileTransferPort == null
+                    ? null
+                    : () => _sendFileToPeer(
+                        peerId: friend.peerId,
+                        peerLabel: friend.nickname,
+                        hostAddress: discoveredPeer.hostAddress,
+                        port: discoveredPeer.fileTransferPort,
+                      ),
+                icon: const Icon(Icons.upload_file_outlined),
+                label: const Text('Send File'),
+              ),
               OutlinedButton.icon(
                 key: ValueKey('friend-edit-${friend.peerId}'),
                 onPressed: () => _showFriendEditor(initialFriend: friend),
@@ -999,6 +1126,19 @@ class _MyHomePageState extends State<MyHomePage> {
                 icon: const Icon(Icons.link),
                 label: const Text('Connect'),
               ),
+              FilledButton.tonalIcon(
+                key: ValueKey('discovered-send-${peer.peerId}'),
+                onPressed: _busy || !_running || peer.fileTransferPort == null
+                    ? null
+                    : () => _sendFileToPeer(
+                        peerId: peer.peerId,
+                        peerLabel: peer.nickname,
+                        hostAddress: peer.hostAddress,
+                        port: peer.fileTransferPort,
+                      ),
+                icon: const Icon(Icons.upload_file_outlined),
+                label: const Text('Send File'),
+              ),
               if (!isSaved)
                 OutlinedButton.icon(
                   key: ValueKey('discovered-add-${peer.peerId}'),
@@ -1095,12 +1235,92 @@ class _MyHomePageState extends State<MyHomePage> {
               child: const Text('Connect'),
             ),
             const SizedBox(height: 12),
-            if (!widget.engine.supportsFileTransfers)
-              const Text(
-                'File transfer is not connected to the Flutter bridge yet.',
+            const Text(
+              'LAN file transfer uses discovered peers. Manual raw-address mode currently covers direct connect only.',
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTransfersCard(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Transfers', style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 12),
+            const Text(
+              'Local LAN file sharing currently uses a direct app-managed transfer path across desktop and Android.',
+            ),
+            const SizedBox(height: 16),
+            if (_transfers.isEmpty)
+              const Text('No transfers yet.')
+            else
+              Column(
+                children: [
+                  for (var index = 0; index < _transfers.length; index++) ...[
+                    _buildTransferTile(context, _transfers[index]),
+                    if (index < _transfers.length - 1)
+                      const SizedBox(height: 12),
+                  ],
+                ],
               ),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildTransferTile(BuildContext context, FileTransferEntry transfer) {
+    final statusLabel = switch (transfer.status) {
+      FileTransferStatus.queued => 'Queued',
+      FileTransferStatus.inProgress => 'In Progress',
+      FileTransferStatus.completed => 'Completed',
+      FileTransferStatus.failed => 'Failed',
+    };
+
+    final directionLabel = switch (transfer.direction) {
+      FileTransferDirection.incoming => 'Incoming',
+      FileTransferDirection.outgoing => 'Outgoing',
+    };
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            transfer.fileName,
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          Text('$directionLabel with ${transfer.peerLabel}'),
+          const SizedBox(height: 8),
+          LinearProgressIndicator(value: transfer.progress),
+          const SizedBox(height: 8),
+          Text(
+            '$statusLabel • ${transfer.bytesTransferred}/${transfer.totalBytes} bytes',
+          ),
+          if (transfer.localPath != null) ...[
+            const SizedBox(height: 8),
+            SelectableText('Path: ${transfer.localPath}'),
+          ],
+          if (transfer.error != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              transfer.error!,
+              style: TextStyle(color: Theme.of(context).colorScheme.error),
+            ),
+          ],
+        ],
       ),
     );
   }
@@ -1118,6 +1338,8 @@ class _MyHomePageState extends State<MyHomePage> {
             _buildFriendsCard(context),
             const SizedBox(height: 16),
             _buildDiscoveryCard(context),
+            const SizedBox(height: 16),
+            _buildTransfersCard(context),
             const SizedBox(height: 16),
             _buildManualConnectCard(context),
           ],
