@@ -1,14 +1,16 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:ui';
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'core/engine_manager.dart';
+import 'core/storage/app_storage_paths.dart';
 import 'features/discovery/discovered_peer.dart';
-import 'features/discovery/local_discovery_service.dart';
 import 'features/file_transfer/file_transfer_entry.dart';
-import 'features/file_transfer/local_file_transfer_service.dart';
+import 'features/file_transfer/incoming_file_request.dart';
 import 'features/friends/friend.dart';
 import 'features/friends/friends_repository.dart';
 import 'features/settings/app_settings.dart';
@@ -19,26 +21,76 @@ void main() {
   runApp(ShareThingApp());
 }
 
-class ShareThingApp extends StatelessWidget {
+class ShareThingApp extends StatefulWidget {
   ShareThingApp({
     super.key,
     EngineManager? engine,
     FriendsRepository? friendsRepository,
     SettingsRepository? settingsRepository,
-    LocalDiscoveryService? discoveryService,
-    LocalFileTransferService? fileTransferService,
+    AppStoragePaths? storagePaths,
   }) : engine = engine ?? EngineManager(),
        friendsRepository = friendsRepository ?? JsonFriendsRepository(),
        settingsRepository = settingsRepository ?? JsonSettingsRepository(),
-       discoveryService = discoveryService ?? UdpLocalDiscoveryService(),
-       fileTransferService =
-           fileTransferService ?? HttpLocalFileTransferService();
+       storagePaths = storagePaths ?? const AppStoragePaths();
 
   final EngineManager engine;
   final FriendsRepository friendsRepository;
   final SettingsRepository settingsRepository;
-  final LocalDiscoveryService discoveryService;
-  final LocalFileTransferService fileTransferService;
+  final AppStoragePaths storagePaths;
+
+  @override
+  State<ShareThingApp> createState() => _ShareThingAppState();
+}
+
+class _ShareThingAppState extends State<ShareThingApp> {
+  AppLifecycleListener? _appLifecycleListener;
+  StreamSubscription<ProcessSignal>? _sigtermSubscription;
+  StreamSubscription<ProcessSignal>? _sigintSubscription;
+  bool _shuttingDown = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _appLifecycleListener = AppLifecycleListener(
+      onExitRequested: () async {
+        await _shutdownNode();
+        return AppExitResponse.exit;
+      },
+    );
+
+    if (Platform.isLinux || Platform.isMacOS) {
+      _sigtermSubscription = ProcessSignal.sigterm.watch().listen((_) {
+        unawaited(_handleTerminationSignal());
+      });
+      _sigintSubscription = ProcessSignal.sigint.watch().listen((_) {
+        unawaited(_handleTerminationSignal());
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _appLifecycleListener?.dispose();
+    _sigtermSubscription?.cancel();
+    _sigintSubscription?.cancel();
+    unawaited(_shutdownNode());
+    super.dispose();
+  }
+
+  Future<void> _handleTerminationSignal() async {
+    await _shutdownNode();
+    exit(0);
+  }
+
+  Future<void> _shutdownNode() async {
+    if (_shuttingDown) return;
+    _shuttingDown = true;
+    try {
+      await widget.engine.stop();
+    } finally {
+      _shuttingDown = false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -49,34 +101,29 @@ class ShareThingApp extends StatelessWidget {
         useMaterial3: true,
       ),
       home: MyHomePage(
-        engine: engine,
-        friendsRepository: friendsRepository,
-        settingsRepository: settingsRepository,
-        discoveryService: discoveryService,
-        fileTransferService: fileTransferService,
+        engine: widget.engine,
+        friendsRepository: widget.friendsRepository,
+        settingsRepository: widget.settingsRepository,
+        storagePaths: widget.storagePaths,
       ),
     );
   }
 }
 
-enum _FriendPresence { unknown, checking, online, offline }
+enum _FriendPresence { unknown, online }
 
 extension _FriendPresenceUi on _FriendPresence {
   String get label {
     return switch (this) {
       _FriendPresence.unknown => 'Unknown',
-      _FriendPresence.checking => 'Checking',
       _FriendPresence.online => 'Online',
-      _FriendPresence.offline => 'Offline',
     };
   }
 
   IconData get icon {
     return switch (this) {
       _FriendPresence.unknown => Icons.help_outline,
-      _FriendPresence.checking => Icons.sync,
       _FriendPresence.online => Icons.check_circle_outline,
-      _FriendPresence.offline => Icons.cancel_outlined,
     };
   }
 
@@ -84,9 +131,7 @@ extension _FriendPresenceUi on _FriendPresence {
     final colors = Theme.of(context).colorScheme;
     return switch (this) {
       _FriendPresence.unknown => colors.secondary,
-      _FriendPresence.checking => colors.tertiary,
       _FriendPresence.online => Colors.green,
-      _FriendPresence.offline => colors.error,
     };
   }
 }
@@ -97,82 +142,50 @@ class MyHomePage extends StatefulWidget {
     required this.engine,
     required this.friendsRepository,
     required this.settingsRepository,
-    required this.discoveryService,
-    required this.fileTransferService,
+    required this.storagePaths,
   });
 
   final EngineManager engine;
   final FriendsRepository friendsRepository;
   final SettingsRepository settingsRepository;
-  final LocalDiscoveryService discoveryService;
-  final LocalFileTransferService fileTransferService;
+  final AppStoragePaths storagePaths;
 
   @override
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  final TextEditingController _peerController = TextEditingController();
   StreamSubscription<Map<String, dynamic>>? _engineSubscription;
-  StreamSubscription<List<DiscoveredPeer>>? _discoverySubscription;
-  StreamSubscription<List<FileTransferEntry>>? _transferSubscription;
 
   List<FriendEntry> _friends = const [];
-  List<DiscoveredPeer> _discoveredPeers = const [];
-  List<FileTransferEntry> _transfers = const [];
-  Map<String, _FriendPresence> _friendStatuses = const {};
+  Map<String, DiscoveredPeer> _discoveredPeers = const {};
+  Map<String, FileTransferEntry> _transfers = const {};
+  Map<String, IncomingFileRequest> _incomingRequests = const {};
   AppSettings _settings = AppSettings.defaults();
-  final Set<String> _notifiedCompletedTransfers = {};
 
   bool _running = false;
   bool _busy = true;
-  String _nodeId = 'Unavailable';
-  String _shareAddress = 'Unavailable';
-  String _localIp = 'Unavailable';
-  String? _statusMessage = 'Starting engine...';
+  String _peerId = 'Unavailable';
+  List<String> _listenAddresses = const [];
+  String? _statusMessage = 'Starting node...';
   String? _errorMessage;
-
-  String get _displayShareAddress {
-    if (_shareAddress == 'Unavailable' || _shareAddress.isEmpty) {
-      return _shareAddress;
-    }
-
-    if (_localIp == 'Unavailable') {
-      return _shareAddress;
-    }
-
-    return _shareAddress.replaceFirst('/ip4/0.0.0.0/', '/ip4/$_localIp/');
-  }
 
   @override
   void initState() {
     super.initState();
     _engineSubscription = widget.engine.updates.listen(_handleEngineEvent);
-    _discoverySubscription = widget.discoveryService.peers.listen(
-      _handleDiscoveredPeers,
-    );
-    _transferSubscription = widget.fileTransferService.transfers.listen(
-      _handleTransfers,
-    );
     unawaited(_bootstrap());
   }
 
   @override
   void dispose() {
     _engineSubscription?.cancel();
-    _discoverySubscription?.cancel();
-    _transferSubscription?.cancel();
-    _peerController.dispose();
-    unawaited(widget.discoveryService.stop());
-    unawaited(widget.fileTransferService.stop());
-    unawaited(widget.engine.stop());
     super.dispose();
   }
 
   Future<void> _bootstrap() async {
     await _loadSettings();
     await _loadFriends();
-    unawaited(_loadLocalIp());
     await _startEngine();
   }
 
@@ -190,7 +203,27 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _settings = settings;
     });
-    await _restartDiscovery();
+
+    if (_running) {
+      await _restartEngine();
+    }
+  }
+
+  Future<void> _loadFriends() async {
+    final friends = await widget.friendsRepository.loadFriends();
+    if (!mounted) return;
+    setState(() {
+      _friends = _sortFriends(friends);
+    });
+  }
+
+  Future<void> _saveFriends(List<FriendEntry> friends) async {
+    final sorted = _sortFriends(friends);
+    await widget.friendsRepository.saveFriends(sorted);
+    if (!mounted) return;
+    setState(() {
+      _friends = sorted;
+    });
   }
 
   List<FriendEntry> _sortFriends(List<FriendEntry> friends) {
@@ -202,354 +235,226 @@ class _MyHomePageState extends State<MyHomePage> {
     return sorted;
   }
 
-  Future<void> _loadFriends() async {
-    final friends = _sortFriends(await widget.friendsRepository.loadFriends());
-    if (!mounted) return;
-    setState(() {
-      _friends = friends;
-      _friendStatuses = {
-        for (final friend in friends)
-          friend.peerId:
-              _friendStatuses[friend.peerId] ?? _FriendPresence.unknown,
-      };
-    });
-  }
-
-  Future<void> _saveFriends(List<FriendEntry> friends) async {
-    final sortedFriends = _sortFriends(friends);
-    await widget.friendsRepository.saveFriends(sortedFriends);
-    if (!mounted) return;
-    setState(() {
-      _friends = sortedFriends;
-      _friendStatuses = {
-        for (final friend in sortedFriends)
-          friend.peerId:
-              _friendStatuses[friend.peerId] ?? _FriendPresence.unknown,
-      };
-    });
-  }
-
-  Future<void> _cacheFriendAddress(String peerId, String shareAddress) async {
-    final index = _friends.indexWhere((friend) => friend.peerId == peerId);
-    if (index == -1) return;
-    if (_friends[index].lastKnownShareAddress == shareAddress) return;
-
-    final updatedFriends = [..._friends];
-    updatedFriends[index] = updatedFriends[index].copyWith(
-      lastKnownShareAddress: shareAddress,
-    );
-    await _saveFriends(updatedFriends);
-  }
-
-  Future<void> _loadLocalIp() async {
-    try {
-      final interfaces = await NetworkInterface.list();
-      for (final interface in interfaces) {
-        for (final address in interface.addresses) {
-          if (address.type == InternetAddressType.IPv4 && !address.isLoopback) {
-            if (!mounted) return;
-            setState(() {
-              _localIp = address.address;
-            });
-            return;
-          }
-        }
-      }
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _localIp = 'Unavailable';
-      });
-    }
-  }
-
-  void _handleEngineEvent(Map<String, dynamic> event) {
-    if (!mounted || event['type'] != 'event') return;
-
-    switch (event['event']) {
-      case 'node_started':
-        setState(() {
-          _running = true;
-          _statusMessage = 'Engine online';
-        });
-        break;
-      case 'node_stopped':
-        setState(() {
-          _running = false;
-          _busy = false;
-          _statusMessage = 'Engine stopped';
-          _discoveredPeers = const [];
-          _transfers = const [];
-          _friendStatuses = {
-            for (final friend in _friends)
-              friend.peerId: _FriendPresence.unknown,
-          };
-        });
-        unawaited(widget.discoveryService.stop());
-        unawaited(widget.fileTransferService.stop());
-        break;
-      case 'file_received':
-        final name = event['filename']?.toString() ?? 'unknown';
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(SnackBar(content: Text('Received file: $name')));
-        break;
-    }
-  }
-
-  void _handleDiscoveredPeers(List<DiscoveredPeer> peers) {
-    if (!mounted) return;
-    setState(() {
-      _discoveredPeers = peers;
-    });
-
-    for (final peer in peers) {
-      if (_friends.any((friend) => friend.peerId == peer.peerId)) {
-        unawaited(_cacheFriendAddress(peer.peerId, peer.shareAddress));
-      }
-    }
-  }
-
-  void _handleTransfers(List<FileTransferEntry> transfers) {
-    if (!mounted) return;
-    setState(() {
-      _transfers = transfers;
-    });
-
-    for (final transfer in transfers) {
-      if (transfer.direction == FileTransferDirection.incoming &&
-          transfer.status == FileTransferStatus.completed &&
-          transfer.localPath != null &&
-          !_notifiedCompletedTransfers.contains(transfer.id)) {
-        _notifiedCompletedTransfers.add(transfer.id);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              'Received ${transfer.fileName} into ${transfer.localPath}',
-            ),
-          ),
-        );
-      }
-    }
-  }
-
-  void _ensureCommandSucceeded(Map<String, dynamic> response, String command) {
-    final error = response['error'];
-    if (error is String && error.isNotEmpty) {
-      throw StateError('$command failed: $error');
-    }
-
-    final data = response['data'];
-    if (data is String && data.startsWith('Error:')) {
-      throw StateError('$command failed: $data');
-    }
-  }
-
-  void _setFriendPresence(String peerId, _FriendPresence presence) {
-    if (!mounted) return;
-    setState(() {
-      _friendStatuses = {..._friendStatuses, peerId: presence};
-    });
-  }
-
-  Future<void> _restartDiscovery() async {
-    if (!_running ||
-        _nodeId == 'Unavailable' ||
-        _nodeId.isEmpty ||
-        _shareAddress == 'Unavailable' ||
-        _shareAddress.isEmpty) {
-      await widget.discoveryService.stop();
-      await widget.fileTransferService.stop();
-      if (!mounted) return;
-      setState(() {
-        _discoveredPeers = const [];
-        _transfers = const [];
-      });
-      return;
-    }
-
-    await widget.fileTransferService.start(
-      peerId: _nodeId,
-      nickname: _settings.nickname,
-    );
-
-    await widget.discoveryService.start(
-      peerId: _nodeId,
-      nickname: _settings.nickname,
-      shareAddress: _shareAddress,
-      fileTransferPort: widget.fileTransferService.listeningPort,
-      capabilities: const [
-        'tcp-connect',
-        'lan-announcement',
-        'lan-file-transfer',
-      ],
-    );
-  }
-
   Future<void> _startEngine() async {
-    if (_busy && _running) return;
-
     setState(() {
       _busy = true;
       _errorMessage = null;
-      _statusMessage = 'Starting engine...';
+      _statusMessage = 'Starting node...';
     });
 
     try {
-      await widget.engine.start();
-      final id = await widget.engine.sendCommand('get_id');
-      final shareAddress = await widget.engine.sendCommand(
-        'get_listen_address',
+      await widget.engine.start(
+        nickname: _settings.nickname,
+        discoveryServers: const [],
       );
-      _ensureCommandSucceeded(id, 'get_id');
-      _ensureCommandSucceeded(shareAddress, 'get_listen_address');
 
       if (!mounted) return;
       setState(() {
-        _running = true;
-        _nodeId = id['data']?.toString() ?? 'Unavailable';
-        _shareAddress = shareAddress['data']?.toString() ?? 'Unavailable';
-        _statusMessage = 'Engine online';
+        _busy = false;
       });
-      await _restartDiscovery();
     } catch (error) {
       if (!mounted) return;
       setState(() {
+        _busy = false;
         _running = false;
+        _statusMessage = 'Node unavailable';
         _errorMessage = '$error';
-        _statusMessage = 'Engine unavailable';
       });
-    } finally {
-      if (mounted) {
-        setState(() {
-          _busy = false;
-        });
-      }
     }
+  }
+
+  Future<void> _restartEngine() async {
+    await widget.engine.stop();
+    if (!mounted) return;
+    setState(() {
+      _running = false;
+      _peerId = 'Unavailable';
+      _listenAddresses = const [];
+      _discoveredPeers = const {};
+      _incomingRequests = const {};
+    });
+    await _startEngine();
   }
 
   Future<void> _stopEngine() async {
     setState(() {
       _busy = true;
       _errorMessage = null;
-      _statusMessage = 'Stopping engine...';
+      _statusMessage = 'Stopping node...';
     });
 
-    await widget.discoveryService.stop();
-    await widget.fileTransferService.stop();
     await widget.engine.stop();
 
     if (!mounted) return;
     setState(() {
       _busy = false;
       _running = false;
-      _nodeId = 'Unavailable';
-      _shareAddress = 'Unavailable';
-      _statusMessage = 'Engine stopped';
-      _discoveredPeers = const [];
-      _transfers = const [];
-      _friendStatuses = {
-        for (final friend in _friends) friend.peerId: _FriendPresence.unknown,
-      };
+      _peerId = 'Unavailable';
+      _listenAddresses = const [];
+      _statusMessage = 'Node stopped';
+      _discoveredPeers = const {};
+      _incomingRequests = const {};
     });
   }
 
-  DiscoveredPeer? _discoveredPeerById(String peerId) {
-    for (final peer in _discoveredPeers) {
-      if (peer.peerId == peerId) {
-        return peer;
-      }
-    }
-    return null;
-  }
-
-  String? _resolveFriendAddress(FriendEntry friend) {
-    return _discoveredPeerById(friend.peerId)?.shareAddress ??
-        friend.lastKnownShareAddress;
-  }
-
-  _FriendPresence _presenceForFriend(FriendEntry friend) {
-    if (_discoveredPeerById(friend.peerId) != null) {
-      return _FriendPresence.online;
-    }
-    return _friendStatuses[friend.peerId] ?? _FriendPresence.unknown;
-  }
-
-  Future<void> _connectToPeer({required String address, String? peerId}) async {
-    final trimmedAddress = address.trim();
-    if (trimmedAddress.isEmpty) return;
-
-    setState(() {
-      _busy = true;
-      _errorMessage = null;
-      _peerController.text = trimmedAddress;
-    });
-
-    if (peerId != null) {
-      _setFriendPresence(peerId, _FriendPresence.checking);
-    }
-
-    try {
-      final response = await widget.engine.sendCommand('connect', {
-        'multiaddr': trimmedAddress,
-      });
-      _ensureCommandSucceeded(response, 'connect');
-
-      if (peerId != null) {
-        _setFriendPresence(peerId, _FriendPresence.online);
-        await _cacheFriendAddress(peerId, trimmedAddress);
-      }
-
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Connected to $trimmedAddress')));
-    } catch (error) {
-      if (peerId != null) {
-        _setFriendPresence(peerId, _FriendPresence.offline);
-      }
-
-      if (!mounted) return;
-      setState(() {
-        _errorMessage = '$error';
-      });
-    } finally {
-      if (mounted) {
+  void _handleEngineEvent(Map<String, dynamic> event) {
+    switch (event['type']) {
+      case 'NODE_STARTED':
+        final listenAddresses =
+            (event['listenAddresses'] as List<dynamic>? ?? const [])
+                .map((address) => address.toString())
+                .toList(growable: false);
         setState(() {
+          _running = true;
+          _peerId = event['peerId']?.toString() ?? 'Unavailable';
+          _listenAddresses = listenAddresses;
+          _statusMessage = 'Node online';
+        });
+        break;
+      case 'NODE_STOPPED':
+        setState(() {
+          _running = false;
+          _statusMessage = 'Node stopped';
+        });
+        break;
+      case 'PEER_DISCOVERED':
+        final peerId = event['peerId']?.toString();
+        if (peerId == null || peerId.isEmpty || peerId == _peerId) return;
+
+        final addresses = (event['addresses'] as List<dynamic>? ?? const [])
+            .map((address) => address.toString())
+            .toList(growable: false);
+
+        setState(() {
+          _discoveredPeers = {
+            ..._discoveredPeers,
+            peerId: DiscoveredPeer(
+              peerId: peerId,
+              nickname: event['nickname']?.toString() ?? peerId,
+              addresses: addresses,
+              lastSeen: DateTime.now(),
+            ),
+          };
+        });
+        break;
+      case 'PEER_NICKNAME_CHANGED':
+        final peerId = event['peerId']?.toString();
+        final newNickname = event['newNickname']?.toString();
+        if (peerId == null || newNickname == null) return;
+
+        final updatedFriends = [
+          for (final friend in _friends)
+            if (friend.peerId == peerId)
+              friend.copyWith(nickname: newNickname)
+            else
+              friend,
+        ];
+        unawaited(_saveFriends(updatedFriends));
+
+        final existingPeer = _discoveredPeers[peerId];
+        if (existingPeer != null) {
+          setState(() {
+            _discoveredPeers = {
+              ..._discoveredPeers,
+              peerId: existingPeer.copyWith(nickname: newNickname),
+            };
+          });
+        }
+        break;
+      case 'INCOMING_FILE_REQUEST':
+        final transferId = event['transferId']?.toString();
+        final peerId = event['peerId']?.toString();
+        final fileName = event['filename']?.toString();
+        final totalBytes = _intValue(event['totalBytes']);
+        if (transferId == null || peerId == null || fileName == null) return;
+
+        setState(() {
+          _incomingRequests = {
+            ..._incomingRequests,
+            transferId: IncomingFileRequest(
+              transferId: transferId,
+              peerId: peerId,
+              fileName: fileName,
+              totalBytes: totalBytes,
+            ),
+          };
+        });
+        break;
+      case 'TRANSFER_UPDATE':
+        final transferId = event['transferId']?.toString();
+        if (transferId == null || transferId.isEmpty) return;
+
+        final direction = event['direction']?.toString() == 'INCOMING'
+            ? FileTransferDirection.incoming
+            : FileTransferDirection.outgoing;
+
+        final status = switch (event['status']?.toString()) {
+          'IN_PROGRESS' => FileTransferStatus.inProgress,
+          'COMPLETED' => FileTransferStatus.completed,
+          'FAILED' => FileTransferStatus.failed,
+          _ => FileTransferStatus.queued,
+        };
+
+        final existing = _transfers[transferId];
+        final updated = FileTransferEntry(
+          id: transferId,
+          direction: direction,
+          peerId: event['peerId']?.toString() ?? existing?.peerId ?? 'unknown',
+          peerLabel:
+              _friendLabel(event['peerId']?.toString()) ??
+              existing?.peerLabel ??
+              (event['peerId']?.toString() ?? 'Unknown Peer'),
+          fileName:
+              event['filename']?.toString() ?? existing?.fileName ?? 'transfer',
+          bytesTransferred: _intValue(event['bytesTransferred']),
+          totalBytes: _intValue(event['totalBytes']),
+          status: status,
+          error: status == FileTransferStatus.failed
+              ? (event['message']?.toString() ?? existing?.error)
+              : existing?.error,
+        );
+
+        setState(() {
+          _transfers = {..._transfers, transferId: updated};
+          if (status == FileTransferStatus.completed ||
+              status == FileTransferStatus.failed) {
+            _incomingRequests = Map.of(_incomingRequests)..remove(transferId);
+          }
+        });
+        break;
+      case 'ERROR':
+        setState(() {
+          _errorMessage = event['message']?.toString() ?? 'Unknown node error';
           _busy = false;
         });
+        break;
+    }
+  }
+
+  int _intValue(dynamic value) {
+    if (value is int) return value;
+    return int.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  String? _friendLabel(String? peerId) {
+    if (peerId == null || peerId.isEmpty) return null;
+
+    for (final friend in _friends) {
+      if (friend.peerId == peerId) {
+        return friend.nickname;
       }
     }
+
+    final discovered = _discoveredPeers[peerId];
+    return discovered?.nickname;
   }
 
-  Future<void> _connectToFriend(FriendEntry friend) async {
-    final address = _resolveFriendAddress(friend);
-    if (address == null || address.isEmpty) {
-      setState(() {
-        _errorMessage =
-            'No active route is known for ${friend.nickname}. Wait for LAN discovery or backend discovery.';
-      });
-      return;
-    }
+  bool _isFriendOnline(FriendEntry friend) =>
+      _discoveredPeers.containsKey(friend.peerId);
 
-    await _connectToPeer(address: address, peerId: friend.peerId);
-  }
-
-  Future<void> _sendFileToPeer({
-    required String peerId,
-    required String peerLabel,
-    required String hostAddress,
-    required int? port,
-  }) async {
-    if (port == null) {
-      setState(() {
-        _errorMessage =
-            'No local file-sharing route is available for $peerLabel yet.';
-      });
-      return;
-    }
-
-    final filePath = await pickFileForTransfer();
+  Future<void> _sendFileToPeer(String peerId) async {
+    final result = await FilePicker.platform.pickFiles();
+    final filePath = result?.files.singleOrNull?.path;
     if (filePath == null || filePath.isEmpty) {
       return;
     }
@@ -560,21 +465,62 @@ class _MyHomePageState extends State<MyHomePage> {
     });
 
     try {
-      await widget.fileTransferService.sendFile(
-        peerId: peerId,
-        peerLabel: peerLabel,
-        hostAddress: hostAddress,
-        port: port,
-        filePath: filePath,
-      );
+      await widget.engine.sendFile(targetPeerId: peerId, filePath: filePath);
+    } catch (error) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text(
-            'Sent ${filePath.split(Platform.pathSeparator).last} to $peerLabel',
-          ),
-        ),
+      setState(() {
+        _errorMessage = '$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _acceptIncomingRequest(IncomingFileRequest request) async {
+    final directory = await widget.storagePaths.receivedFilesDirectory();
+    final savePath = '${directory.path}/${request.fileName}';
+
+    setState(() {
+      _busy = true;
+      _errorMessage = null;
+    });
+
+    try {
+      await widget.engine.acceptFile(
+        transferId: request.transferId,
+        savePath: savePath,
       );
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = '$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _rejectIncomingRequest(IncomingFileRequest request) async {
+    setState(() {
+      _busy = true;
+      _errorMessage = null;
+    });
+
+    try {
+      await widget.engine.rejectFile(transferId: request.transferId);
+      if (!mounted) return;
+      setState(() {
+        _incomingRequests = Map.of(_incomingRequests)
+          ..remove(request.transferId);
+      });
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -653,12 +599,6 @@ class _MyHomePageState extends State<MyHomePage> {
                         border: OutlineInputBorder(),
                       ),
                     ),
-                    const SizedBox(height: 12),
-                    Text(
-                      discoveredPeer == null
-                          ? 'Addresses stay internal. The app will use LAN or backend discovery to find routes.'
-                          : 'A LAN-announced route is currently available and will be cached automatically.',
-                    ),
                     if (validationError != null) ...[
                       const SizedBox(height: 12),
                       Text(
@@ -695,9 +635,6 @@ class _MyHomePageState extends State<MyHomePage> {
                     editedFriend = FriendEntry(
                       peerId: peerId,
                       nickname: nickname,
-                      lastKnownShareAddress:
-                          discoveredPeer?.shareAddress ??
-                          initialFriend?.lastKnownShareAddress,
                     );
                     Navigator.of(dialogContext).pop();
                   },
@@ -761,35 +698,6 @@ class _MyHomePageState extends State<MyHomePage> {
         .where((candidate) => candidate.peerId != friend.peerId)
         .toList(growable: false);
     await _saveFriends(updatedFriends);
-
-    if (!mounted) return;
-    setState(() {
-      _friendStatuses = {
-        for (final candidate in updatedFriends)
-          candidate.peerId:
-              _friendStatuses[candidate.peerId] ?? _FriendPresence.unknown,
-      };
-    });
-  }
-
-  Future<void> _copyPeerId() async {
-    if (_nodeId == 'Unavailable' || _nodeId.isEmpty) return;
-    await Clipboard.setData(ClipboardData(text: _nodeId));
-    if (!mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('Peer ID copied')));
-  }
-
-  Future<void> _copyShareAddress() async {
-    if (_displayShareAddress == 'Unavailable' || _displayShareAddress.isEmpty) {
-      return;
-    }
-    await Clipboard.setData(ClipboardData(text: _displayShareAddress));
-    if (!mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(const SnackBar(content: Text('Share address copied')));
   }
 
   Future<void> _showNicknameEditor() async {
@@ -858,9 +766,17 @@ class _MyHomePageState extends State<MyHomePage> {
     nicknameController.dispose();
   }
 
+  Future<void> _copyPeerId() async {
+    if (_peerId == 'Unavailable' || _peerId.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: _peerId));
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Peer ID copied')));
+  }
+
   Widget _buildPresenceChip(BuildContext context, _FriendPresence presence) {
     final color = presence.color(context);
-
     return Chip(
       avatar: Icon(presence.icon, size: 18, color: color),
       label: Text(presence.label),
@@ -893,11 +809,19 @@ class _MyHomePageState extends State<MyHomePage> {
             const SizedBox(height: 16),
             Text('Nickname: ${_settings.nickname}'),
             const SizedBox(height: 8),
-            SelectableText('Peer ID: $_nodeId'),
+            SelectableText('Peer ID: $_peerId'),
             const SizedBox(height: 8),
-            SelectableText('Share address: $_displayShareAddress'),
+            Text('Listen addresses:'),
             const SizedBox(height: 8),
-            Text('Local IPv4: $_localIp'),
+            if (_listenAddresses.isEmpty)
+              const Text('No listen addresses announced yet.')
+            else
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: _listenAddresses
+                    .map((address) => SelectableText(address))
+                    .toList(growable: false),
+              ),
             const SizedBox(height: 12),
             Wrap(
               spacing: 12,
@@ -907,11 +831,6 @@ class _MyHomePageState extends State<MyHomePage> {
                   onPressed: _running ? _copyPeerId : null,
                   icon: const Icon(Icons.badge_outlined),
                   label: const Text('Copy Peer ID'),
-                ),
-                FilledButton.tonalIcon(
-                  onPressed: _running ? _copyShareAddress : null,
-                  icon: const Icon(Icons.copy_all_outlined),
-                  label: const Text('Copy Share Address'),
                 ),
                 OutlinedButton.icon(
                   onPressed: _showNicknameEditor,
@@ -937,12 +856,50 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  Widget _buildFriendsCard(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Text('Friends', style: Theme.of(context).textTheme.titleLarge),
+                const Spacer(),
+                FilledButton.icon(
+                  onPressed: () => _showFriendEditor(),
+                  icon: const Icon(Icons.person_add_alt_1),
+                  label: const Text('Add Friend'),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Friends are stored locally as peerId-to-nickname mappings. Routing data comes from the node, not from Dart.',
+            ),
+            const SizedBox(height: 16),
+            if (_friends.isEmpty)
+              const Text('No friends saved yet.')
+            else
+              Column(
+                children: [
+                  for (var index = 0; index < _friends.length; index++) ...[
+                    _buildFriendCard(context, _friends[index]),
+                    if (index < _friends.length - 1) const SizedBox(height: 12),
+                  ],
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildFriendCard(BuildContext context, FriendEntry friend) {
-    final presence = _presenceForFriend(friend);
-    final discoveredPeer = _discoveredPeerById(friend.peerId);
-    final hasKnownRoute =
-        discoveredPeer != null ||
-        (friend.lastKnownShareAddress?.isNotEmpty ?? false);
+    final presence = _isFriendOnline(friend)
+        ? _FriendPresence.online
+        : _FriendPresence.unknown;
 
     return Container(
       key: ValueKey('friend-card-${friend.peerId}'),
@@ -967,14 +924,6 @@ class _MyHomePageState extends State<MyHomePage> {
                     ),
                     const SizedBox(height: 8),
                     SelectableText('Peer ID: ${friend.peerId}'),
-                    const SizedBox(height: 8),
-                    Text(
-                      discoveredPeer != null
-                          ? 'LAN route is available right now.'
-                          : hasKnownRoute
-                          ? 'A cached route is stored locally.'
-                          : 'No route is currently known.',
-                    ),
                   ],
                 ),
               ),
@@ -988,27 +937,10 @@ class _MyHomePageState extends State<MyHomePage> {
             runSpacing: 8,
             children: [
               FilledButton.tonalIcon(
-                key: ValueKey('friend-connect-${friend.peerId}'),
+                key: ValueKey('friend-send-${friend.peerId}'),
                 onPressed: _busy || !_running
                     ? null
-                    : () => _connectToFriend(friend),
-                icon: const Icon(Icons.link),
-                label: const Text('Connect'),
-              ),
-              FilledButton.tonalIcon(
-                key: ValueKey('friend-send-${friend.peerId}'),
-                onPressed:
-                    _busy ||
-                        !_running ||
-                        discoveredPeer == null ||
-                        discoveredPeer.fileTransferPort == null
-                    ? null
-                    : () => _sendFileToPeer(
-                        peerId: friend.peerId,
-                        peerLabel: friend.nickname,
-                        hostAddress: discoveredPeer.hostAddress,
-                        port: discoveredPeer.fileTransferPort,
-                      ),
+                    : () => _sendFileToPeer(friend.peerId),
                 icon: const Icon(Icons.upload_file_outlined),
                 label: const Text('Send File'),
               ),
@@ -1031,37 +963,36 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget _buildFriendsCard(BuildContext context) {
+  Widget _buildDiscoveredPeersCard(BuildContext context) {
+    final peers = _discoveredPeers.values.toList(growable: false)
+      ..sort(
+        (left, right) =>
+            left.nickname.toLowerCase().compareTo(right.nickname.toLowerCase()),
+      );
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(20),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Row(
-              children: [
-                Text('Friends', style: Theme.of(context).textTheme.titleLarge),
-                const Spacer(),
-                FilledButton.icon(
-                  onPressed: () => _showFriendEditor(),
-                  icon: const Icon(Icons.person_add_alt_1),
-                  label: const Text('Add Friend'),
-                ),
-              ],
+            Text(
+              'Discovered Peers',
+              style: Theme.of(context).textTheme.titleLarge,
             ),
             const SizedBox(height: 12),
             const Text(
-              'Friends are keyed by peer ID. Share addresses stay internal and are learned from LAN or backend discovery.',
+              'Discovery is handled by the node. Dart only renders the discovered peer state.',
             ),
             const SizedBox(height: 16),
-            if (_friends.isEmpty)
-              const Text('No friends saved yet.')
+            if (peers.isEmpty)
+              const Text('No peers discovered yet.')
             else
               Column(
                 children: [
-                  for (var index = 0; index < _friends.length; index++) ...[
-                    _buildFriendCard(context, _friends[index]),
-                    if (index < _friends.length - 1) const SizedBox(height: 12),
+                  for (var index = 0; index < peers.length; index++) ...[
+                    _buildDiscoveredPeerCard(context, peers[index]),
+                    if (index < peers.length - 1) const SizedBox(height: 12),
                   ],
                 ],
               ),
@@ -1098,11 +1029,15 @@ class _MyHomePageState extends State<MyHomePage> {
                     const SizedBox(height: 8),
                     SelectableText('Peer ID: ${peer.peerId}'),
                     const SizedBox(height: 8),
-                    Text('Platform: ${peer.platform}'),
-                    if (peer.capabilities.isNotEmpty) ...[
-                      const SizedBox(height: 8),
-                      Text('Capabilities: ${peer.capabilities.join(', ')}'),
-                    ],
+                    if (peer.addresses.isEmpty)
+                      const Text('No addresses announced.')
+                    else
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: peer.addresses
+                            .map((address) => SelectableText(address))
+                            .toList(growable: false),
+                      ),
                   ],
                 ),
               ),
@@ -1116,26 +1051,10 @@ class _MyHomePageState extends State<MyHomePage> {
             runSpacing: 8,
             children: [
               FilledButton.tonalIcon(
-                key: ValueKey('discovered-connect-${peer.peerId}'),
+                key: ValueKey('discovered-send-${peer.peerId}'),
                 onPressed: _busy || !_running
                     ? null
-                    : () => _connectToPeer(
-                        address: peer.shareAddress,
-                        peerId: peer.peerId,
-                      ),
-                icon: const Icon(Icons.link),
-                label: const Text('Connect'),
-              ),
-              FilledButton.tonalIcon(
-                key: ValueKey('discovered-send-${peer.peerId}'),
-                onPressed: _busy || !_running || peer.fileTransferPort == null
-                    ? null
-                    : () => _sendFileToPeer(
-                        peerId: peer.peerId,
-                        peerLabel: peer.nickname,
-                        hostAddress: peer.hostAddress,
-                        port: peer.fileTransferPort,
-                      ),
+                    : () => _sendFileToPeer(peer.peerId),
                 icon: const Icon(Icons.upload_file_outlined),
                 label: const Text('Send File'),
               ),
@@ -1159,7 +1078,10 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget _buildDiscoveryCard(BuildContext context) {
+  Widget _buildIncomingRequestsCard(BuildContext context) {
+    final requests = _incomingRequests.values.toList(growable: false)
+      ..sort((left, right) => left.transferId.compareTo(right.transferId));
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(20),
@@ -1167,29 +1089,18 @@ class _MyHomePageState extends State<MyHomePage> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Local Discovery',
+              'Incoming Requests',
               style: Theme.of(context).textTheme.titleLarge,
             ),
             const SizedBox(height: 12),
-            const Text(
-              'Nearby ShareThing clients announce their peer ID, nickname, and supported route on the local network.',
-            ),
-            const SizedBox(height: 16),
-            if (!_running)
-              const Text('Start the engine to announce and discover LAN peers.')
-            else if (_discoveredPeers.isEmpty)
-              const Text('No LAN peers discovered yet.')
+            if (requests.isEmpty)
+              const Text('No incoming files pending.')
             else
               Column(
                 children: [
-                  for (
-                    var index = 0;
-                    index < _discoveredPeers.length;
-                    index++
-                  ) ...[
-                    _buildDiscoveredPeerCard(context, _discoveredPeers[index]),
-                    if (index < _discoveredPeers.length - 1)
-                      const SizedBox(height: 12),
+                  for (var index = 0; index < requests.length; index++) ...[
+                    _buildIncomingRequestCard(context, requests[index]),
+                    if (index < requests.length - 1) const SizedBox(height: 12),
                   ],
                 ],
               ),
@@ -1199,52 +1110,51 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget _buildManualConnectCard(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Advanced Connect',
-              style: Theme.of(context).textTheme.titleLarge,
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              'Use raw share addresses only as a fallback. Normal friend management should be peer ID based.',
-            ),
-            const SizedBox(height: 16),
-            TextField(
-              key: const ValueKey('manual-peer-field'),
-              controller: _peerController,
-              minLines: 2,
-              maxLines: 3,
-              decoration: const InputDecoration(
-                labelText: 'Peer multiaddr',
-                hintText: '/ip4/192.168.1.20/tcp/4101/p2p/...',
-                border: OutlineInputBorder(),
+  Widget _buildIncomingRequestCard(
+    BuildContext context,
+    IncomingFileRequest request,
+  ) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            request.fileName,
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 8),
+          Text('From: ${_friendLabel(request.peerId) ?? request.peerId}'),
+          const SizedBox(height: 8),
+          Text('Size: ${request.totalBytes} bytes'),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton(
+                onPressed: _busy ? null : () => _acceptIncomingRequest(request),
+                child: const Text('Accept'),
               ),
-            ),
-            const SizedBox(height: 12),
-            FilledButton(
-              key: const ValueKey('manual-connect-button'),
-              onPressed: _busy || !_running
-                  ? null
-                  : () => _connectToPeer(address: _peerController.text),
-              child: const Text('Connect'),
-            ),
-            const SizedBox(height: 12),
-            const Text(
-              'LAN file transfer uses discovered peers. Manual raw-address mode currently covers direct connect only.',
-            ),
-          ],
-        ),
+              OutlinedButton(
+                onPressed: _busy ? null : () => _rejectIncomingRequest(request),
+                child: const Text('Reject'),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
 
   Widget _buildTransfersCard(BuildContext context) {
+    final transfers = _transfers.values.toList(growable: false)
+      ..sort((left, right) => right.id.compareTo(left.id));
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(20),
@@ -1253,18 +1163,14 @@ class _MyHomePageState extends State<MyHomePage> {
           children: [
             Text('Transfers', style: Theme.of(context).textTheme.titleLarge),
             const SizedBox(height: 12),
-            const Text(
-              'Local LAN file sharing currently uses a direct app-managed transfer path across desktop and Android.',
-            ),
-            const SizedBox(height: 16),
-            if (_transfers.isEmpty)
+            if (transfers.isEmpty)
               const Text('No transfers yet.')
             else
               Column(
                 children: [
-                  for (var index = 0; index < _transfers.length; index++) ...[
-                    _buildTransferTile(context, _transfers[index]),
-                    if (index < _transfers.length - 1)
+                  for (var index = 0; index < transfers.length; index++) ...[
+                    _buildTransferCard(context, transfers[index]),
+                    if (index < transfers.length - 1)
                       const SizedBox(height: 12),
                   ],
                 ],
@@ -1275,14 +1181,13 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget _buildTransferTile(BuildContext context, FileTransferEntry transfer) {
+  Widget _buildTransferCard(BuildContext context, FileTransferEntry transfer) {
     final statusLabel = switch (transfer.status) {
       FileTransferStatus.queued => 'Queued',
       FileTransferStatus.inProgress => 'In Progress',
       FileTransferStatus.completed => 'Completed',
       FileTransferStatus.failed => 'Failed',
     };
-
     final directionLabel = switch (transfer.direction) {
       FileTransferDirection.incoming => 'Incoming',
       FileTransferDirection.outgoing => 'Outgoing',
@@ -1302,17 +1207,13 @@ class _MyHomePageState extends State<MyHomePage> {
             style: Theme.of(context).textTheme.titleMedium,
           ),
           const SizedBox(height: 8),
-          Text('$directionLabel with ${transfer.peerLabel}'),
+          Text('$directionLabel • ${transfer.peerLabel}'),
           const SizedBox(height: 8),
           LinearProgressIndicator(value: transfer.progress),
           const SizedBox(height: 8),
           Text(
             '$statusLabel • ${transfer.bytesTransferred}/${transfer.totalBytes} bytes',
           ),
-          if (transfer.localPath != null) ...[
-            const SizedBox(height: 8),
-            SelectableText('Path: ${transfer.localPath}'),
-          ],
           if (transfer.error != null) ...[
             const SizedBox(height: 8),
             Text(
@@ -1337,17 +1238,17 @@ class _MyHomePageState extends State<MyHomePage> {
             const SizedBox(height: 16),
             _buildFriendsCard(context),
             const SizedBox(height: 16),
-            _buildDiscoveryCard(context),
+            _buildDiscoveredPeersCard(context),
+            const SizedBox(height: 16),
+            _buildIncomingRequestsCard(context),
             const SizedBox(height: 16),
             _buildTransfersCard(context),
-            const SizedBox(height: 16),
-            _buildManualConnectCard(context),
           ],
         ),
       ),
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _busy ? null : (_running ? _stopEngine : _startEngine),
-        label: Text(_running ? 'Stop Engine' : 'Start Engine'),
+        label: Text(_running ? 'Stop Node' : 'Start Node'),
         icon: Icon(_running ? Icons.stop : Icons.play_arrow),
       ),
     );

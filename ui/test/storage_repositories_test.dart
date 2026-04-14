@@ -47,11 +47,7 @@ void main() {
       const AppSettings(nickname: 'Tester'),
     );
     await friendsRepository.saveFriends(const [
-      FriendEntry(
-        peerId: 'peer-123',
-        nickname: 'Alice',
-        lastKnownShareAddress: '/ip4/192.168.1.5/tcp/4101/p2p/peer-123',
-      ),
+      FriendEntry(peerId: 'peer-123', nickname: 'Alice'),
     ]);
 
     final settingsFile = File('${root.path}/config/settings.json');

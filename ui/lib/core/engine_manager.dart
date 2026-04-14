@@ -7,122 +7,168 @@ import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
 class EngineManager {
-  static const _channel = MethodChannel('engine');
+  static const _commandChannel = MethodChannel('engine/commands');
+  static const _eventChannel = EventChannel('engine/events');
   static const _desktopJarAsset = 'assets/engine/p2p_engine.jar';
-  static const _defaultDesktopPort = 4101;
 
   Process? _engineProcess;
   Completer<void>? _desktopReady;
-  final Map<String, Completer<Map<String, dynamic>>> _pendingRequests = {};
+  StreamSubscription<dynamic>? _androidEventSubscription;
   final _eventController = StreamController<Map<String, dynamic>>.broadcast();
 
   Stream<Map<String, dynamic>> get updates => _eventController.stream;
-  bool get isAlive => Platform.isAndroid ? _androidStarted : _engineProcess != null;
-  bool get supportsPeerConnections => true;
-  bool get supportsFileTransfers => false;
-  String get endpointLabel => 'Share address';
+  bool get isAlive =>
+      Platform.isAndroid ? _androidStarted : _engineProcess != null;
+  bool get supportsFileTransfers => true;
 
   bool _androidStarted = false;
 
-  Future<void> start() async {
+  Future<void> start({
+    required String nickname,
+    required List<String> discoveryServers,
+  }) async {
     if (Platform.isAndroid) {
       if (_androidStarted) return;
-      await _channel.invokeMethod<Map>('startEngine');
+      await _listenForAndroidEvents();
+      final started = _waitForEventTypes({'NODE_STARTED', 'ERROR'});
+      await _sendAndroidCommand({
+        'type': 'START_NODE',
+        'nickname': nickname,
+        'discoveryServers': discoveryServers,
+      });
       _androidStarted = true;
-      await Future.delayed(const Duration(seconds: 2));
-      _eventController.add({'type': 'event', 'event': 'node_started'});
+      await started;
       return;
     }
 
     if (_engineProcess != null) return;
     await _startDesktopProcess();
-
-    await _startDesktopNode();
-    _eventController.add({'type': 'event', 'event': 'node_started'});
-  }
-
-  Future<Map<String, dynamic>> sendCommand(
-    String type, [
-    Map<String, dynamic>? params,
-  ]) async {
-    if (Platform.isAndroid) {
-      final args = <String, dynamic>{'type': type, ...?params};
-      final result = await _channel.invokeMethod<Map>('command', args);
-      return Map<String, dynamic>.from(result ?? {});
-    }
-
-    if (_engineProcess == null) {
-      throw StateError('Desktop engine is not running.');
-    }
-
-    const supportedDesktopCommands = {
-      'start_node',
-      'stop_node',
-      'get_id',
-      'get_port',
-      'get_listen_address',
-      'connect',
-    };
-
-    if (!supportedDesktopCommands.contains(type)) {
-      throw UnsupportedError(
-        'Desktop engine command `$type` is not implemented yet.',
-      );
-    }
-
-    final id = DateTime.now().microsecondsSinceEpoch.toString();
-    final completer = Completer<Map<String, dynamic>>();
-    _pendingRequests[id] = completer;
-
-    final request = {'requestId': id, 'type': type, ...?params};
-    _engineProcess!.stdin.writeln(jsonEncode(request));
-
-    return completer.future.timeout(
-      const Duration(seconds: 10),
-      onTimeout: () {
-        _pendingRequests.remove(id);
-        throw TimeoutException('Engine failed to respond to $type in 10s');
-      },
-    );
-  }
-
-  Future<void> sendFile(String path, String peerAddr) async {
-    throw UnsupportedError(
-      'File transfer is not wired into the Flutter bridge yet. Requested `$path` for `$peerAddr`.',
-    );
+    final started = _waitForEventTypes({'NODE_STARTED', 'ERROR'});
+    await _sendDesktopCommand({
+      'type': 'START_NODE',
+      'nickname': nickname,
+      'discoveryServers': discoveryServers,
+    });
+    await started;
   }
 
   Future<void> stop() async {
     if (Platform.isAndroid) {
       if (_androidStarted) {
+        await _sendAndroidCommand({'type': 'STOP_NODE'});
         _androidStarted = false;
-        _eventController.add({'type': 'event', 'event': 'node_stopped'});
       }
+      await _androidEventSubscription?.cancel();
+      _androidEventSubscription = null;
       return;
     }
 
-    final process = _engineProcess;
-    if (process == null) return;
+    if (_engineProcess == null) return;
+    final process = _engineProcess!;
 
     try {
-      final response = await sendCommand('stop_node');
-      _ensureDesktopCommandSucceeded('stop_node', response);
+      await _sendDesktopCommand({'type': 'STOP_NODE'});
     } catch (_) {
-      // Best effort shutdown. The process is still terminated below.
+      // Best effort shutdown.
     }
 
-    process.kill();
+    try {
+      await process.stdin.close();
+    } catch (_) {
+      // Ignore shutdown races.
+    }
+
+    try {
+      await process.exitCode.timeout(const Duration(seconds: 5));
+    } catch (_) {
+      process.kill();
+      try {
+        await process.exitCode.timeout(const Duration(seconds: 2));
+      } catch (_) {
+        // Ignore forced shutdown races.
+      }
+    }
+
     _engineProcess = null;
     _desktopReady = null;
-    _failPendingRequests('Desktop engine stopped.');
-    _eventController.add({'type': 'event', 'event': 'node_stopped'});
+  }
+
+  Future<void> sendFile({
+    required String targetPeerId,
+    required String filePath,
+  }) async {
+    final payload = {
+      'type': 'SEND_FILE',
+      'targetPeerId': targetPeerId,
+      'filePath': filePath,
+    };
+
+    if (Platform.isAndroid) {
+      await _sendAndroidCommand(payload);
+      return;
+    }
+
+    await _sendDesktopCommand(payload);
+  }
+
+  Future<void> acceptFile({
+    required String transferId,
+    required String savePath,
+  }) async {
+    final payload = {
+      'type': 'ACCEPT_FILE',
+      'transferId': transferId,
+      'savePath': savePath,
+    };
+
+    if (Platform.isAndroid) {
+      await _sendAndroidCommand(payload);
+      return;
+    }
+
+    await _sendDesktopCommand(payload);
+  }
+
+  Future<void> rejectFile({required String transferId}) async {
+    final payload = {'type': 'REJECT_FILE', 'transferId': transferId};
+
+    if (Platform.isAndroid) {
+      await _sendAndroidCommand(payload);
+      return;
+    }
+
+    await _sendDesktopCommand(payload);
+  }
+
+  Future<void> _listenForAndroidEvents() async {
+    if (_androidEventSubscription != null) return;
+
+    _androidEventSubscription = _eventChannel.receiveBroadcastStream().listen(
+      (event) {
+        final message = _decodeMessage(event);
+        if (message == null) return;
+        _eventController.add(message);
+      },
+      onError: (error) {
+        _eventController.add({'type': 'ERROR', 'message': '$error'});
+      },
+    );
+  }
+
+  Future<void> _sendAndroidCommand(Map<String, dynamic> payload) async {
+    await _commandChannel.invokeMethod<void>(
+      'commandJson',
+      jsonEncode(payload),
+    );
   }
 
   Future<void> _startDesktopProcess() async {
     final jarPath = await _resolveDesktopJarPath();
     final javaBin = await _findJava();
     if (javaBin == null) {
-      throw StateError('Java 17+ was not found. Set JAVA_HOME before starting ShareThing.');
+      throw StateError(
+        'Java 17+ was not found. Set JAVA_HOME before starting ShareThing.',
+      );
     }
 
     _desktopReady = Completer<void>();
@@ -146,8 +192,7 @@ class EngineManager {
           StateError('Desktop engine exited during startup with code $code.'),
         );
       }
-      _failPendingRequests('Desktop engine exited with code $code.');
-      _eventController.add({'type': 'event', 'event': 'node_stopped', 'exitCode': code});
+      _eventController.add({'type': 'NODE_STOPPED', 'exitCode': code});
     });
 
     await _desktopReady!.future.timeout(
@@ -158,81 +203,50 @@ class EngineManager {
     );
   }
 
-  Future<void> _startDesktopNode() async {
-    final attemptedPorts = <int>[_defaultDesktopPort];
-    final fallbackPort = await _findAvailablePort();
-    if (fallbackPort != _defaultDesktopPort) {
-      attemptedPorts.add(fallbackPort);
+  Future<void> _sendDesktopCommand(Map<String, dynamic> payload) async {
+    if (_engineProcess == null) {
+      throw StateError('Desktop engine is not running.');
     }
-
-    Object? lastError;
-    for (final port in attemptedPorts) {
-      final response = await sendCommand('start_node', {'port': port});
-      try {
-        _ensureDesktopCommandSucceeded('start_node', response);
-        return;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-
-    throw lastError ??
-        StateError('Desktop engine failed to start on any candidate port.');
+    _engineProcess!.stdin.writeln(jsonEncode(payload));
   }
 
   void _handleDesktopMessage(String line) {
-    if (line.trim().isEmpty) return;
-
-    try {
-      final msg = jsonDecode(line) as Map<String, dynamic>;
-      final type = msg['type'] as String?;
-      final data = msg['data'];
-
-      if (type == 'event' && data == 'ready') {
-        _desktopReady?.complete();
-        return;
-      }
-
-      final id = msg['requestId'] as String?;
-      if (id != null && _pendingRequests.containsKey(id)) {
-        _pendingRequests[id]!.complete(msg);
-        _pendingRequests.remove(id);
-        return;
-      }
-
-      if (type == 'event' && data is String) {
-        _eventController.add({'type': 'event', 'event': data});
-        return;
-      }
-
-      _eventController.add(msg);
-    } catch (_) {
+    final message = _decodeMessage(line);
+    if (message == null) {
       debugPrint('ENGINE: $line');
+      return;
     }
+
+    if (message['type'] == 'READY') {
+      _desktopReady?.complete();
+      return;
+    }
+
+    _eventController.add(message);
   }
 
-  void _ensureDesktopCommandSucceeded(
-    String command,
-    Map<String, dynamic> response,
-  ) {
-    final error = response['error'];
-    if (error is String && error.isNotEmpty) {
-      throw StateError('Desktop engine failed `$command`: $error');
-    }
-
-    final data = response['data'];
-    if (data is String && data.startsWith('Error:')) {
-      throw StateError('Desktop engine failed `$command`: $data');
-    }
-  }
-
-  void _failPendingRequests(String message) {
-    for (final entry in _pendingRequests.entries) {
-      if (!entry.value.isCompleted) {
-        entry.value.completeError(StateError(message));
+  Map<String, dynamic>? _decodeMessage(dynamic rawMessage) {
+    try {
+      if (rawMessage is Map) {
+        return Map<String, dynamic>.from(rawMessage);
       }
+      if (rawMessage is String) {
+        return Map<String, dynamic>.from(jsonDecode(rawMessage) as Map);
+      }
+    } catch (_) {
+      return null;
     }
-    _pendingRequests.clear();
+    return null;
+  }
+
+  Future<void> _waitForEventTypes(Set<String> types) async {
+    final event = await updates
+        .firstWhere((message) => types.contains(message['type']))
+        .timeout(const Duration(seconds: 10));
+
+    if (event['type'] == 'ERROR') {
+      throw StateError(event['message']?.toString() ?? 'Node error');
+    }
   }
 
   Future<String> _resolveDesktopJarPath() async {
@@ -267,13 +281,6 @@ class EngineManager {
     }
   }
 
-  Future<int> _findAvailablePort() async {
-    final socket = await ServerSocket.bind(InternetAddress.anyIPv4, 0);
-    final port = socket.port;
-    await socket.close();
-    return port;
-  }
-
   Future<String?> _findJava() async {
     try {
       final home = Platform.environment['JAVA_HOME'];
@@ -283,7 +290,10 @@ class EngineManager {
       }
 
       if (Platform.isMacOS) {
-        final result = await Process.run('/usr/libexec/java_home', ['-v', '17']);
+        final result = await Process.run('/usr/libexec/java_home', [
+          '-v',
+          '17',
+        ]);
         final resolvedHome = (result.stdout as String).trim();
         if (resolvedHome.isNotEmpty) {
           return p.join(resolvedHome, 'bin', 'java');

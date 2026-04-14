@@ -1,85 +1,80 @@
-# ShareThing – compatible p2p file sharing software
+# ShareThing
 
-A decentralized P2P file-sharing application built with **Kotlin Multiplatform** and **Flutter**.
+ShareThing is a privacy-first peer-to-peer file sharing client split into a Flutter UI and platform-specific libp2p nodes.
 
-## Project Structure
+## Architecture
 
-* **`engine/`**: The core P2P logic.
-    * Written in Kotlin Multiplatform.
-    * Uses `jvm-libp2p` for decentralized networking.
-    * Targets: Android (AAR) and JVM Desktop (JAR).
-* **`ui/`**: The frontend application.
-    * Built with Flutter.
-    * Communicates with the engine via MethodChannels (Android) and JNI/Native bridges (Desktop).
+- `ui/`
+  - Flutter UI, persistent state, and process orchestration
+  - stores config and local friend data as JSON files
+  - does not perform peer discovery, transport negotiation, or file byte streaming
+- `engine/`
+  - headless Kotlin JVM node for desktop
+  - communicates with Flutter over newline-delimited JSON on stdin/stdout
+- `p2pbridge/`
+  - Go libp2p bridge for Android
+  - invoked from the Android host layer
 
-## Getting Started
+## JSON Contract
 
-### Prerequisites
-* **JDK 17 (minimum)** 
-* **Flutter SDK** 
-* **Android SDK**
-* * **Go 1.21+** (for Android only) — https://go.dev/dl/
-* **gomobile** (for Android only)
-* **Android NDK** (installed via Android Studio → SDK Manager → SDK Tools)
+Flutter sends newline-delimited JSON commands to the node layer. The primary command types are:
 
-### 🛠 Building the Engine
-Before running the UI, you must compile the Kotlin engine to generate the necessary libraries.
+- `START_NODE`
+- `STOP_NODE`
+- `SEND_FILE`
+- `ACCEPT_FILE`
+- `REJECT_FILE`
 
-1.  Navigate to the engine directory:
-    ```bash
-    cd engine
-    ```
-2.  Build the Desktop library:
-    ```bash
-    ./gradlew :lib:desktopJar
-    ```
-3.  Build the Android library:
-    ```bash
-    ./gradlew :lib:assembleRelease
-    ```
+The node emits JSON events back to Flutter. The primary event types are:
 
-### 📱 Running the UI
-1.  Navigate to the UI directory:
-    ```bash
-    cd ui
-    ```
-2.  Fetch dependencies:
-    ```bash
-    flutter pub get
-    ```
-3.  Run the app:
-    ```bash
-    flutter run
-    ```
+- `NODE_STARTED`
+- `PEER_DISCOVERED`
+- `PEER_NICKNAME_CHANGED`
+- `INCOMING_FILE_REQUEST`
+- `TRANSFER_UPDATE`
 
-### 🤖 Building the Android Engine (go-libp2p)
+## Storage
 
-Android does not support JVM-based libp2p, so a separate Go bridge is used instead.
-This must be built once and copied into the Flutter project before running on Android.
+Client data is stored in platform-appropriate application directories:
 
-#### 1. Install Go
-Download and install Go from https://go.dev/dl/ (1.21 or newer).
-go get github.com/libp2p/go-libp2p@v0.38.1
+- Linux
+  - config: `~/.config/sharething/`
+  - data: `~/.local/share/sharething/`
+- Windows
+  - config: `%APPDATA%\\ShareThing\\`
+  - data: `%LOCALAPPDATA%\\ShareThing\\`
+- macOS
+  - `~/Library/Application Support/ShareThing/`
+- Android
+  - app-specific support/data directories
 
-#### 2. Install gomobile
+## Current State
+
+- Desktop node startup and identity persistence are wired.
+- Flutter friend/config storage is file-backed JSON.
+- Dart-side LAN networking and Dart-side file streaming were removed to restore the intended architecture boundary.
+- `SEND_FILE`, `ACCEPT_FILE`, and `REJECT_FILE` are part of the shared contract, but full node-side transfer handling is not implemented yet.
+
+## Build
+
+### Desktop Engine
+
 ```bash
-go install golang.org/x/mobile/cmd/gomobile@latest
-gomobile init
+cd engine
+JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew :lib:desktopJar :lib:syncDesktopJar --no-daemon
 ```
 
-#### 3. Build the .aar
+### Flutter UI
+
+Use `fvm`:
+
 ```bash
-cd p2pbridge
-gomobile bind -target android/arm64 -androidapi 21 -o p2p.aar .
+cd ui
+fvm flutter analyze
+fvm flutter test
+fvm flutter build linux
 ```
 
-This produces two files: `p2p.aar` and `p2p-sources.jar`.
+### Android Go Bridge
 
-#### 4. Copy into the Flutter project
-```bash
-cp p2p.aar ../ui/android/app/libs/
-cp p2p-sources.jar ../ui/android/app/libs/
-```
-
-## 📜 License
-This project is licensed under the **GPL-3.0 License** - see the LICENSE file for details.
+The Android bridge source lives in `p2pbridge/`, but the checked-in Android app currently consumes a prebuilt bridge artifact in `ui/android/app/libs/`.

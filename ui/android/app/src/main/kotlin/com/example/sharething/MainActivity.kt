@@ -3,101 +3,99 @@ package com.example.sharething
 import android.content.Intent
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
-import p2p.P2p
+import org.json.JSONObject
 
 class MainActivity : FlutterActivity() {
+    companion object {
+        private var eventSink: EventChannel.EventSink? = null
 
-    private val CHANNEL = "engine"
+        fun emitEvent(payload: Map<String, Any?>) {
+            eventSink?.success(payload)
+        }
+    }
+
+    private val commandChannel = "engine/commands"
+    private val eventChannel = "engine/events"
     private var started = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, commandChannel)
             .setMethodCallHandler { call, result ->
                 when (call.method) {
-
-                    "startEngine" -> {
-                        if (started) {
-                            result.success(mapOf("status" to "already_started"))
-                            return@setMethodCallHandler
-                        }
-                        startForegroundService(Intent(this, EngineService::class.java))
-                        started = true
-                        result.success(mapOf("status" to "running"))
-                    }
-
-                    "command" -> {
-                        val type = call.argument<String>("type")
-                        if (type == null) {
-                            result.error("INVALID_ARGUMENT", "type is null", null)
+                    "commandJson" -> {
+                        val payload = call.arguments as? String
+                        if (payload == null) {
+                            result.error("INVALID_ARGUMENT", "payload is null", null)
                             return@setMethodCallHandler
                         }
 
-                        when (type) {
-
-                            "ping" -> {
-                                result.success(mapOf("response" to "pong"))
-                            }
-
-                            "get_id" -> {
-                                Thread {
-                                    var attempts = 0
-                                    while (EngineService.peerId.isEmpty() && attempts < 20) {
-                                        Thread.sleep(500)
-                                        attempts++
-                                    }
-                                    result.success(mapOf("data" to EngineService.peerId))
-                                }.start()
-                            }
-
-                            "get_port", "get_listen_address" -> {
-                                Thread {
-                                    var attempts = 0
-                                    while (EngineService.multiaddr.isEmpty() && attempts < 20) {
-                                        Thread.sleep(500)
-                                        attempts++
-                                    }
-                                    result.success(mapOf("data" to EngineService.multiaddr))
-                                }.start()
-                            }
-
-                            "connect" -> {
-                                val addr = call.argument<String>("multiaddr")
-                                if (addr == null) {
-                                    result.error("INVALID_ARGUMENT", "multiaddr is null", null)
-                                    return@setMethodCallHandler
-                                }
-                                Thread {
-                                    try {
-                                        P2p.connectToPeer(addr)
-                                        result.success(mapOf("status" to "connected", "addr" to addr))
-                                    } catch (e: Exception) {
-                                        result.error("CONNECT_FAILED", e.message, null)
-                                    }
-                                }.start()
-                            }
-
-                            "send_message" -> {
-                                val peerId  = call.argument<String>("peerId")!!
-                                val message = call.argument<String>("message")!!
-                                Thread {
-                                    try {
-                                        P2p.sendMessage(peerId, message)
-                                        result.success(mapOf("status" to "sent"))
-                                    } catch (e: Exception) {
-                                        result.error("SEND_FAILED", e.message, null)
-                                    }
-                                }.start()
-                            }
-
-                            else -> result.success(mapOf("error" to "unknown_command"))
-                        }
+                        handleJsonCommand(payload, result)
                     }
 
                     else -> result.notImplemented()
                 }
             }
+
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, eventChannel)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, sink: EventChannel.EventSink) {
+                    eventSink = sink
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    eventSink = null
+                }
+            })
+    }
+
+    private fun handleJsonCommand(
+        payload: String,
+        result: MethodChannel.Result
+    ) {
+        val json = try {
+            JSONObject(payload)
+        } catch (e: Exception) {
+            result.error("INVALID_JSON", e.message, null)
+            return
+        }
+
+        when (json.optString("type")) {
+            "START_NODE" -> {
+                if (started) {
+                    result.success(null)
+                    return
+                }
+
+                val intent = Intent(this, EngineService::class.java).apply {
+                    putExtra("nickname", json.optString("nickname"))
+                    putExtra("discoveryServers", json.optJSONArray("discoveryServers")?.toString())
+                }
+                startForegroundService(intent)
+                started = true
+                result.success(null)
+            }
+
+            "STOP_NODE" -> {
+                stopService(Intent(this, EngineService::class.java))
+                started = false
+                result.success(null)
+            }
+
+            "SEND_FILE",
+            "ACCEPT_FILE",
+            "REJECT_FILE" -> {
+                result.error(
+                    "UNSUPPORTED",
+                    "${json.optString("type")} is not implemented in the Android bridge yet",
+                    null
+                )
+            }
+
+            else -> result.error("UNKNOWN_COMMAND", json.optString("type"), null)
+        }
     }
 }
