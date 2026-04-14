@@ -1,31 +1,62 @@
 class FriendEntry {
   const FriendEntry({
-    required this.id,
+    required this.peerId,
     required this.nickname,
-    required this.multiaddr,
+    this.lastKnownShareAddress,
   });
 
-  final String id;
+  final String peerId;
   final String nickname;
-  final String multiaddr;
+  final String? lastKnownShareAddress;
 
   factory FriendEntry.fromJson(Map<String, dynamic> json) {
+    final peerId =
+        json['peerId']?.toString() ??
+        _peerIdFromAddress(
+          json['multiaddr']?.toString() ??
+              json['lastKnownShareAddress']?.toString(),
+        ) ??
+        '';
+
     return FriendEntry(
-      id: json['id']?.toString() ?? '',
+      peerId: peerId,
       nickname: json['nickname']?.toString() ?? '',
-      multiaddr: json['multiaddr']?.toString() ?? '',
+      lastKnownShareAddress:
+          json['lastKnownShareAddress']?.toString() ??
+          json['multiaddr']?.toString(),
     );
   }
 
   Map<String, dynamic> toJson() {
-    return {'id': id, 'nickname': nickname, 'multiaddr': multiaddr};
+    return {
+      'peerId': peerId,
+      'nickname': nickname,
+      'lastKnownShareAddress': lastKnownShareAddress,
+    };
   }
 
-  FriendEntry copyWith({String? id, String? nickname, String? multiaddr}) {
+  FriendEntry copyWith({
+    String? peerId,
+    String? nickname,
+    String? lastKnownShareAddress,
+  }) {
     return FriendEntry(
-      id: id ?? this.id,
+      peerId: peerId ?? this.peerId,
       nickname: nickname ?? this.nickname,
-      multiaddr: multiaddr ?? this.multiaddr,
+      lastKnownShareAddress:
+          lastKnownShareAddress ?? this.lastKnownShareAddress,
     );
+  }
+
+  static String? _peerIdFromAddress(String? address) {
+    if (address == null || address.isEmpty) {
+      return null;
+    }
+
+    final markerIndex = address.lastIndexOf('/p2p/');
+    if (markerIndex == -1) {
+      return null;
+    }
+    return address.substring(markerIndex + 5);
   }
 }

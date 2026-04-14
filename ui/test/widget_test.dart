@@ -3,10 +3,13 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:sharething/core/engine_manager.dart';
+import 'package:sharething/features/discovery/discovered_peer.dart';
+import 'package:sharething/features/discovery/local_discovery_service.dart';
 import 'package:sharething/features/friends/friend.dart';
 import 'package:sharething/features/friends/friends_repository.dart';
+import 'package:sharething/features/settings/app_settings.dart';
+import 'package:sharething/features/settings/settings_repository.dart';
 import 'package:sharething/main.dart';
-import 'package:shared_preferences/shared_preferences.dart';
 
 class FakeEngineManager extends EngineManager {
   final StreamController<Map<String, dynamic>> _updatesController =
@@ -41,7 +44,7 @@ class FakeEngineManager extends EngineManager {
     return switch (type) {
       'get_id' => {'data': 'fake-peer-id'},
       'get_listen_address' => {
-        'data': '/ip4/192.168.1.20/tcp/4001/p2p/fake-peer-id',
+        'data': '/ip4/192.168.1.20/tcp/4101/p2p/fake-peer-id',
       },
       'connect' => {
         'status': 'connected',
@@ -61,37 +64,115 @@ class FakeEngineManager extends EngineManager {
   }
 }
 
+class InMemoryFriendsRepository implements FriendsRepository {
+  InMemoryFriendsRepository([List<FriendEntry>? friends])
+    : _friends = [...?friends];
+
+  List<FriendEntry> _friends;
+
+  @override
+  Future<List<FriendEntry>> loadFriends() async =>
+      List<FriendEntry>.from(_friends);
+
+  @override
+  Future<void> saveFriends(List<FriendEntry> friends) async {
+    _friends = List<FriendEntry>.from(friends);
+  }
+}
+
+class InMemorySettingsRepository implements SettingsRepository {
+  InMemorySettingsRepository([AppSettings? settings])
+    : _settings = settings ?? const AppSettings(nickname: 'Local Tester');
+
+  AppSettings _settings;
+
+  @override
+  Future<AppSettings> loadSettings() async => _settings;
+
+  @override
+  Future<void> saveSettings(AppSettings settings) async {
+    _settings = settings;
+  }
+}
+
+class FakeLocalDiscoveryService implements LocalDiscoveryService {
+  final _controller = StreamController<List<DiscoveredPeer>>.broadcast();
+
+  String? lastStartedPeerId;
+  String? lastStartedNickname;
+  String? lastStartedShareAddress;
+
+  @override
+  Stream<List<DiscoveredPeer>> get peers => _controller.stream;
+
+  @override
+  Future<void> start({
+    required String peerId,
+    required String nickname,
+    required String shareAddress,
+    required List<String> capabilities,
+  }) async {
+    lastStartedPeerId = peerId;
+    lastStartedNickname = nickname;
+    lastStartedShareAddress = shareAddress;
+  }
+
+  @override
+  Future<void> stop() async {}
+
+  void emit(List<DiscoveredPeer> peers) {
+    _controller.add(peers);
+  }
+}
+
 void _setLargeSurface(WidgetTester tester) {
-  tester.view.physicalSize = const Size(1200, 2000);
+  tester.view.physicalSize = const Size(1200, 2200);
   tester.view.devicePixelRatio = 1;
 }
 
+ShareThingApp _buildApp({
+  required FakeEngineManager engine,
+  FriendsRepository? friendsRepository,
+  SettingsRepository? settingsRepository,
+  FakeLocalDiscoveryService? discoveryService,
+}) {
+  return ShareThingApp(
+    engine: engine,
+    friendsRepository: friendsRepository ?? InMemoryFriendsRepository(),
+    settingsRepository: settingsRepository ?? InMemorySettingsRepository(),
+    discoveryService: discoveryService ?? FakeLocalDiscoveryService(),
+  );
+}
+
 void main() {
-  setUp(() {
-    SharedPreferences.setMockInitialValues({});
-  });
+  testWidgets(
+    'renders current engine state, nickname, and empty friends list',
+    (tester) async {
+      _setLargeSurface(tester);
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
 
-  testWidgets('renders current engine state and empty friends list', (
-    tester,
-  ) async {
-    _setLargeSurface(tester);
-    addTearDown(tester.view.resetPhysicalSize);
-    addTearDown(tester.view.resetDevicePixelRatio);
+      final engine = FakeEngineManager();
+      final discovery = FakeLocalDiscoveryService();
 
-    await tester.pumpWidget(ShareThingApp(engine: FakeEngineManager()));
-    await tester.pumpAndSettle();
+      await tester.pumpWidget(
+        _buildApp(engine: engine, discoveryService: discovery),
+      );
+      await tester.pumpAndSettle();
 
-    expect(find.text('Node Online'), findsOneWidget);
-    expect(find.text('Peer ID: fake-peer-id'), findsOneWidget);
-    expect(
-      find.text('Share address: /ip4/192.168.1.20/tcp/4001/p2p/fake-peer-id'),
-      findsOneWidget,
-    );
-    expect(find.text('Friends'), findsOneWidget);
-    expect(find.text('No friends saved yet.'), findsOneWidget);
-    expect(find.byKey(const ValueKey('manual-peer-field')), findsOneWidget);
-    expect(find.byKey(const ValueKey('manual-connect-button')), findsOneWidget);
-  });
+      expect(find.text('Node Online'), findsOneWidget);
+      expect(find.text('Nickname: Local Tester'), findsOneWidget);
+      expect(find.text('Peer ID: fake-peer-id'), findsOneWidget);
+      expect(
+        find.text('Share address: /ip4/192.168.1.20/tcp/4101/p2p/fake-peer-id'),
+        findsOneWidget,
+      );
+      expect(find.text('No friends saved yet.'), findsOneWidget);
+      expect(find.text('No LAN peers discovered yet.'), findsOneWidget);
+      expect(discovery.lastStartedPeerId, 'fake-peer-id');
+      expect(discovery.lastStartedNickname, 'Local Tester');
+    },
+  );
 
   testWidgets('manual connect sends the entered multiaddr to the engine', (
     tester,
@@ -102,17 +183,14 @@ void main() {
 
     final engine = FakeEngineManager();
 
-    await tester.pumpWidget(ShareThingApp(engine: engine));
+    await tester.pumpWidget(_buildApp(engine: engine));
     await tester.pumpAndSettle();
 
-    const remoteAddress = '/ip4/192.168.1.30/tcp/4001/p2p/remote-peer';
+    const remoteAddress = '/ip4/192.168.1.30/tcp/4101/p2p/remote-peer';
 
     await tester.enterText(
       find.byKey(const ValueKey('manual-peer-field')),
       remoteAddress,
-    );
-    await tester.ensureVisible(
-      find.byKey(const ValueKey('manual-connect-button')),
     );
     await tester.tap(find.byKey(const ValueKey('manual-connect-button')));
     await tester.pumpAndSettle();
@@ -121,36 +199,77 @@ void main() {
     expect(find.text('Connected to $remoteAddress'), findsOneWidget);
   });
 
-  testWidgets(
-    'loads a saved friend and connects using the stored share address',
-    (tester) async {
-      _setLargeSurface(tester);
-      addTearDown(tester.view.resetPhysicalSize);
-      addTearDown(tester.view.resetDevicePixelRatio);
+  testWidgets('loads a saved friend and connects using the cached route', (
+    tester,
+  ) async {
+    _setLargeSurface(tester);
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
 
-      const alice = FriendEntry(
-        id: 'alice',
+    final engine = FakeEngineManager();
+    final repository = InMemoryFriendsRepository([
+      const FriendEntry(
+        peerId: 'alice-peer',
         nickname: 'Alice',
-        multiaddr: '/ip4/192.168.1.44/tcp/4001/p2p/alice-peer',
-      );
-      await FriendsRepository().saveFriends(const [alice]);
+        lastKnownShareAddress: '/ip4/192.168.1.44/tcp/4101/p2p/alice-peer',
+      ),
+    ]);
 
-      final engine = FakeEngineManager();
+    await tester.pumpWidget(
+      _buildApp(engine: engine, friendsRepository: repository),
+    );
+    await tester.pumpAndSettle();
 
-      await tester.pumpWidget(ShareThingApp(engine: engine));
-      await tester.pumpAndSettle();
+    expect(find.text('Alice'), findsOneWidget);
+    expect(find.text('Peer ID: alice-peer'), findsOneWidget);
 
-      expect(find.text('Alice'), findsOneWidget);
-      expect(find.text('Unknown'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('friend-connect-alice-peer')));
+    await tester.pumpAndSettle();
 
-      await tester.ensureVisible(
-        find.byKey(const ValueKey('friend-connect-alice')),
-      );
-      await tester.tap(find.byKey(const ValueKey('friend-connect-alice')));
-      await tester.pumpAndSettle();
+    expect(
+      engine.lastConnectedAddress,
+      '/ip4/192.168.1.44/tcp/4101/p2p/alice-peer',
+    );
+    expect(
+      find.text('Connected to /ip4/192.168.1.44/tcp/4101/p2p/alice-peer'),
+      findsOneWidget,
+    );
+  });
 
-      expect(engine.lastConnectedAddress, alice.multiaddr);
-      expect(find.text('Online'), findsOneWidget);
-    },
-  );
+  testWidgets('shows discovered peers and allows direct connect', (
+    tester,
+  ) async {
+    _setLargeSurface(tester);
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
+
+    final engine = FakeEngineManager();
+    final discovery = FakeLocalDiscoveryService();
+
+    await tester.pumpWidget(
+      _buildApp(engine: engine, discoveryService: discovery),
+    );
+    await tester.pumpAndSettle();
+
+    discovery.emit([
+      DiscoveredPeer(
+        peerId: 'bob-peer',
+        nickname: 'Bob',
+        shareAddress: '/ip4/192.168.1.55/tcp/4101/p2p/bob-peer',
+        platform: 'linux',
+        capabilities: const ['tcp-connect', 'lan-announcement'],
+        lastSeen: DateTime.now(),
+      ),
+    ]);
+    await tester.pumpAndSettle();
+
+    expect(find.text('Bob'), findsOneWidget);
+    await tester.tap(find.byKey(const ValueKey('discovered-connect-bob-peer')));
+    await tester.pumpAndSettle();
+
+    expect(
+      engine.lastConnectedAddress,
+      '/ip4/192.168.1.55/tcp/4101/p2p/bob-peer',
+    );
+  });
 }

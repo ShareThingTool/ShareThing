@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 class EngineManager {
   static const _channel = MethodChannel('engine');
   static const _desktopJarAsset = 'assets/engine/p2p_engine.jar';
+  static const _defaultDesktopPort = 4101;
 
   Process? _engineProcess;
   Completer<void>? _desktopReady;
@@ -36,9 +37,7 @@ class EngineManager {
     if (_engineProcess != null) return;
     await _startDesktopProcess();
 
-    final port = await _findAvailablePort();
-    final response = await sendCommand('start_node', {'port': port});
-    _ensureDesktopCommandSucceeded('start_node', response);
+    await _startDesktopNode();
     _eventController.add({'type': 'event', 'event': 'node_started'});
   }
 
@@ -157,6 +156,28 @@ class EngineManager {
         'Desktop engine did not report readiness in time.',
       ),
     );
+  }
+
+  Future<void> _startDesktopNode() async {
+    final attemptedPorts = <int>[_defaultDesktopPort];
+    final fallbackPort = await _findAvailablePort();
+    if (fallbackPort != _defaultDesktopPort) {
+      attemptedPorts.add(fallbackPort);
+    }
+
+    Object? lastError;
+    for (final port in attemptedPorts) {
+      final response = await sendCommand('start_node', {'port': port});
+      try {
+        _ensureDesktopCommandSucceeded('start_node', response);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    throw lastError ??
+        StateError('Desktop engine failed to start on any candidate port.');
   }
 
   void _handleDesktopMessage(String line) {

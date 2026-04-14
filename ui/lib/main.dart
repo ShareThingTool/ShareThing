@@ -5,8 +5,12 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'core/engine_manager.dart';
+import 'features/discovery/discovered_peer.dart';
+import 'features/discovery/local_discovery_service.dart';
 import 'features/friends/friend.dart';
 import 'features/friends/friends_repository.dart';
+import 'features/settings/app_settings.dart';
+import 'features/settings/settings_repository.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
@@ -14,10 +18,21 @@ void main() {
 }
 
 class ShareThingApp extends StatelessWidget {
-  ShareThingApp({super.key, EngineManager? engine})
-    : engine = engine ?? EngineManager();
+  ShareThingApp({
+    super.key,
+    EngineManager? engine,
+    FriendsRepository? friendsRepository,
+    SettingsRepository? settingsRepository,
+    LocalDiscoveryService? discoveryService,
+  }) : engine = engine ?? EngineManager(),
+       friendsRepository = friendsRepository ?? JsonFriendsRepository(),
+       settingsRepository = settingsRepository ?? JsonSettingsRepository(),
+       discoveryService = discoveryService ?? UdpLocalDiscoveryService();
 
   final EngineManager engine;
+  final FriendsRepository friendsRepository;
+  final SettingsRepository settingsRepository;
+  final LocalDiscoveryService discoveryService;
 
   @override
   Widget build(BuildContext context) {
@@ -27,14 +42,19 @@ class ShareThingApp extends StatelessWidget {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueGrey),
         useMaterial3: true,
       ),
-      home: MyHomePage(engine: engine),
+      home: MyHomePage(
+        engine: engine,
+        friendsRepository: friendsRepository,
+        settingsRepository: settingsRepository,
+        discoveryService: discoveryService,
+      ),
     );
   }
 }
 
 enum _FriendPresence { unknown, checking, online, offline }
 
-extension on _FriendPresence {
+extension _FriendPresenceUi on _FriendPresence {
   String get label {
     return switch (this) {
       _FriendPresence.unknown => 'Unknown',
@@ -65,21 +85,32 @@ extension on _FriendPresence {
 }
 
 class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.engine});
+  const MyHomePage({
+    super.key,
+    required this.engine,
+    required this.friendsRepository,
+    required this.settingsRepository,
+    required this.discoveryService,
+  });
 
   final EngineManager engine;
+  final FriendsRepository friendsRepository;
+  final SettingsRepository settingsRepository;
+  final LocalDiscoveryService discoveryService;
 
   @override
   State<MyHomePage> createState() => _MyHomePageState();
 }
 
 class _MyHomePageState extends State<MyHomePage> {
-  final FriendsRepository _friendsRepository = FriendsRepository();
   final TextEditingController _peerController = TextEditingController();
   StreamSubscription<Map<String, dynamic>>? _engineSubscription;
+  StreamSubscription<List<DiscoveredPeer>>? _discoverySubscription;
 
   List<FriendEntry> _friends = const [];
+  List<DiscoveredPeer> _discoveredPeers = const [];
   Map<String, _FriendPresence> _friendStatuses = const {};
+  AppSettings _settings = AppSettings.defaults();
 
   bool _running = false;
   bool _busy = true;
@@ -105,59 +136,92 @@ class _MyHomePageState extends State<MyHomePage> {
   void initState() {
     super.initState();
     _engineSubscription = widget.engine.updates.listen(_handleEngineEvent);
+    _discoverySubscription = widget.discoveryService.peers.listen(
+      _handleDiscoveredPeers,
+    );
     unawaited(_bootstrap());
   }
 
   @override
   void dispose() {
     _engineSubscription?.cancel();
+    _discoverySubscription?.cancel();
     _peerController.dispose();
+    unawaited(widget.discoveryService.stop());
     unawaited(widget.engine.stop());
     super.dispose();
   }
 
   Future<void> _bootstrap() async {
+    await _loadSettings();
     await _loadFriends();
     unawaited(_loadLocalIp());
     await _startEngine();
   }
 
-  Future<void> _loadFriends() async {
-    final friends = await _friendsRepository.loadFriends();
+  Future<void> _loadSettings() async {
+    final settings = await widget.settingsRepository.loadSettings();
     if (!mounted) return;
+    setState(() {
+      _settings = settings;
+    });
+  }
 
-    final sortedFriends = [...friends]
+  Future<void> _saveSettings(AppSettings settings) async {
+    await widget.settingsRepository.saveSettings(settings);
+    if (!mounted) return;
+    setState(() {
+      _settings = settings;
+    });
+    await _restartDiscovery();
+  }
+
+  List<FriendEntry> _sortFriends(List<FriendEntry> friends) {
+    final sorted = [...friends]
       ..sort(
         (left, right) =>
             left.nickname.toLowerCase().compareTo(right.nickname.toLowerCase()),
       );
+    return sorted;
+  }
 
+  Future<void> _loadFriends() async {
+    final friends = _sortFriends(await widget.friendsRepository.loadFriends());
+    if (!mounted) return;
     setState(() {
-      _friends = sortedFriends;
+      _friends = friends;
       _friendStatuses = {
-        for (final friend in sortedFriends)
-          friend.id: _friendStatuses[friend.id] ?? _FriendPresence.unknown,
+        for (final friend in friends)
+          friend.peerId:
+              _friendStatuses[friend.peerId] ?? _FriendPresence.unknown,
       };
     });
   }
 
   Future<void> _saveFriends(List<FriendEntry> friends) async {
-    final sortedFriends = [...friends]
-      ..sort(
-        (left, right) =>
-            left.nickname.toLowerCase().compareTo(right.nickname.toLowerCase()),
-      );
-
-    await _friendsRepository.saveFriends(sortedFriends);
+    final sortedFriends = _sortFriends(friends);
+    await widget.friendsRepository.saveFriends(sortedFriends);
     if (!mounted) return;
-
     setState(() {
       _friends = sortedFriends;
       _friendStatuses = {
         for (final friend in sortedFriends)
-          friend.id: _friendStatuses[friend.id] ?? _FriendPresence.unknown,
+          friend.peerId:
+              _friendStatuses[friend.peerId] ?? _FriendPresence.unknown,
       };
     });
+  }
+
+  Future<void> _cacheFriendAddress(String peerId, String shareAddress) async {
+    final index = _friends.indexWhere((friend) => friend.peerId == peerId);
+    if (index == -1) return;
+    if (_friends[index].lastKnownShareAddress == shareAddress) return;
+
+    final updatedFriends = [..._friends];
+    updatedFriends[index] = updatedFriends[index].copyWith(
+      lastKnownShareAddress: shareAddress,
+    );
+    await _saveFriends(updatedFriends);
   }
 
   Future<void> _loadLocalIp() async {
@@ -197,10 +261,13 @@ class _MyHomePageState extends State<MyHomePage> {
           _running = false;
           _busy = false;
           _statusMessage = 'Engine stopped';
+          _discoveredPeers = const [];
           _friendStatuses = {
-            for (final friend in _friends) friend.id: _FriendPresence.unknown,
+            for (final friend in _friends)
+              friend.peerId: _FriendPresence.unknown,
           };
         });
+        unawaited(widget.discoveryService.stop());
         break;
       case 'file_received':
         final name = event['filename']?.toString() ?? 'unknown';
@@ -208,6 +275,19 @@ class _MyHomePageState extends State<MyHomePage> {
           context,
         ).showSnackBar(SnackBar(content: Text('Received file: $name')));
         break;
+    }
+  }
+
+  void _handleDiscoveredPeers(List<DiscoveredPeer> peers) {
+    if (!mounted) return;
+    setState(() {
+      _discoveredPeers = peers;
+    });
+
+    for (final peer in peers) {
+      if (_friends.any((friend) => friend.peerId == peer.peerId)) {
+        unawaited(_cacheFriendAddress(peer.peerId, peer.shareAddress));
+      }
     }
   }
 
@@ -223,11 +303,33 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  void _setFriendPresence(String friendId, _FriendPresence presence) {
+  void _setFriendPresence(String peerId, _FriendPresence presence) {
     if (!mounted) return;
     setState(() {
-      _friendStatuses = {..._friendStatuses, friendId: presence};
+      _friendStatuses = {..._friendStatuses, peerId: presence};
     });
+  }
+
+  Future<void> _restartDiscovery() async {
+    if (!_running ||
+        _nodeId == 'Unavailable' ||
+        _nodeId.isEmpty ||
+        _shareAddress == 'Unavailable' ||
+        _shareAddress.isEmpty) {
+      await widget.discoveryService.stop();
+      if (!mounted) return;
+      setState(() {
+        _discoveredPeers = const [];
+      });
+      return;
+    }
+
+    await widget.discoveryService.start(
+      peerId: _nodeId,
+      nickname: _settings.nickname,
+      shareAddress: _shareAddress,
+      capabilities: const ['tcp-connect', 'lan-announcement'],
+    );
   }
 
   Future<void> _startEngine() async {
@@ -255,6 +357,7 @@ class _MyHomePageState extends State<MyHomePage> {
         _shareAddress = shareAddress['data']?.toString() ?? 'Unavailable';
         _statusMessage = 'Engine online';
       });
+      await _restartDiscovery();
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -278,6 +381,7 @@ class _MyHomePageState extends State<MyHomePage> {
       _statusMessage = 'Stopping engine...';
     });
 
+    await widget.discoveryService.stop();
     await widget.engine.stop();
 
     if (!mounted) return;
@@ -287,16 +391,35 @@ class _MyHomePageState extends State<MyHomePage> {
       _nodeId = 'Unavailable';
       _shareAddress = 'Unavailable';
       _statusMessage = 'Engine stopped';
+      _discoveredPeers = const [];
       _friendStatuses = {
-        for (final friend in _friends) friend.id: _FriendPresence.unknown,
+        for (final friend in _friends) friend.peerId: _FriendPresence.unknown,
       };
     });
   }
 
-  Future<void> _connectToPeer({
-    required String address,
-    String? friendId,
-  }) async {
+  DiscoveredPeer? _discoveredPeerById(String peerId) {
+    for (final peer in _discoveredPeers) {
+      if (peer.peerId == peerId) {
+        return peer;
+      }
+    }
+    return null;
+  }
+
+  String? _resolveFriendAddress(FriendEntry friend) {
+    return _discoveredPeerById(friend.peerId)?.shareAddress ??
+        friend.lastKnownShareAddress;
+  }
+
+  _FriendPresence _presenceForFriend(FriendEntry friend) {
+    if (_discoveredPeerById(friend.peerId) != null) {
+      return _FriendPresence.online;
+    }
+    return _friendStatuses[friend.peerId] ?? _FriendPresence.unknown;
+  }
+
+  Future<void> _connectToPeer({required String address, String? peerId}) async {
     final trimmedAddress = address.trim();
     if (trimmedAddress.isEmpty) return;
 
@@ -306,8 +429,8 @@ class _MyHomePageState extends State<MyHomePage> {
       _peerController.text = trimmedAddress;
     });
 
-    if (friendId != null) {
-      _setFriendPresence(friendId, _FriendPresence.checking);
+    if (peerId != null) {
+      _setFriendPresence(peerId, _FriendPresence.checking);
     }
 
     try {
@@ -316,8 +439,9 @@ class _MyHomePageState extends State<MyHomePage> {
       });
       _ensureCommandSucceeded(response, 'connect');
 
-      if (friendId != null) {
-        _setFriendPresence(friendId, _FriendPresence.online);
+      if (peerId != null) {
+        _setFriendPresence(peerId, _FriendPresence.online);
+        await _cacheFriendAddress(peerId, trimmedAddress);
       }
 
       if (!mounted) return;
@@ -325,8 +449,8 @@ class _MyHomePageState extends State<MyHomePage> {
         context,
       ).showSnackBar(SnackBar(content: Text('Connected to $trimmedAddress')));
     } catch (error) {
-      if (friendId != null) {
-        _setFriendPresence(friendId, _FriendPresence.offline);
+      if (peerId != null) {
+        _setFriendPresence(peerId, _FriendPresence.offline);
       }
 
       if (!mounted) return;
@@ -342,39 +466,50 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  Future<void> _connectToFriend(FriendEntry friend) async {
+    final address = _resolveFriendAddress(friend);
+    if (address == null || address.isEmpty) {
+      setState(() {
+        _errorMessage =
+            'No active route is known for ${friend.nickname}. Wait for LAN discovery or backend discovery.';
+      });
+      return;
+    }
+
+    await _connectToPeer(address: address, peerId: friend.peerId);
+  }
+
   String? _validateFriend(
-    String nickname,
-    String multiaddr, {
-    String? editingId,
+    String peerId,
+    String nickname, {
+    String? editingPeerId,
   }) {
+    if (peerId.isEmpty) {
+      return 'Peer ID is required.';
+    }
     if (nickname.isEmpty) {
       return 'Nickname is required.';
     }
-    if (multiaddr.isEmpty) {
-      return 'Share address is required.';
-    }
-    if (!multiaddr.contains('/p2p/')) {
-      return 'Share address must contain a /p2p/<peerId> segment.';
-    }
 
-    final duplicateNickname = _friends.any(
-      (friend) =>
-          friend.id != editingId &&
-          friend.nickname.toLowerCase() == nickname.toLowerCase(),
+    final duplicatePeerId = _friends.any(
+      (friend) => friend.peerId != editingPeerId && friend.peerId == peerId,
     );
-    if (duplicateNickname) {
-      return 'Nickname must be unique.';
+    if (duplicatePeerId) {
+      return 'Peer ID must be unique in the friend list.';
     }
 
     return null;
   }
 
-  Future<void> _showFriendEditor([FriendEntry? initialFriend]) async {
-    final nicknameController = TextEditingController(
-      text: initialFriend?.nickname ?? '',
+  Future<void> _showFriendEditor({
+    FriendEntry? initialFriend,
+    DiscoveredPeer? discoveredPeer,
+  }) async {
+    final peerIdController = TextEditingController(
+      text: initialFriend?.peerId ?? discoveredPeer?.peerId ?? '',
     );
-    final addressController = TextEditingController(
-      text: initialFriend?.multiaddr ?? '',
+    final nicknameController = TextEditingController(
+      text: initialFriend?.nickname ?? discoveredPeer?.nickname ?? '',
     );
 
     FriendEntry? editedFriend;
@@ -389,10 +524,18 @@ class _MyHomePageState extends State<MyHomePage> {
             return AlertDialog(
               title: Text(initialFriend == null ? 'Add Friend' : 'Edit Friend'),
               content: SizedBox(
-                width: 440,
+                width: 460,
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    TextField(
+                      controller: peerIdController,
+                      decoration: const InputDecoration(
+                        labelText: 'Peer ID',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    const SizedBox(height: 12),
                     TextField(
                       controller: nicknameController,
                       decoration: const InputDecoration(
@@ -401,15 +544,10 @@ class _MyHomePageState extends State<MyHomePage> {
                       ),
                     ),
                     const SizedBox(height: 12),
-                    TextField(
-                      controller: addressController,
-                      minLines: 2,
-                      maxLines: 3,
-                      decoration: const InputDecoration(
-                        labelText: 'Share address',
-                        hintText: '/ip4/192.168.1.20/tcp/4001/p2p/...',
-                        border: OutlineInputBorder(),
-                      ),
+                    Text(
+                      discoveredPeer == null
+                          ? 'Addresses stay internal. The app will use LAN or backend discovery to find routes.'
+                          : 'A LAN-announced route is currently available and will be cached automatically.',
                     ),
                     if (validationError != null) ...[
                       const SizedBox(height: 12),
@@ -430,12 +568,12 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
                 FilledButton(
                   onPressed: () {
+                    final peerId = peerIdController.text.trim();
                     final nickname = nicknameController.text.trim();
-                    final multiaddr = addressController.text.trim();
                     final validationMessage = _validateFriend(
+                      peerId,
                       nickname,
-                      multiaddr,
-                      editingId: initialFriend?.id,
+                      editingPeerId: initialFriend?.peerId,
                     );
                     if (validationMessage != null) {
                       setDialogState(() {
@@ -445,11 +583,11 @@ class _MyHomePageState extends State<MyHomePage> {
                     }
 
                     editedFriend = FriendEntry(
-                      id:
-                          initialFriend?.id ??
-                          DateTime.now().microsecondsSinceEpoch.toString(),
+                      peerId: peerId,
                       nickname: nickname,
-                      multiaddr: multiaddr,
+                      lastKnownShareAddress:
+                          discoveredPeer?.shareAddress ??
+                          initialFriend?.lastKnownShareAddress,
                     );
                     Navigator.of(dialogContext).pop();
                   },
@@ -462,15 +600,20 @@ class _MyHomePageState extends State<MyHomePage> {
       },
     );
 
+    peerIdController.dispose();
     nicknameController.dispose();
-    addressController.dispose();
 
     if (editedFriend == null) return;
 
     final updatedFriends = [
       for (final friend in _friends)
-        if (friend.id == editedFriend!.id) editedFriend! else friend,
-      if (_friends.every((friend) => friend.id != editedFriend!.id))
+        if (friend.peerId == editedFriend!.peerId ||
+            friend.peerId == initialFriend?.peerId)
+          editedFriend!
+        else
+          friend,
+      if (_friends.every((friend) => friend.peerId != editedFriend!.peerId) &&
+          initialFriend == null)
         editedFriend!,
     ];
 
@@ -505,7 +648,7 @@ class _MyHomePageState extends State<MyHomePage> {
     if (!shouldDelete) return;
 
     final updatedFriends = _friends
-        .where((candidate) => candidate.id != friend.id)
+        .where((candidate) => candidate.peerId != friend.peerId)
         .toList(growable: false);
     await _saveFriends(updatedFriends);
 
@@ -513,22 +656,96 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _friendStatuses = {
         for (final candidate in updatedFriends)
-          candidate.id:
-              _friendStatuses[candidate.id] ?? _FriendPresence.unknown,
+          candidate.peerId:
+              _friendStatuses[candidate.peerId] ?? _FriendPresence.unknown,
       };
     });
+  }
+
+  Future<void> _copyPeerId() async {
+    if (_nodeId == 'Unavailable' || _nodeId.isEmpty) return;
+    await Clipboard.setData(ClipboardData(text: _nodeId));
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Peer ID copied')));
   }
 
   Future<void> _copyShareAddress() async {
     if (_displayShareAddress == 'Unavailable' || _displayShareAddress.isEmpty) {
       return;
     }
-
     await Clipboard.setData(ClipboardData(text: _displayShareAddress));
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Share address copied to clipboard')),
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Share address copied')));
+  }
+
+  Future<void> _showNicknameEditor() async {
+    final nicknameController = TextEditingController(text: _settings.nickname);
+    String? validationError;
+
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Edit Nickname'),
+              content: SizedBox(
+                width: 420,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    TextField(
+                      controller: nicknameController,
+                      decoration: const InputDecoration(
+                        labelText: 'Nickname',
+                        border: OutlineInputBorder(),
+                      ),
+                    ),
+                    if (validationError != null) ...[
+                      const SizedBox(height: 12),
+                      Text(
+                        validationError!,
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () async {
+                    final nickname = nicknameController.text.trim();
+                    if (nickname.isEmpty) {
+                      setDialogState(() {
+                        validationError = 'Nickname is required.';
+                      });
+                      return;
+                    }
+
+                    await _saveSettings(_settings.copyWith(nickname: nickname));
+                    if (!dialogContext.mounted) return;
+                    Navigator.of(dialogContext).pop();
+                  },
+                  child: const Text('Save'),
+                ),
+              ],
+            );
+          },
+        );
+      },
     );
+
+    nicknameController.dispose();
   }
 
   Widget _buildPresenceChip(BuildContext context, _FriendPresence presence) {
@@ -541,7 +758,7 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
-  Widget _buildStatusCard(BuildContext context) {
+  Widget _buildIdentityCard(BuildContext context) {
     final theme = Theme.of(context);
 
     return Card(
@@ -564,11 +781,11 @@ class _MyHomePageState extends State<MyHomePage> {
               ],
             ),
             const SizedBox(height: 16),
+            Text('Nickname: ${_settings.nickname}'),
+            const SizedBox(height: 8),
             SelectableText('Peer ID: $_nodeId'),
             const SizedBox(height: 8),
-            SelectableText(
-              '${widget.engine.endpointLabel}: $_displayShareAddress',
-            ),
+            SelectableText('Share address: $_displayShareAddress'),
             const SizedBox(height: 8),
             Text('Local IPv4: $_localIp'),
             const SizedBox(height: 12),
@@ -577,9 +794,19 @@ class _MyHomePageState extends State<MyHomePage> {
               runSpacing: 12,
               children: [
                 FilledButton.tonalIcon(
+                  onPressed: _running ? _copyPeerId : null,
+                  icon: const Icon(Icons.badge_outlined),
+                  label: const Text('Copy Peer ID'),
+                ),
+                FilledButton.tonalIcon(
                   onPressed: _running ? _copyShareAddress : null,
                   icon: const Icon(Icons.copy_all_outlined),
                   label: const Text('Copy Share Address'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _showNicknameEditor,
+                  icon: const Icon(Icons.edit_outlined),
+                  label: const Text('Edit Nickname'),
                 ),
               ],
             ),
@@ -601,10 +828,14 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Widget _buildFriendCard(BuildContext context, FriendEntry friend) {
-    final presence = _friendStatuses[friend.id] ?? _FriendPresence.unknown;
+    final presence = _presenceForFriend(friend);
+    final discoveredPeer = _discoveredPeerById(friend.peerId);
+    final hasKnownRoute =
+        discoveredPeer != null ||
+        (friend.lastKnownShareAddress?.isNotEmpty ?? false);
 
     return Container(
-      key: ValueKey('friend-card-${friend.id}'),
+      key: ValueKey('friend-card-${friend.peerId}'),
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(16),
@@ -625,7 +856,15 @@ class _MyHomePageState extends State<MyHomePage> {
                       style: Theme.of(context).textTheme.titleMedium,
                     ),
                     const SizedBox(height: 8),
-                    SelectableText(friend.multiaddr),
+                    SelectableText('Peer ID: ${friend.peerId}'),
+                    const SizedBox(height: 8),
+                    Text(
+                      discoveredPeer != null
+                          ? 'LAN route is available right now.'
+                          : hasKnownRoute
+                          ? 'A cached route is stored locally.'
+                          : 'No route is currently known.',
+                    ),
                   ],
                 ),
               ),
@@ -639,24 +878,21 @@ class _MyHomePageState extends State<MyHomePage> {
             runSpacing: 8,
             children: [
               FilledButton.tonalIcon(
-                key: ValueKey('friend-connect-${friend.id}'),
+                key: ValueKey('friend-connect-${friend.peerId}'),
                 onPressed: _busy || !_running
                     ? null
-                    : () => _connectToPeer(
-                        address: friend.multiaddr,
-                        friendId: friend.id,
-                      ),
+                    : () => _connectToFriend(friend),
                 icon: const Icon(Icons.link),
                 label: const Text('Connect'),
               ),
               OutlinedButton.icon(
-                key: ValueKey('friend-edit-${friend.id}'),
-                onPressed: () => _showFriendEditor(friend),
+                key: ValueKey('friend-edit-${friend.peerId}'),
+                onPressed: () => _showFriendEditor(initialFriend: friend),
                 icon: const Icon(Icons.edit_outlined),
                 label: const Text('Edit'),
               ),
               OutlinedButton.icon(
-                key: ValueKey('friend-delete-${friend.id}'),
+                key: ValueKey('friend-delete-${friend.peerId}'),
                 onPressed: () => _removeFriend(friend),
                 icon: const Icon(Icons.delete_outline),
                 label: const Text('Remove'),
@@ -687,9 +923,8 @@ class _MyHomePageState extends State<MyHomePage> {
               ],
             ),
             const SizedBox(height: 12),
-            Text(
-              'Presence currently reflects the last connect attempt. Discovery-backed online status comes later.',
-              style: Theme.of(context).textTheme.bodyMedium,
+            const Text(
+              'Friends are keyed by peer ID. Share addresses stay internal and are learned from LAN or backend discovery.',
             ),
             const SizedBox(height: 16),
             if (_friends.isEmpty)
@@ -709,6 +944,121 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  Widget _buildDiscoveredPeerCard(BuildContext context, DiscoveredPeer peer) {
+    final isSaved = _friends.any((friend) => friend.peerId == peer.peerId);
+
+    return Container(
+      key: ValueKey('discovered-peer-${peer.peerId}'),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      peer.nickname,
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    SelectableText('Peer ID: ${peer.peerId}'),
+                    const SizedBox(height: 8),
+                    Text('Platform: ${peer.platform}'),
+                    if (peer.capabilities.isNotEmpty) ...[
+                      const SizedBox(height: 8),
+                      Text('Capabilities: ${peer.capabilities.join(', ')}'),
+                    ],
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              _buildPresenceChip(context, _FriendPresence.online),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
+            children: [
+              FilledButton.tonalIcon(
+                key: ValueKey('discovered-connect-${peer.peerId}'),
+                onPressed: _busy || !_running
+                    ? null
+                    : () => _connectToPeer(
+                        address: peer.shareAddress,
+                        peerId: peer.peerId,
+                      ),
+                icon: const Icon(Icons.link),
+                label: const Text('Connect'),
+              ),
+              if (!isSaved)
+                OutlinedButton.icon(
+                  key: ValueKey('discovered-add-${peer.peerId}'),
+                  onPressed: () => _showFriendEditor(discoveredPeer: peer),
+                  icon: const Icon(Icons.person_add_alt_1),
+                  label: const Text('Add Friend'),
+                )
+              else
+                OutlinedButton.icon(
+                  onPressed: null,
+                  icon: const Icon(Icons.check),
+                  label: const Text('Saved'),
+                ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDiscoveryCard(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              'Local Discovery',
+              style: Theme.of(context).textTheme.titleLarge,
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Nearby ShareThing clients announce their peer ID, nickname, and supported route on the local network.',
+            ),
+            const SizedBox(height: 16),
+            if (!_running)
+              const Text('Start the engine to announce and discover LAN peers.')
+            else if (_discoveredPeers.isEmpty)
+              const Text('No LAN peers discovered yet.')
+            else
+              Column(
+                children: [
+                  for (
+                    var index = 0;
+                    index < _discoveredPeers.length;
+                    index++
+                  ) ...[
+                    _buildDiscoveredPeerCard(context, _discoveredPeers[index]),
+                    if (index < _discoveredPeers.length - 1)
+                      const SizedBox(height: 12),
+                  ],
+                ],
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildManualConnectCard(BuildContext context) {
     return Card(
       child: Padding(
@@ -717,8 +1067,12 @@ class _MyHomePageState extends State<MyHomePage> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             Text(
-              'Manual Connect',
+              'Advanced Connect',
               style: Theme.of(context).textTheme.titleLarge,
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'Use raw share addresses only as a fallback. Normal friend management should be peer ID based.',
             ),
             const SizedBox(height: 16),
             TextField(
@@ -728,7 +1082,7 @@ class _MyHomePageState extends State<MyHomePage> {
               maxLines: 3,
               decoration: const InputDecoration(
                 labelText: 'Peer multiaddr',
-                hintText: '/ip4/192.168.1.20/tcp/4001/p2p/...',
+                hintText: '/ip4/192.168.1.20/tcp/4101/p2p/...',
                 border: OutlineInputBorder(),
               ),
             ),
@@ -759,9 +1113,11 @@ class _MyHomePageState extends State<MyHomePage> {
         child: ListView(
           padding: const EdgeInsets.all(16),
           children: [
-            _buildStatusCard(context),
+            _buildIdentityCard(context),
             const SizedBox(height: 16),
             _buildFriendsCard(context),
+            const SizedBox(height: 16),
+            _buildDiscoveryCard(context),
             const SizedBox(height: 16),
             _buildManualConnectCard(context),
           ],
