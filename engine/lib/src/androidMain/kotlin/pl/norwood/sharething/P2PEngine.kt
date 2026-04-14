@@ -1,15 +1,21 @@
-import p2pbridge.P2pbridge
+package pl.norwood.sharething
 
-actual class P2PEngine : IP2PEngine {
-    private var node: p2pbridge.Node? = null
+actual class P2PEngine actual constructor() {
+    private var port: Int = 0
 
-    actual fun start() {
-        node = P2pbridge.startNode()
+    actual fun startNode(port: Int): String {
+        this.port = port
+        return "Android engine is provided by the Go bridge in the Flutter app."
     }
 
-    actual fun stop() {
-        node?.stop()
-    }
+    actual fun getPeerId(): String = "Android engine is managed by the Flutter bridge."
 
-    actual fun getId(): String = node?.getId() ?: ""
+    actual fun getPort(): String = port.toString()
+
+    actual fun getListenAddress(): String = "Android engine is managed by the Flutter bridge."
+
+    actual fun connect(multiaddr: String): String =
+        "Android engine is managed by the Flutter bridge."
+
+    actual fun stopNode(): String = "Stopped"
 }

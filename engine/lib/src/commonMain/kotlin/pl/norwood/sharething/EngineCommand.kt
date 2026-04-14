@@ -19,9 +19,21 @@ sealed class EngineCommand {
     @Serializable
     @SerialName("get_port")
     data class GetPort(override val requestId: String) : EngineCommand()
+
     @Serializable
     @SerialName("get_id")
     data class GetId(override val requestId: String) : EngineCommand()
+
+    @Serializable
+    @SerialName("get_listen_address")
+    data class GetListenAddress(override val requestId: String) : EngineCommand()
+
+    @Serializable
+    @SerialName("connect")
+    data class Connect(
+        override val requestId: String,
+        val multiaddr: String
+    ) : EngineCommand()
 }
 
 @Serializable

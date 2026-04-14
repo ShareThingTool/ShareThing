@@ -20,6 +20,8 @@ object CommandDispatcher {
                 is EngineCommand.StopNode -> engine.stopNode()
                 is EngineCommand.GetId -> engine.getPeerId()
                 is EngineCommand.GetPort -> engine.getPort()
+                is EngineCommand.GetListenAddress -> engine.getListenAddress()
+                is EngineCommand.Connect -> engine.connect(command.multiaddr)
             }
 
             json.encodeToString(

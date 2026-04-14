@@ -52,7 +52,7 @@ class MainActivity : FlutterActivity() {
                                 }.start()
                             }
 
-                            "get_port" -> {
+                            "get_port", "get_listen_address" -> {
                                 Thread {
                                     var attempts = 0
                                     while (EngineService.multiaddr.isEmpty() && attempts < 20) {

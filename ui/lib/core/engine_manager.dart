@@ -17,9 +17,9 @@ class EngineManager {
 
   Stream<Map<String, dynamic>> get updates => _eventController.stream;
   bool get isAlive => Platform.isAndroid ? _androidStarted : _engineProcess != null;
-  bool get supportsPeerConnections => Platform.isAndroid;
+  bool get supportsPeerConnections => true;
   bool get supportsFileTransfers => false;
-  String get endpointLabel => Platform.isAndroid ? 'Listen address' : 'Listen port';
+  String get endpointLabel => 'Share address';
 
   bool _androidStarted = false;
 
@@ -61,6 +61,8 @@ class EngineManager {
       'stop_node',
       'get_id',
       'get_port',
+      'get_listen_address',
+      'connect',
     };
 
     if (!supportedDesktopCommands.contains(type)) {

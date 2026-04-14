@@ -3,10 +3,12 @@ package p2p
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/core/peer" // ← add this
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/multiformats/go-multiaddr"
 )
 
 var node host.Host
@@ -17,7 +19,7 @@ func Start() (string, error) {
 		return "", err
 	}
 	node = h
-	addr := fmt.Sprintf("%s/p2p/%s", h.Addrs()[0], h.ID())
+	addr := formatPeerMultiaddr(h.Addrs(), h.ID())
 	return addr, nil
 }
 
@@ -57,11 +59,27 @@ func GetMultiaddr() string {
 	if len(node.Addrs()) == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%s/p2p/%s", node.Addrs()[0], node.ID())
+	return formatPeerMultiaddr(node.Addrs(), node.ID())
 }
 
 func Stop() {
 	if node != nil {
 		node.Close()
 	}
+}
+
+func formatPeerMultiaddr(addrs []multiaddr.Multiaddr, id peer.ID) string {
+	if len(addrs) == 0 {
+		return ""
+	}
+
+	selected := addrs[0]
+	for _, addr := range addrs {
+		if strings.HasPrefix(addr.String(), "/ip4/") {
+			selected = addr
+			break
+		}
+	}
+
+	return fmt.Sprintf("%s/p2p/%s", selected, id)
 }

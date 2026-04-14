@@ -18,6 +18,16 @@ expect class P2PEngine() {
     fun getPort(): String
 
     /**
+     * Returns a shareable multiaddr for the running node when available.
+     */
+    fun getListenAddress(): String
+
+    /**
+     * Connects to another peer by multiaddr.
+     */
+    fun connect(multiaddr: String): String
+
+    /**
      * Cleanly stops the node and releases resources.
      */
     fun stopNode(): String
