@@ -255,7 +255,7 @@ actual class P2PEngine actual constructor() {
         val mdns = MDnsDiscovery(
             host = currentNode,
             serviceTag = "_sharething._tcp.local.",
-            queryInterval = 10,
+            queryInterval = 120, //Networks LOVE to freak out if its too agressive
             address = getLocalIpv4AddressObject()
         )
 
