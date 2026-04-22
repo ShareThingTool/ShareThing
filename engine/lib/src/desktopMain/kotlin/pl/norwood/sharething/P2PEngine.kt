@@ -12,7 +12,9 @@ import io.libp2p.core.dsl.HostBuilder
 import io.libp2p.core.multiformats.Multiaddr
 import io.libp2p.core.multiformats.Protocol
 import io.libp2p.core.P2PChannelHandler
+import io.libp2p.core.PeerInfo
 import io.libp2p.core.multistream.ProtocolBinding
+import io.libp2p.discovery.MDnsDiscovery
 import io.libp2p.protocol.ProtocolMessageHandler
 import io.libp2p.protocol.ProtocolMessageHandlerAdapter
 import io.netty.buffer.ByteBuf
@@ -43,14 +45,21 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+
+@Serializable
+private data class UdpDiscoveryMessage(
+    val peerId: String,
+    val nickname: String,
+    val addresses: List<String>
+)
 
 actual class P2PEngine actual constructor() {
     private var host: Host? = null
     private var port: Int = 0
     private var nickname: String = ""
+    private var mndsService: MDnsDiscovery? = null;
     private var discoveryServers: List<String> = emptyList()
 
     private val identityJson = Json {
@@ -67,6 +76,8 @@ actual class P2PEngine actual constructor() {
 
     private var heartbeatJob: Job? = null
     private var discoveryJob: Job? = null
+    private var udpSendJob: Job? = null
+    private var udpReceiveJob: Job? = null
 
     private val knownPeers = ConcurrentHashMap<String, KnownPeer>()
     private val incomingTransfers = ConcurrentHashMap<String, PendingIncomingTransfer>()
@@ -120,6 +131,10 @@ actual class P2PEngine actual constructor() {
             heartbeatJob = null
             discoveryJob?.cancelAndJoin()
             discoveryJob = null
+            udpSendJob?.cancelAndJoin()
+            udpSendJob = null
+            udpReceiveJob?.cancelAndJoin()
+            udpReceiveJob = null
         }
 
         knownPeers.clear()
@@ -260,6 +275,24 @@ actual class P2PEngine actual constructor() {
     private fun startDiscoveryLoops() {
         heartbeatJob?.cancel()
         discoveryJob?.cancel()
+        var currentNode = host ?: return
+        println("Starting mDNS discovery with service tag: _sharething._tcp.local.")
+        val mdns = MDnsDiscovery(
+            host = currentNode,
+            serviceTag = "_sharething.tcp.local."
+
+        )
+        mdns.addHandler { peerInfo ->
+            println("Raw mDNS payload received for peer: \${peerInfo.peerId.toBase58()}")
+            handleMdnsPeerFound(peerInfo)
+        }
+
+        mdns.start();
+        mndsService = mdns;
+
+
+
+
 
         if (discoveryServers.isEmpty()) {
             return
@@ -401,6 +434,46 @@ actual class P2PEngine actual constructor() {
                 return
             } catch (_: Exception) {
                 continue
+            }
+        }
+    }
+
+    private fun handleMdnsPeerFound(peerInfo: PeerInfo) {
+        val node = host ?: return
+        val selfPeerId = node.peerId.toBase58()
+        val peerIdStr = peerInfo.peerId.toBase58()
+
+        if (peerIdStr == selfPeerId) return
+
+        val previous = knownPeers[peerIdStr]
+        val resolvedNickname = previous?.nickname ?: peerIdStr
+        val newAddresses = peerInfo.addresses.map { it.toString() }
+
+        val discovered = KnownPeer(
+            peerId = peerIdStr,
+            nickname = resolvedNickname,
+            addresses = newAddresses
+        )
+
+        knownPeers[peerIdStr] = discovered
+
+        if (previous == null) {
+            CommandDispatcher.emit(
+                EngineEvent.PeerDiscovered(
+                    peerId = discovered.peerId,
+                    nickname = discovered.nickname,
+                    addresses = discovered.addresses
+                )
+            )
+        } else {
+            if (previous.addresses != discovered.addresses) {
+                CommandDispatcher.emit(
+                    EngineEvent.PeerDiscovered(
+                        peerId = discovered.peerId,
+                        nickname = discovered.nickname,
+                        addresses = discovered.addresses
+                    )
+                )
             }
         }
     }
