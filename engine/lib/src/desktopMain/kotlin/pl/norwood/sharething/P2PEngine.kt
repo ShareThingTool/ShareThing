@@ -257,9 +257,9 @@ actual class P2PEngine actual constructor() {
             serviceTag = "_sharething._tcp.local.",
             queryInterval = 10,
             address = getLocalIpv4AddressObject()
-        ){
+        )
 
-        }
+
         mdns.addHandler { peerInfo ->
             println("Raw mDNS payload received for peer: \${peerInfo.peerId.toBase58()}")
             handleMdnsPeerFound(peerInfo)
