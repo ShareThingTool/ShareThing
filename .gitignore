@@ -7,7 +7,6 @@
 /.dart_tool/
 /.dart_tool_bak/
 **/build/
-**/.gradle/
 **/.kotlin/
 **/out/
 **/local.properties
