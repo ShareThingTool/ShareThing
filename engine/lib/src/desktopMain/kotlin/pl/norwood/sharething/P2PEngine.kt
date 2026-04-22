@@ -1,24 +1,20 @@
 package pl.norwood.sharething
 
-import io.libp2p.core.Host
-import io.libp2p.core.PeerId
-import io.libp2p.core.Stream
-import io.libp2p.core.crypto.KeyType
-import io.libp2p.core.crypto.PrivKey
-import io.libp2p.core.crypto.generateKeyPair
-import io.libp2p.core.crypto.marshalPrivateKey
-import io.libp2p.core.crypto.unmarshalPrivateKey
+import io.libp2p.core.*
+import io.libp2p.core.crypto.*
 import io.libp2p.core.dsl.HostBuilder
 import io.libp2p.core.multiformats.Multiaddr
 import io.libp2p.core.multiformats.Protocol
-import io.libp2p.core.P2PChannelHandler
-import io.libp2p.core.PeerInfo
 import io.libp2p.core.multistream.ProtocolBinding
 import io.libp2p.discovery.MDnsDiscovery
 import io.libp2p.protocol.ProtocolMessageHandler
 import io.libp2p.protocol.ProtocolMessageHandlerAdapter
 import io.netty.buffer.ByteBuf
 import io.netty.buffer.Unpooled
+import kotlinx.coroutines.*
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import java.io.File
 import java.io.OutputStream
 import java.net.Inet4Address
@@ -30,30 +26,9 @@ import java.net.http.HttpResponse
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.time.Duration
-import java.util.Base64
-import java.util.Collections
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
+import java.util.*
 import java.util.concurrent.CompletableFuture
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
-
-@Serializable
-private data class UdpDiscoveryMessage(
-    val peerId: String,
-    val nickname: String,
-    val addresses: List<String>
-)
+import java.util.concurrent.ConcurrentHashMap
 
 actual class P2PEngine actual constructor() {
     private var host: Host? = null
@@ -279,8 +254,9 @@ actual class P2PEngine actual constructor() {
         println("Starting mDNS discovery with service tag: _sharething._tcp.local.")
         val mdns = MDnsDiscovery(
             host = currentNode,
-            serviceTag = "_sharething.tcp.local."
-
+            serviceTag = "_sharething._tcp.local.",
+            queryInterval = 120,
+            address = getLocalIpv4AddressObject()
         )
         mdns.addHandler { peerInfo ->
             println("Raw mDNS payload received for peer: \${peerInfo.peerId.toBase58()}")
@@ -527,6 +503,14 @@ actual class P2PEngine actual constructor() {
             ?.hostAddress
     }
 
+    fun getLocalIpv4AddressObject(): Inet4Address? {
+        return NetworkInterface.getNetworkInterfaces().asSequence()
+            .filter { it.isUp && !it.isLoopback }
+            .flatMap { it.inetAddresses.asSequence() }
+            .filterIsInstance<Inet4Address>()
+            .firstOrNull()
+    }
+
     private fun loadOrCreatePrivateKey(): PrivKey {
         val file = identityFile()
         if (file.exists()) {
@@ -671,6 +655,7 @@ actual class P2PEngine actual constructor() {
             when (state) {
                 StreamState.READING_CONTROL,
                 StreamState.WAITING_FOR_RESPONSE -> readControl(msg)
+
                 StreamState.RECEIVING_FILE -> readFileBytes(msg)
                 StreamState.SENDING_FILE,
                 StreamState.CLOSED -> {
