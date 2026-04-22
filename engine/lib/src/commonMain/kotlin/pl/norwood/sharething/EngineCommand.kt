@@ -70,6 +70,19 @@ sealed class EngineEvent {
     ) : EngineEvent()
 
     @Serializable
+    @SerialName("PEER_ADDRESSES_CHANGED")
+    data class PeerAddressesChanged(
+        val peerId: String,
+        val newAddresses: List<String>
+    ) : EngineEvent()
+
+    @Serializable
+    @SerialName("PEER_OFFLINE")
+    data class PeerOffline(
+        val peerId: String
+    ) : EngineEvent()
+
+    @Serializable
     @SerialName("INCOMING_FILE_REQUEST")
     data class IncomingFileRequest(
         val transferId: String,

@@ -12,6 +12,7 @@ import io.libp2p.protocol.ProtocolMessageHandlerAdapter
 import io.netty.buffer.ByteBuf
 import io.netty.buffer.Unpooled
 import kotlinx.coroutines.*
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -29,12 +30,13 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.TimeUnit
 
 actual class P2PEngine actual constructor() {
     private var host: Host? = null
     private var port: Int = 0
     private var nickname: String = ""
-    private var mndsService: MDnsDiscovery? = null;
+    private var mndsService: MDnsDiscovery? = null
     private var discoveryServers: List<String> = emptyList()
 
     private val identityJson = Json {
@@ -45,14 +47,11 @@ actual class P2PEngine actual constructor() {
         ignoreUnknownKeys = true
     }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val httpClient = HttpClient.newBuilder()
-        .connectTimeout(Duration.ofSeconds(5))
-        .build()
+    private val httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()
 
     private var heartbeatJob: Job? = null
     private var discoveryJob: Job? = null
-    private var udpSendJob: Job? = null
-    private var udpReceiveJob: Job? = null
+    private var peerSweepJob: Job? = null
 
     private val knownPeers = ConcurrentHashMap<String, KnownPeer>()
     private val incomingTransfers = ConcurrentHashMap<String, PendingIncomingTransfer>()
@@ -61,16 +60,14 @@ actual class P2PEngine actual constructor() {
         createFileTransferBinding(outboundTransfer = null)
 
     actual fun startNode(
-        nickname: String,
-        discoveryServers: List<String>
+        nickname: String, discoveryServers: List<String>
     ): EngineEvent.NodeStarted {
         this.nickname = nickname
         this.discoveryServers = discoveryServers.map(::normalizeDiscoveryServer)
 
         if (host != null) {
             return EngineEvent.NodeStarted(
-                peerId = host!!.peerId.toBase58(),
-                listenAddresses = currentListenAddresses()
+                peerId = host!!.peerId.toBase58(), listenAddresses = currentListenAddresses()
             )
         }
 
@@ -88,8 +85,7 @@ actual class P2PEngine actual constructor() {
                 startDiscoveryLoops()
 
                 return EngineEvent.NodeStarted(
-                    peerId = node.peerId.toBase58(),
-                    listenAddresses = currentListenAddresses()
+                    peerId = node.peerId.toBase58(), listenAddresses = currentListenAddresses()
                 )
             } catch (e: Exception) {
                 lastError = e
@@ -106,11 +102,12 @@ actual class P2PEngine actual constructor() {
             heartbeatJob = null
             discoveryJob?.cancelAndJoin()
             discoveryJob = null
-            udpSendJob?.cancelAndJoin()
-            udpSendJob = null
-            udpReceiveJob?.cancelAndJoin()
-            udpReceiveJob = null
+            peerSweepJob?.cancelAndJoin()
+            peerSweepJob = null
         }
+
+        mndsService?.stop()
+        mndsService = null
 
         knownPeers.clear()
         incomingTransfers.clear()
@@ -124,8 +121,7 @@ actual class P2PEngine actual constructor() {
 
     actual fun sendFile(targetPeerId: String, filePath: String): EngineEvent {
         val node = host ?: return EngineEvent.Error("Desktop node is not running")
-        val target = knownPeers[targetPeerId]
-            ?: return EngineEvent.Error("Unknown peer: $targetPeerId")
+        val target = knownPeers[targetPeerId] ?: return EngineEvent.Error("Unknown peer: $targetPeerId")
         val file = File(filePath)
         if (!file.exists() || !file.isFile) {
             return EngineEvent.Error("File does not exist: $filePath")
@@ -133,10 +129,7 @@ actual class P2PEngine actual constructor() {
 
         val transferId = UUID.randomUUID().toString()
         val transfer = OutgoingTransfer(
-            transferId = transferId,
-            targetPeerId = targetPeerId,
-            targetNickname = target.nickname,
-            file = file
+            transferId = transferId, targetPeerId = targetPeerId, targetNickname = target.nickname, file = file
         )
 
         emitTransferUpdate(
@@ -184,8 +177,7 @@ actual class P2PEngine actual constructor() {
     }
 
     actual fun acceptFile(transferId: String, savePath: String): EngineEvent {
-        val pending = incomingTransfers[transferId]
-            ?: return EngineEvent.Error("Unknown transfer: $transferId")
+        val pending = incomingTransfers[transferId] ?: return EngineEvent.Error("Unknown transfer: $transferId")
 
         return try {
             pending.handler.accept(savePath)
@@ -215,8 +207,7 @@ actual class P2PEngine actual constructor() {
     }
 
     actual fun rejectFile(transferId: String): EngineEvent {
-        val pending = incomingTransfers.remove(transferId)
-            ?: return EngineEvent.Error("Unknown transfer: $transferId")
+        val pending = incomingTransfers.remove(transferId) ?: return EngineEvent.Error("Unknown transfer: $transferId")
 
         return try {
             pending.handler.reject()
@@ -250,27 +241,30 @@ actual class P2PEngine actual constructor() {
     private fun startDiscoveryLoops() {
         heartbeatJob?.cancel()
         discoveryJob?.cancel()
-        var currentNode = host ?: return
+        peerSweepJob?.cancel()
+
+        val currentNode = host ?: return
         println("Starting mDNS discovery with service tag: _sharething._tcp.local.")
         val mdns = MDnsDiscovery(
             host = currentNode,
             serviceTag = "_sharething._tcp.local.",
-            queryInterval = 120, //Networks LOVE to freak out if its too agressive
+            queryInterval = 120, // Networks LOVE to freak out if it's too aggressive
             address = getLocalIpv4AddressObject()
         )
-
-
         mdns.addHandler { peerInfo ->
-            println("Raw mDNS payload received for peer: \${peerInfo.peerId.toBase58()}")
+            println("Raw mDNS payload received for peer: ${peerInfo.peerId.toBase58()}")
             handleMdnsPeerFound(peerInfo)
         }
 
-        mdns.start();
-        mndsService = mdns;
+        mdns.start()
+        mndsService = mdns
 
-
-
-
+        peerSweepJob = scope.launch {
+            while (isActive && host != null) {
+                delay(10_000)
+                sweepStalePeers()
+            }
+        }
 
         if (discoveryServers.isEmpty()) {
             return
@@ -293,23 +287,53 @@ actual class P2PEngine actual constructor() {
         }
     }
 
+    private suspend fun sweepStalePeers() {
+        val now = System.currentTimeMillis()
+        val staleThreshold = 25_000L // 25 seconds
+
+        for ((peerId, peer) in knownPeers.toList()) {
+            if (now - peer.lastSeenMillis < staleThreshold) {
+                continue // Peer is fresh, no need to check
+            }
+
+            val isReachable = verifyPeerReachability(peer)
+
+            if (isReachable) {
+                // They are still online, reset their clock
+                peer.lastSeenMillis = System.currentTimeMillis()
+            } else {
+                // They dropped off the network
+                knownPeers.remove(peerId)
+                CommandDispatcher.emit(EngineEvent.PeerOffline(peerId))
+            }
+        }
+    }
+
+    private suspend fun verifyPeerReachability(peer: KnownPeer): Boolean = withContext(Dispatchers.IO) {
+        val node = host ?: return@withContext false
+        try {
+            val peerIdObj = PeerId.fromBase58(peer.peerId)
+            val multiaddrs = peer.addresses.map { Multiaddr(it) }.toTypedArray()
+
+            node.network.connect(peerIdObj, *multiaddrs).get(5, TimeUnit.SECONDS)
+            true
+        } catch (e: Exception) {
+            false
+        }
+    }
+
     private fun registerWithDiscoveryServers() {
         val node = host ?: return
         val request = DiscoveryRegisterRequest(
-            peerId = node.peerId.toBase58(),
-            nick = nickname,
-            addresses = currentListenAddresses(),
-            platform = "desktop"
+            peerId = node.peerId.toBase58(), nick = nickname, addresses = currentListenAddresses(), platform = "desktop"
         )
 
         for (server in discoveryServers) {
             try {
                 val httpRequest = HttpRequest.newBuilder(
                     URI.create("$server/api/peers")
-                )
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(networkJson.encodeToString(request)))
-                    .build()
+                ).header("Content-Type", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(networkJson.encodeToString(request))).build()
                 httpClient.send(httpRequest, HttpResponse.BodyHandlers.discarding())
             } catch (_: Exception) {
                 // Best effort.
@@ -323,9 +347,7 @@ actual class P2PEngine actual constructor() {
             try {
                 val httpRequest = HttpRequest.newBuilder(
                     URI.create("$server/api/peers/${node.peerId.toBase58()}")
-                )
-                    .DELETE()
-                    .build()
+                ).DELETE().build()
                 httpClient.send(httpRequest, HttpResponse.BodyHandlers.discarding())
             } catch (_: Exception) {
                 // Best effort.
@@ -339,9 +361,7 @@ actual class P2PEngine actual constructor() {
             try {
                 val heartbeatRequest = HttpRequest.newBuilder(
                     URI.create("$server/api/peers/${node.peerId.toBase58()}/heartbeat")
-                )
-                    .POST(HttpRequest.BodyPublishers.noBody())
-                    .build()
+                ).POST(HttpRequest.BodyPublishers.noBody()).build()
                 val response = httpClient.send(heartbeatRequest, HttpResponse.BodyHandlers.discarding())
                 if (response.statusCode() == 404) {
                     registerWithDiscoveryServers()
@@ -360,9 +380,7 @@ actual class P2PEngine actual constructor() {
             try {
                 val request = HttpRequest.newBuilder(
                     URI.create("$server/api/peers")
-                )
-                    .GET()
-                    .build()
+                ).GET().build()
                 val response = httpClient.send(request, HttpResponse.BodyHandlers.ofString())
                 if (response.statusCode() !in 200..299) {
                     continue
@@ -374,14 +392,15 @@ actual class P2PEngine actual constructor() {
 
                     val previous = knownPeers[peer.peerId]
                     val resolvedNickname = peer.nick?.takeIf { it.isNotBlank() } ?: peer.peerId
-                    val discovered = KnownPeer(
-                        peerId = peer.peerId,
-                        nickname = resolvedNickname,
-                        addresses = peer.addresses
-                    )
-                    knownPeers[peer.peerId] = discovered
 
                     if (previous == null) {
+                        val discovered = KnownPeer(
+                            peerId = peer.peerId,
+                            nickname = resolvedNickname,
+                            addresses = peer.addresses,
+                            lastSeenMillis = System.currentTimeMillis()
+                        )
+                        knownPeers[peer.peerId] = discovered
                         CommandDispatcher.emit(
                             EngineEvent.PeerDiscovered(
                                 peerId = discovered.peerId,
@@ -390,20 +409,23 @@ actual class P2PEngine actual constructor() {
                             )
                         )
                     } else {
-                        if (previous.nickname != discovered.nickname) {
+                        previous.lastSeenMillis = System.currentTimeMillis()
+
+                        if (previous.nickname != resolvedNickname) {
                             CommandDispatcher.emit(
                                 EngineEvent.PeerNicknameChanged(
-                                    peerId = discovered.peerId,
-                                    newNickname = discovered.nickname
+                                    peerId = peer.peerId, newNickname = resolvedNickname
                                 )
                             )
                         }
-                        if (previous.addresses != discovered.addresses) {
+                        if (previous.addresses != peer.addresses) {
+                            val updated = previous.copy(nickname = resolvedNickname, addresses = peer.addresses)
+                            knownPeers[peer.peerId] = updated
                             CommandDispatcher.emit(
                                 EngineEvent.PeerDiscovered(
-                                    peerId = discovered.peerId,
-                                    nickname = discovered.nickname,
-                                    addresses = discovered.addresses
+                                    peerId = updated.peerId,
+                                    nickname = updated.nickname,
+                                    addresses = updated.addresses
                                 )
                             )
                         }
@@ -421,7 +443,7 @@ actual class P2PEngine actual constructor() {
         val selfPeerId = node.peerId.toBase58()
         var peerIdStr = peerInfo.peerId.toBase58()
 
-        //POSSIBLE UPSTREAM BUG, THE LENGTH IS NOT STRIPPED LMAO
+        // STRIP THE LENGTH PREFIX BUG
         if (peerIdStr.length == 53 && peerIdStr.startsWith("412D")) {
             peerIdStr = peerIdStr.substring(1)
         }
@@ -432,29 +454,29 @@ actual class P2PEngine actual constructor() {
         val resolvedNickname = previous?.nickname ?: peerIdStr
         val newAddresses = peerInfo.addresses.map { it.toString() }
 
-        val discovered = KnownPeer(
-            peerId = peerIdStr,
-            nickname = resolvedNickname,
-            addresses = newAddresses
-        )
-
-        knownPeers[peerIdStr] = discovered
-
         if (previous == null) {
+            val discovered = KnownPeer(
+                peerId = peerIdStr,
+                nickname = resolvedNickname,
+                addresses = newAddresses,
+                lastSeenMillis = System.currentTimeMillis()
+            )
+            knownPeers[peerIdStr] = discovered
             CommandDispatcher.emit(
                 EngineEvent.PeerDiscovered(
-                    peerId = discovered.peerId,
-                    nickname = discovered.nickname,
-                    addresses = discovered.addresses
+                    peerId = discovered.peerId, nickname = discovered.nickname, addresses = discovered.addresses
                 )
             )
         } else {
-            if (previous.addresses != discovered.addresses) {
+            // Update freshness clock
+            previous.lastSeenMillis = System.currentTimeMillis()
+
+            if (previous.addresses != newAddresses) {
+                val updated = previous.copy(addresses = newAddresses)
+                knownPeers[peerIdStr] = updated
                 CommandDispatcher.emit(
                     EngineEvent.PeerDiscovered(
-                        peerId = discovered.peerId,
-                        nickname = discovered.nickname,
-                        addresses = discovered.addresses
+                        peerId = updated.peerId, nickname = updated.nickname, addresses = updated.addresses
                     )
                 )
             }
@@ -462,9 +484,7 @@ actual class P2PEngine actual constructor() {
     }
 
     private fun buildHost(privKey: PrivKey, port: Int): Host {
-        return HostBuilder()
-            .builderModifier { b -> b.identity.factory = { privKey } }
-            .listen("/ip4/0.0.0.0/tcp/$port")
+        return HostBuilder().builderModifier { b -> b.identity.factory = { privKey } }.listen("/ip4/0.0.0.0/tcp/$port")
             .build()
     }
 
@@ -475,15 +495,13 @@ actual class P2PEngine actual constructor() {
             "/ip4/$it/tcp/$port/p2p/$peerId"
         }
 
-        val advertised = node.listenAddresses()
-            .map { address ->
-                if (address.getPeerId() == null) {
-                    address.withP2P(node.peerId).toString()
-                } else {
-                    address.toString()
-                }
+        val advertised = node.listenAddresses().map { address ->
+            if (address.getPeerId() == null) {
+                address.withP2P(node.peerId).toString()
+            } else {
+                address.toString()
             }
-            .sorted()
+        }.sorted()
 
         return linkedSetOf<String>().apply {
             synthesizedIpv4?.let { add(it) }
@@ -492,8 +510,7 @@ actual class P2PEngine actual constructor() {
     }
 
     private fun currentPort(node: Host): Int {
-        val tcpAddress = node.listenAddresses()
-            .firstOrNull { it.has(Protocol.TCP) && it.has(Protocol.IP4) }
+        val tcpAddress = node.listenAddresses().firstOrNull { it.has(Protocol.TCP) && it.has(Protocol.IP4) }
             ?: node.listenAddresses().firstOrNull { it.has(Protocol.TCP) }
 
         val tcpComponent = tcpAddress?.getFirstComponent(Protocol.TCP)
@@ -501,21 +518,14 @@ actual class P2PEngine actual constructor() {
     }
 
     private fun localIpv4Address(): String? {
-        return Collections.list(NetworkInterface.getNetworkInterfaces())
-            .asSequence()
-            .filter { it.isUp && !it.isLoopback }
-            .flatMap { Collections.list(it.inetAddresses).asSequence() }
-            .filterIsInstance<Inet4Address>()
-            .firstOrNull()
-            ?.hostAddress
+        return Collections.list(NetworkInterface.getNetworkInterfaces()).asSequence()
+            .filter { it.isUp && !it.isLoopback }.flatMap { Collections.list(it.inetAddresses).asSequence() }
+            .filterIsInstance<Inet4Address>().firstOrNull()?.hostAddress
     }
 
-    fun getLocalIpv4AddressObject(): Inet4Address? {
-        return NetworkInterface.getNetworkInterfaces().asSequence()
-            .filter { it.isUp && !it.isLoopback }
-            .flatMap { it.inetAddresses.asSequence() }
-            .filterIsInstance<Inet4Address>()
-            .firstOrNull()
+    private fun getLocalIpv4AddressObject(): Inet4Address? {
+        return NetworkInterface.getNetworkInterfaces().asSequence().filter { it.isUp && !it.isLoopback }
+            .flatMap { it.inetAddresses.asSequence() }.filterIsInstance<Inet4Address>().firstOrNull()
     }
 
     private fun loadOrCreatePrivateKey(): PrivKey {
@@ -550,15 +560,12 @@ actual class P2PEngine actual constructor() {
 
         val directory = when {
             osName.contains("win") -> {
-                val base = System.getenv("LOCALAPPDATA")
-                    ?: System.getenv("APPDATA")
-                    ?: "$userHome\\AppData\\Local"
+                val base = System.getenv("LOCALAPPDATA") ?: System.getenv("APPDATA") ?: "$userHome\\AppData\\Local"
                 File(base, "ShareThing")
             }
 
             osName.contains("mac") -> File(
-                userHome,
-                "Library/Application Support/ShareThing/data"
+                userHome, "Library/Application Support/ShareThing/data"
             )
 
             else -> {
@@ -660,12 +667,10 @@ actual class P2PEngine actual constructor() {
 
         override fun onMessage(stream: Stream, msg: ByteBuf) {
             when (state) {
-                StreamState.READING_CONTROL,
-                StreamState.WAITING_FOR_RESPONSE -> readControl(msg)
+                StreamState.READING_CONTROL, StreamState.WAITING_FOR_RESPONSE -> readControl(msg)
 
                 StreamState.RECEIVING_FILE -> readFileBytes(msg)
-                StreamState.SENDING_FILE,
-                StreamState.CLOSED -> {
+                StreamState.SENDING_FILE, StreamState.CLOSED -> {
                     // No-op.
                 }
             }
@@ -720,9 +725,7 @@ actual class P2PEngine actual constructor() {
         fun reject() {
             writeControl(
                 FileTransferControl.Response(
-                    transferId = transferId,
-                    accepted = false,
-                    message = "Rejected by user"
+                    transferId = transferId, accepted = false, message = "Rejected by user"
                 )
             )
             stream.close()
@@ -773,10 +776,7 @@ actual class P2PEngine actual constructor() {
                     )
                     CommandDispatcher.emit(
                         EngineEvent.IncomingFileRequest(
-                            transferId = transferId,
-                            peerId = remotePeerId,
-                            filename = fileName,
-                            totalBytes = totalBytes
+                            transferId = transferId, peerId = remotePeerId, filename = fileName, totalBytes = totalBytes
                         )
                     )
                 }
@@ -867,10 +867,7 @@ actual class P2PEngine actual constructor() {
 
         private fun writeControl(control: FileTransferControl) {
             val encoded = transferJson.encodeToString(control).toByteArray(StandardCharsets.UTF_8)
-            val frame = ByteBuffer.allocate(4 + encoded.size)
-                .putInt(encoded.size)
-                .put(encoded)
-                .array()
+            val frame = ByteBuffer.allocate(4 + encoded.size).putInt(encoded.size).put(encoded).array()
             stream.writeAndFlush(Unpooled.wrappedBuffer(frame))
         }
     }
@@ -883,10 +880,7 @@ actual class P2PEngine actual constructor() {
 
     @Serializable
     private data class DiscoveryRegisterRequest(
-        val peerId: String,
-        val nick: String,
-        val addresses: List<String>,
-        val platform: String
+        val peerId: String, val nick: String, val addresses: List<String>, val platform: String
     )
 
     @Serializable
@@ -905,14 +899,12 @@ actual class P2PEngine actual constructor() {
     private data class KnownPeer(
         val peerId: String,
         val nickname: String,
-        val addresses: List<String>
+        val addresses: List<String>,
+        var lastSeenMillis: Long = System.currentTimeMillis()
     )
 
     private data class OutgoingTransfer(
-        val transferId: String,
-        val targetPeerId: String,
-        val targetNickname: String,
-        val file: File
+        val transferId: String, val targetPeerId: String, val targetNickname: String, val file: File
     )
 
     private data class PendingIncomingTransfer(
@@ -931,30 +923,20 @@ actual class P2PEngine actual constructor() {
     @Serializable
     private sealed class FileTransferControl {
         @Serializable
-        @kotlinx.serialization.SerialName("OFFER")
+        @SerialName("OFFER")
         data class Offer(
-            val transferId: String,
-            val peerId: String,
-            val nickname: String,
-            val filename: String,
-            val totalBytes: Long
+            val transferId: String, val peerId: String, val nickname: String, val filename: String, val totalBytes: Long
         ) : FileTransferControl()
 
         @Serializable
-        @kotlinx.serialization.SerialName("RESPONSE")
+        @SerialName("RESPONSE")
         data class Response(
-            val transferId: String,
-            val accepted: Boolean,
-            val message: String? = null
+            val transferId: String, val accepted: Boolean, val message: String? = null
         ) : FileTransferControl()
     }
 
     private enum class StreamState {
-        READING_CONTROL,
-        WAITING_FOR_RESPONSE,
-        SENDING_FILE,
-        RECEIVING_FILE,
-        CLOSED
+        READING_CONTROL, WAITING_FOR_RESPONSE, SENDING_FILE, RECEIVING_FILE, CLOSED
     }
 
     private companion object {
