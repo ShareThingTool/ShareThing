@@ -255,9 +255,11 @@ actual class P2PEngine actual constructor() {
         val mdns = MDnsDiscovery(
             host = currentNode,
             serviceTag = "_sharething._tcp.local.",
-            queryInterval = 120,
+            queryInterval = 10,
             address = getLocalIpv4AddressObject()
-        )
+        ){
+
+        }
         mdns.addHandler { peerInfo ->
             println("Raw mDNS payload received for peer: \${peerInfo.peerId.toBase58()}")
             handleMdnsPeerFound(peerInfo)
@@ -417,7 +419,12 @@ actual class P2PEngine actual constructor() {
     private fun handleMdnsPeerFound(peerInfo: PeerInfo) {
         val node = host ?: return
         val selfPeerId = node.peerId.toBase58()
-        val peerIdStr = peerInfo.peerId.toBase58()
+        var peerIdStr = peerInfo.peerId.toBase58()
+
+        //POSSIBLE UPSTREAM BUG, THE LENGTH IS NOT STRIPPED LMAO
+        if (peerIdStr.length == 53 && peerIdStr.startsWith("412D")) {
+            peerIdStr = peerIdStr.substring(1)
+        }
 
         if (peerIdStr == selfPeerId) return
 
