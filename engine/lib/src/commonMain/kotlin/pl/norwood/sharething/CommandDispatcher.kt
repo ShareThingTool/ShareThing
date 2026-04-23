@@ -1,9 +1,12 @@
 package pl.norwood.sharething
 
+import co.touchlab.kermit.Logger
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 object CommandDispatcher {
+    private val log = Logger.withTag("CommandDispatcher")
+
     data class DispatchResult(
         val eventJson: String?,
         val shouldTerminate: Boolean = false
@@ -20,6 +23,7 @@ object CommandDispatcher {
     fun encodeEvent(event: EngineEvent): String = json.encodeToString(event)
 
     fun dispatch(input: String): DispatchResult {
+        log.d { "dispatch_input bytes=${input.length}" }
         return try {
             when (val command = json.decodeFromString<EngineCommand>(input)) {
                 is EngineCommand.StartNode -> DispatchResult(
@@ -52,6 +56,7 @@ object CommandDispatcher {
                 )
             }
         } catch (e: Exception) {
+            log.e(e) { "dispatch_failed inputBytes=${input.length}" }
             DispatchResult(
                 eventJson = encodeEvent(
                     EngineEvent.Error(e.message ?: e::class.simpleName.orEmpty())
@@ -61,6 +66,7 @@ object CommandDispatcher {
     }
 
     fun emit(event: EngineEvent) {
+        log.v { "emit_event type=${event::class.simpleName}" }
         EngineRuntime.emit(event)
     }
 }

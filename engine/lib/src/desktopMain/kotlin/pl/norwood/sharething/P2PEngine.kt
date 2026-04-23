@@ -1,5 +1,6 @@
 package pl.norwood.sharething
 
+import co.touchlab.kermit.Logger
 import io.libp2p.core.*
 import io.libp2p.core.crypto.*
 import io.libp2p.core.dsl.HostBuilder
@@ -56,20 +57,28 @@ actual class P2PEngine actual constructor() {
     }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val httpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build()
+    private val log = Logger.withTag("P2PEngine")
 
     private var heartbeatJob: Job? = null
     private var discoveryJob: Job? = null
     private var peerSweepJob: Job? = null
 
     private val knownPeers = ConcurrentHashMap<String, KnownPeer>()
+    private val outgoingTransfers = ConcurrentHashMap<String, OutgoingTransfer>()
     private val incomingTransfers = ConcurrentHashMap<String, PendingIncomingTransfer>()
+    private val acceptedIncomingTransfers = ConcurrentHashMap<String, AcceptedIncomingTransfer>()
 
-    private val inboundFileBinding: ProtocolBinding<FileTransferMessageHandler> =
+    private val inboundControlBinding: ProtocolBinding<FileControlMessageHandler> =
+        createFileControlBinding(outboundControl = null)
+    private val inboundDataBinding: ProtocolBinding<FileTransferMessageHandler> =
         createFileTransferBinding(outboundTransfer = null)
 
     actual fun startNode(
         nickname: String, discoveryServers: List<String>
     ): EngineEvent.NodeStarted {
+        log.i {
+            "start_node requested nickname=$nickname discoveryServers=${discoveryServers.size}"
+        }
         this.nickname = nickname
         this.discoveryServers = discoveryServers.map(::normalizeDiscoveryServer)
 
@@ -84,13 +93,18 @@ actual class P2PEngine actual constructor() {
 
         for (candidatePort in candidatePorts) {
             try {
+                log.d { "start_node attempting port=$candidatePort" }
                 val privKey = loadOrCreatePrivateKey()
                 val node = buildHost(privKey, candidatePort)
-                node.addProtocolHandler(inboundFileBinding as ProtocolBinding<Any>)
+                node.addProtocolHandler(inboundControlBinding as ProtocolBinding<Any>)
+                node.addProtocolHandler(inboundDataBinding as ProtocolBinding<Any>)
                 node.start().get()
                 host = node
                 port = currentPort(node)
                 startDiscoveryLoops()
+                log.i {
+                    "start_node success peerId=${node.peerId.toBase58()} listenAddresses=${currentListenAddresses().size}"
+                }
 
                 return EngineEvent.NodeStarted(
                     peerId = node.peerId.toBase58(), listenAddresses = currentListenAddresses()
@@ -98,6 +112,7 @@ actual class P2PEngine actual constructor() {
             } catch (e: Exception) {
                 lastError = e
                 host = null
+                log.w(e) { "start_node failed on port=$candidatePort" }
             }
         }
 
@@ -105,6 +120,7 @@ actual class P2PEngine actual constructor() {
     }
 
     actual fun stopNode() {
+        log.i { "stop_node requested" }
         runBlocking {
             heartbeatJob?.cancelAndJoin()
             heartbeatJob = null
@@ -118,17 +134,20 @@ actual class P2PEngine actual constructor() {
         mndsService = null
 
         knownPeers.clear()
+        outgoingTransfers.clear()
         incomingTransfers.clear()
+        acceptedIncomingTransfers.clear()
         unregisterFromDiscoveryServers()
 
         host?.stop()?.get()
         host = null
         port = 0
+        log.i { "stop_node completed" }
         CommandDispatcher.emit(EngineEvent.NodeStopped)
     }
 
     actual fun sendFile(targetPeerId: String, filePath: String): EngineEvent {
-        val node = host ?: return EngineEvent.Error("Desktop node is not running")
+        host ?: return EngineEvent.Error("Desktop node is not running")
         val target = knownPeers[targetPeerId] ?: return EngineEvent.Error("Unknown peer: $targetPeerId")
         val file = File(filePath)
         if (!file.exists() || !file.isFile) {
@@ -137,8 +156,16 @@ actual class P2PEngine actual constructor() {
 
         val transferId = UUID.randomUUID().toString()
         val transfer = OutgoingTransfer(
-            transferId = transferId, targetPeerId = targetPeerId, targetNickname = target.nickname, file = file
+            transferId = transferId,
+            targetPeerId = targetPeerId,
+            targetNickname = target.nickname,
+            file = file,
+            targetAddresses = target.addresses
         )
+        outgoingTransfers[transferId] = transfer
+        log.i {
+            "send_file queued id=$transferId target=$targetPeerId file=${file.name} bytes=${file.length()} addrs=${target.addresses.size}"
+        }
 
         emitTransferUpdate(
             transferId = transferId,
@@ -153,18 +180,22 @@ actual class P2PEngine actual constructor() {
 
         scope.launch {
             try {
-                val binding = createFileTransferBinding(outboundTransfer = transfer)
-                val peerId = PeerId.fromBase58(target.peerId)
-                val addresses = target.addresses.map { Multiaddr(it) }.toTypedArray()
-
-                println("Dialing ${target.peerId} on addresses: ${target.addresses}")
-
-                // .await() fixes the Netty thread deadlock caused by .get()
-                binding.dial(node, peerId, *addresses).controller.await()
-
-                println("Stream established successfully to ${target.peerId}")
+                sendControlMessage(
+                    targetPeerId = target.peerId,
+                    targetAddresses = target.addresses,
+                    control = FileTransferControl.Offer(
+                        transferId = transferId,
+                        peerId = host?.peerId?.toBase58() ?: "",
+                        nickname = nickname,
+                        filename = file.name,
+                        totalBytes = file.length(),
+                        addresses = currentListenAddresses()
+                    )
+                )
+                log.d { "send_file offer_sent id=$transferId target=$targetPeerId" }
             } catch (e: Exception) {
-                println("Dial failed: ${e.message}")
+                outgoingTransfers.remove(transferId)
+                log.e(e) { "send_file offer_failed id=$transferId target=$targetPeerId" }
                 emitTransferUpdate(
                     transferId = transferId,
                     direction = "OUTGOING",
@@ -192,30 +223,107 @@ actual class P2PEngine actual constructor() {
     }
 
     actual fun acceptFile(transferId: String, savePath: String): EngineEvent {
-        val pending = incomingTransfers[transferId] ?: return EngineEvent.Error("Unknown transfer: $transferId")
+        val pending = incomingTransfers.remove(transferId)
+            ?: return EngineEvent.Error("Unknown transfer: $transferId")
+        log.i {
+            "accept_file requested id=$transferId peer=${pending.peerId} file=${pending.fileName} savePath=$savePath"
+        }
+        acceptedIncomingTransfers[transferId] = AcceptedIncomingTransfer(
+            transferId = transferId,
+            peerId = pending.peerId,
+            fileName = pending.fileName,
+            totalBytes = pending.totalBytes,
+            savePath = savePath
+        )
 
         return try {
-            pending.handler.accept(savePath)
+            val responseAddresses = pending.addresses.ifEmpty {
+                knownPeers[pending.peerId]?.addresses ?: emptyList()
+            }
+            if (responseAddresses.isEmpty()) {
+                acceptedIncomingTransfers.remove(transferId)
+                log.w {
+                    "accept_file missing_route id=$transferId peer=${pending.peerId}"
+                }
+                return EngineEvent.Error("No route to peer for transfer response: ${pending.peerId}")
+            }
+
+            scope.launch {
+                try {
+                    sendControlMessage(
+                        targetPeerId = pending.peerId,
+                        targetAddresses = responseAddresses,
+                        control = FileTransferControl.Response(
+                            transferId = transferId,
+                            accepted = true,
+                            peerId = host?.peerId?.toBase58(),
+                            addresses = currentListenAddresses()
+                        )
+                    )
+                } catch (e: Exception) {
+                    acceptedIncomingTransfers.remove(transferId)
+                    log.e(e) { "accept_file response_failed id=$transferId peer=${pending.peerId}" }
+                    emitTransferUpdate(
+                        transferId = transferId,
+                        direction = "INCOMING",
+                        bytesTransferred = 0,
+                        totalBytes = pending.totalBytes,
+                        speedBps = 0,
+                        status = "FAILED",
+                        peerId = pending.peerId,
+                        filename = pending.fileName,
+                        message = e.message ?: "Failed to send acceptance"
+                    )
+                }
+            }
+
             EngineEvent.TransferUpdate(
                 transferId = transferId,
                 direction = "INCOMING",
                 bytesTransferred = 0,
                 totalBytes = pending.totalBytes,
                 speedBps = 0,
-                status = "IN_PROGRESS",
+                status = "QUEUED",
                 peerId = pending.peerId,
                 filename = pending.fileName
             )
         } catch (e: Exception) {
+            acceptedIncomingTransfers.remove(transferId)
             EngineEvent.Error(e.message ?: "Failed to accept transfer")
         }
     }
 
     actual fun rejectFile(transferId: String): EngineEvent {
-        val pending = incomingTransfers.remove(transferId) ?: return EngineEvent.Error("Unknown transfer: $transferId")
+        val pending = incomingTransfers.remove(transferId)
+            ?: return EngineEvent.Error("Unknown transfer: $transferId")
+        log.i {
+            "reject_file requested id=$transferId peer=${pending.peerId} file=${pending.fileName}"
+        }
 
         return try {
-            pending.handler.reject()
+            val responseAddresses = pending.addresses.ifEmpty {
+                knownPeers[pending.peerId]?.addresses ?: emptyList()
+            }
+            if (responseAddresses.isNotEmpty()) {
+                scope.launch {
+                    try {
+                        sendControlMessage(
+                            targetPeerId = pending.peerId,
+                            targetAddresses = responseAddresses,
+                            control = FileTransferControl.Response(
+                                transferId = transferId,
+                                accepted = false,
+                                message = "Rejected by user",
+                                peerId = host?.peerId?.toBase58(),
+                                addresses = currentListenAddresses()
+                            )
+                        )
+                    } catch (_: Exception) {
+                        log.w { "reject_file response_send_failed id=$transferId peer=${pending.peerId}" }
+                    }
+                }
+            }
+
             emitTransferUpdate(
                 transferId = transferId,
                 direction = "INCOMING",
@@ -249,7 +357,7 @@ actual class P2PEngine actual constructor() {
         peerSweepJob?.cancel()
 
         val currentNode = host ?: return
-        println("Starting mDNS discovery with service tag: _sharething._tcp.local.")
+        log.i { "mdns_start serviceTag=_sharething._tcp.local." }
         val mdns = MDnsDiscovery(
             host = currentNode,
             serviceTag = "_sharething._tcp.local.",
@@ -257,7 +365,7 @@ actual class P2PEngine actual constructor() {
             address = getLocalIpv4AddressObject()
         )
         mdns.addHandler { peerInfo ->
-            println("Raw mDNS payload received for peer: ${peerInfo.peerId.toBase58()}")
+            log.v { "mdns_payload peer=${peerInfo.peerId.toBase58()}" }
             handleMdnsPeerFound(peerInfo)
         }
 
@@ -307,6 +415,7 @@ actual class P2PEngine actual constructor() {
                 peer.lastSeenMillis = System.currentTimeMillis()
             } else {
                 knownPeers.remove(peerId)
+                log.i { "peer_offline peerId=$peerId" }
                 CommandDispatcher.emit(EngineEvent.PeerOffline(peerId))
             }
         }
@@ -401,6 +510,9 @@ actual class P2PEngine actual constructor() {
                             lastSeenMillis = System.currentTimeMillis()
                         )
                         knownPeers[peer.peerId] = discovered
+                        log.i {
+                            "peer_discovered source=discovery peer=${discovered.peerId} nick=${discovered.nickname} addrs=${discovered.addresses.size}"
+                        }
                         CommandDispatcher.emit(
                             EngineEvent.PeerDiscovered(
                                 peerId = discovered.peerId,
@@ -412,6 +524,9 @@ actual class P2PEngine actual constructor() {
                         previous.lastSeenMillis = System.currentTimeMillis()
 
                         if (previous.nickname != resolvedNickname) {
+                            log.i {
+                                "peer_nick_changed source=discovery peer=${peer.peerId} newNick=$resolvedNickname"
+                            }
                             CommandDispatcher.emit(
                                 EngineEvent.PeerNicknameChanged(
                                     peerId = peer.peerId, newNickname = resolvedNickname
@@ -421,6 +536,9 @@ actual class P2PEngine actual constructor() {
                         if (previous.addresses != peer.addresses) {
                             val updated = previous.copy(nickname = resolvedNickname, addresses = peer.addresses)
                             knownPeers[peer.peerId] = updated
+                            log.d {
+                                "peer_addresses_changed source=discovery peer=${updated.peerId} addrs=${updated.addresses.size}"
+                            }
                             CommandDispatcher.emit(
                                 EngineEvent.PeerDiscovered(
                                     peerId = updated.peerId,
@@ -461,6 +579,9 @@ actual class P2PEngine actual constructor() {
                 lastSeenMillis = System.currentTimeMillis()
             )
             knownPeers[peerIdStr] = discovered
+            log.i {
+                "peer_discovered source=mdns peer=${discovered.peerId} nick=${discovered.nickname} addrs=${discovered.addresses.size}"
+            }
             CommandDispatcher.emit(
                 EngineEvent.PeerDiscovered(
                     peerId = discovered.peerId, nickname = discovered.nickname, addresses = discovered.addresses
@@ -472,6 +593,7 @@ actual class P2PEngine actual constructor() {
             if (previous.addresses != newAddresses) {
                 val updated = previous.copy(addresses = newAddresses)
                 knownPeers[peerIdStr] = updated
+                log.d { "peer_addresses_changed source=mdns peer=${updated.peerId} addrs=${updated.addresses.size}" }
                 CommandDispatcher.emit(
                     EngineEvent.PeerDiscovered(
                         peerId = updated.peerId, nickname = updated.nickname, addresses = updated.addresses
@@ -611,12 +733,121 @@ actual class P2PEngine actual constructor() {
                 message = message
             )
         )
+        log.d {
+            "transfer_update id=$transferId direction=$direction status=$status " +
+                "bytes=$bytesTransferred/$totalBytes speedBps=$speedBps " +
+                "peer=${peerId ?: "unknown"} file=${filename ?: "unknown"} message=${message ?: "-"}"
+        }
+    }
+
+    private fun logControl(control: FileTransferControl, scope: String) {
+        when (control) {
+            is FileTransferControl.Offer -> log.d {
+                "control[$scope] OFFER id=${control.transferId} peer=${control.peerId} " +
+                    "file=${control.filename} bytes=${control.totalBytes} addrs=${control.addresses.size}"
+            }
+
+            is FileTransferControl.Response -> log.d {
+                "control[$scope] RESPONSE id=${control.transferId} accepted=${control.accepted} " +
+                    "peer=${control.peerId ?: "unknown"} addrs=${control.addresses.size} msg=${control.message ?: "-"}"
+            }
+
+            is FileTransferControl.Completion -> log.d {
+                "control[$scope] COMPLETION id=${control.transferId} completed=${control.completed} " +
+                    "msg=${control.message ?: "-"}"
+            }
+
+            is FileTransferControl.DataStart -> log.d {
+                "control[$scope] DATA_START id=${control.transferId} peer=${control.peerId} " +
+                    "file=${control.filename} bytes=${control.totalBytes}"
+            }
+        }
+    }
+
+    private suspend fun sendControlMessage(
+        targetPeerId: String,
+        targetAddresses: List<String>,
+        control: FileTransferControl
+    ) {
+        val node = host ?: throw IllegalStateException("Desktop node is not running")
+        logControl(control, "outbound")
+        log.d {
+            "control_dial peer=$targetPeerId addrs=${targetAddresses.size}"
+        }
+        val addresses = targetAddresses.map { Multiaddr(it) }.toTypedArray()
+        val binding = createFileControlBinding(outboundControl = control)
+        binding.dial(node, PeerId.fromBase58(targetPeerId), *addresses).controller.await()
+    }
+
+    private fun createFileControlBinding(
+        outboundControl: FileTransferControl?
+    ): ProtocolBinding<FileControlMessageHandler> {
+        return ProtocolBinding.createSimple(FILE_CONTROL_PROTOCOL_ID, P2PChannelHandler { ch ->
+            val stream = ch as Stream
+            val handler = FileControlMessageHandler(outboundControl)
+            stream.pushHandler(ProtocolMessageHandlerAdapter(stream, handler))
+            handler.activeFuture
+        })
+    }
+
+    private fun startOutgoingDataTransfer(
+        transfer: OutgoingTransfer,
+        responseAddresses: List<String>
+    ) {
+        val node = host ?: return
+        scope.launch {
+            try {
+                val addresses = responseAddresses.ifEmpty {
+                    transfer.targetAddresses.ifEmpty {
+                        knownPeers[transfer.targetPeerId]?.addresses ?: emptyList()
+                    }
+                }
+                if (addresses.isEmpty()) {
+                    outgoingTransfers.remove(transfer.transferId)
+                    log.w { "data_start no_route id=${transfer.transferId} peer=${transfer.targetPeerId}" }
+                    emitTransferUpdate(
+                        transferId = transfer.transferId,
+                        direction = "OUTGOING",
+                        bytesTransferred = 0,
+                        totalBytes = transfer.file.length(),
+                        speedBps = 0,
+                        status = "FAILED",
+                        peerId = transfer.targetPeerId,
+                        filename = transfer.file.name,
+                        message = "No routable addresses returned for transfer"
+                    )
+                    return@launch
+                }
+
+                val binding = createFileTransferBinding(outboundTransfer = transfer)
+                val peerId = PeerId.fromBase58(transfer.targetPeerId)
+                val multiaddrs = addresses.map { Multiaddr(it) }.toTypedArray()
+                log.i {
+                    "data_dial id=${transfer.transferId} peer=${transfer.targetPeerId} addrs=${addresses.size}"
+                }
+                binding.dial(node, peerId, *multiaddrs).controller.await()
+            } catch (e: Exception) {
+                outgoingTransfers.remove(transfer.transferId)
+                log.e(e) { "data_dial_failed id=${transfer.transferId} peer=${transfer.targetPeerId}" }
+                emitTransferUpdate(
+                    transferId = transfer.transferId,
+                    direction = "OUTGOING",
+                    bytesTransferred = 0,
+                    totalBytes = transfer.file.length(),
+                    speedBps = 0,
+                    status = "FAILED",
+                    peerId = transfer.targetPeerId,
+                    filename = transfer.file.name,
+                    message = e.message ?: "Failed to start transfer stream"
+                )
+            }
+        }
     }
 
     private fun createFileTransferBinding(
         outboundTransfer: OutgoingTransfer?
     ): ProtocolBinding<FileTransferMessageHandler> {
-        return ProtocolBinding.createSimple(FILE_PROTOCOL_ID, P2PChannelHandler { ch ->
+        return ProtocolBinding.createSimple(FILE_DATA_PROTOCOL_ID, P2PChannelHandler { ch ->
             val stream = ch as Stream
             val handler = FileTransferMessageHandler(outboundTransfer)
             stream.pushHandler(ProtocolMessageHandlerAdapter(stream, handler))
@@ -626,6 +857,130 @@ actual class P2PEngine actual constructor() {
                 handler.activeFuture
             }
         })
+    }
+
+    inner class FileControlMessageHandler(
+        private val outboundControl: FileTransferControl?
+    ) : ProtocolMessageHandler<ByteBuf> {
+        private val transferJson = Json { ignoreUnknownKeys = true }
+        val activeFuture = CompletableFuture<FileControlMessageHandler>()
+
+        private var expectedControlLength = -1
+        private var controlHeaderBytesRead = 0
+        private val controlHeaderBuffer = ByteArray(4)
+        private var controlPayloadBuffer = ByteArray(0)
+        private var controlPayloadBytesRead = 0
+        private lateinit var stream: Stream
+
+        override fun onActivated(stream: Stream) {
+            this.stream = stream
+            activeFuture.complete(this)
+            log.v { "control_stream_activated outbound=${outboundControl != null}" }
+
+            val control = outboundControl ?: return
+            writeControl(control)
+            stream.close()
+        }
+
+        override fun onMessage(stream: Stream, msg: ByteBuf) {
+            while (msg.isReadable) {
+                if (expectedControlLength < 0) {
+                    while (msg.isReadable && controlHeaderBytesRead < 4) {
+                        controlHeaderBuffer[controlHeaderBytesRead++] = msg.readByte()
+                    }
+                    if (controlHeaderBytesRead < 4) {
+                        return
+                    }
+                    expectedControlLength = ByteBuffer.wrap(controlHeaderBuffer).int
+                    if (expectedControlLength <= 0 || expectedControlLength > MAX_CONTROL_FRAME_BYTES) {
+                        log.w { "control_frame_invalid size=$expectedControlLength" }
+                        stream.close()
+                        return
+                    }
+                    controlPayloadBuffer = ByteArray(expectedControlLength)
+                    controlPayloadBytesRead = 0
+                }
+
+                val remaining = expectedControlLength - controlPayloadBytesRead
+                val readable = minOf(msg.readableBytes(), remaining)
+                msg.readBytes(controlPayloadBuffer, controlPayloadBytesRead, readable)
+                controlPayloadBytesRead += readable
+
+                if (controlPayloadBytesRead == expectedControlLength) {
+                    val payload = String(controlPayloadBuffer, StandardCharsets.UTF_8)
+                    handleControl(payload)
+                    expectedControlLength = -1
+                    controlHeaderBytesRead = 0
+                    controlPayloadBytesRead = 0
+                }
+            }
+        }
+
+        override fun onClosed(stream: Stream) {}
+
+        override fun onException(cause: Throwable?) {}
+
+        private fun handleControl(payload: String) {
+            val control = try {
+                transferJson.decodeFromString<FileTransferControl>(payload)
+            } catch (_: Exception) {
+                log.w { "control_decode_failed payloadSize=${payload.length}" }
+                return
+            }
+            logControl(control, "inbound")
+
+            when (control) {
+                is FileTransferControl.Offer -> {
+                    incomingTransfers[control.transferId] = PendingIncomingTransfer(
+                        transferId = control.transferId,
+                        peerId = control.peerId,
+                        fileName = control.filename,
+                        totalBytes = control.totalBytes,
+                        addresses = control.addresses
+                    )
+                    CommandDispatcher.emit(
+                        EngineEvent.IncomingFileRequest(
+                            transferId = control.transferId,
+                            peerId = control.peerId,
+                            filename = control.filename,
+                            totalBytes = control.totalBytes
+                        )
+                    )
+                }
+
+                is FileTransferControl.Response -> {
+                    val transfer = outgoingTransfers[control.transferId] ?: return
+                    if (!control.accepted) {
+                        outgoingTransfers.remove(control.transferId)
+                        emitTransferUpdate(
+                            transferId = transfer.transferId,
+                            direction = "OUTGOING",
+                            bytesTransferred = 0,
+                            totalBytes = transfer.file.length(),
+                            speedBps = 0,
+                            status = "FAILED",
+                            peerId = transfer.targetPeerId,
+                            filename = transfer.file.name,
+                            message = control.message ?: "Rejected by receiver"
+                        )
+                        return
+                    }
+
+                    startOutgoingDataTransfer(
+                        transfer = transfer,
+                        responseAddresses = control.addresses
+                    )
+                }
+
+                else -> {}
+            }
+        }
+
+        private fun writeControl(control: FileTransferControl) {
+            val encoded = transferJson.encodeToString(control).toByteArray(StandardCharsets.UTF_8)
+            val frame = ByteBuffer.allocate(4 + encoded.size).putInt(encoded.size).put(encoded).array()
+            stream.writeAndFlush(Unpooled.wrappedBuffer(frame))
+        }
     }
 
     inner class FileTransferMessageHandler(
@@ -667,6 +1022,7 @@ actual class P2PEngine actual constructor() {
             })
 
             activeFuture.complete(this)
+            log.v { "data_stream_activated outbound=${outboundTransfer != null}" }
 
 
 
@@ -680,10 +1036,14 @@ actual class P2PEngine actual constructor() {
                 )
                 writeControl(offer)
                 state = StreamState.WAITING_FOR_RESPONSE
+                log.d { "data_stream_offer_sent id=${outboundTransfer.transferId}" }
             }
         }
 
         override fun onMessage(stream: Stream, msg: ByteBuf) {
+            log.v {
+                "data_stream_message state=$state readable=${msg.readableBytes()} transferId=$transferId"
+            }
             when (state) {
                 StreamState.READING_CONTROL, StreamState.WAITING_FOR_RESPONSE, StreamState.WAITING_FOR_COMPLETION -> readControl(
                     msg
@@ -699,6 +1059,7 @@ actual class P2PEngine actual constructor() {
             streamClosed = true
             diskWriteChannel.close()
             incomingTransfers.remove(transferId)
+            log.d { "data_stream_closed transferId=$transferId outbound=${outboundTransfer != null}" }
             if (outboundTransfer != null && !transferCompletion.isCompleted) {
                 transferCompletion.complete(
                     FileTransferControl.Completion(
@@ -712,6 +1073,7 @@ actual class P2PEngine actual constructor() {
         }
 
         override fun onException(cause: Throwable?) {
+            log.e(cause) { "data_stream_exception transferId=$transferId outbound=${outboundTransfer != null}" }
             if (outboundTransfer != null && !transferCompletion.isCompleted) {
                 transferCompletion.complete(
                     FileTransferControl.Completion(
@@ -735,6 +1097,7 @@ actual class P2PEngine actual constructor() {
         }
 
         fun accept(savePath: String) {
+            log.i { "data_accept id=$transferId savePath=$savePath" }
             val destination = File(savePath)
             destination.parentFile?.mkdirs()
             transferStartMillis = System.currentTimeMillis()
@@ -804,6 +1167,7 @@ actual class P2PEngine actual constructor() {
         }
 
         fun reject() {
+            log.i { "data_reject id=$transferId" }
             writeControl(
                 FileTransferControl.Response(
                     transferId = transferId, accepted = false, message = "Rejected by user"
@@ -822,6 +1186,11 @@ actual class P2PEngine actual constructor() {
                         return
                     }
                     expectedControlLength = ByteBuffer.wrap(controlHeaderBuffer).int
+                    if (expectedControlLength <= 0 || expectedControlLength > MAX_CONTROL_FRAME_BYTES) {
+                        log.w { "data_control_frame_invalid size=$expectedControlLength id=$transferId" }
+                        stream.close()
+                        return
+                    }
                     controlPayloadBuffer = ByteArray(expectedControlLength)
                     controlPayloadBytesRead = 0
                 }
@@ -845,6 +1214,7 @@ actual class P2PEngine actual constructor() {
             try {
                 when (val control = transferJson.decodeFromString<FileTransferControl>(payload)) {
                     is FileTransferControl.Offer -> {
+                        logControl(control, "data-inbound")
                         transferId = control.transferId
                         remotePeerId = control.peerId
                         fileName = control.filename
@@ -867,7 +1237,9 @@ actual class P2PEngine actual constructor() {
                     }
 
                     is FileTransferControl.Response -> {
+                        logControl(control, "data-inbound")
                         if (control.transferId != transferId) {
+                            log.w { "data_response_mismatch expected=$transferId got=${control.transferId}" }
                             return
                         }
                         if (!control.accepted) {
@@ -888,12 +1260,14 @@ actual class P2PEngine actual constructor() {
 
                         transferStartMillis = System.currentTimeMillis()
                         state = StreamState.SENDING_FILE
+                        log.i { "data_response_accepted id=$transferId; begin send" }
                         scope.launch {
                             sendFileBytes()
                         }
                     }
 
                     is FileTransferControl.Completion -> {
+                        logControl(control, "data-inbound")
                         if (outboundTransfer == null || control.transferId != transferId) {
                             return
                         }
@@ -901,13 +1275,21 @@ actual class P2PEngine actual constructor() {
                             transferCompletion.complete(control)
                         }
                     }
+
+                    is FileTransferControl.DataStart -> {
+                        // DataStart is only relevant for the newer split data stream flow.
+                        // Legacy single-stream handler ignores it safely.
+                        logControl(control, "data-inbound")
+                    }
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                log.w(e) { "data_control_decode_failed transferId=$transferId payloadSize=${payload.length}" }
             }
         }
 
         private suspend fun sendFileBytes() = withContext(Dispatchers.IO) {
             val transfer = outboundTransfer ?: return@withContext
+            log.i { "data_send_start id=${transfer.transferId} file=${transfer.file.name} bytes=${transfer.file.length()}" }
             try {
                 transfer.file.inputStream().use { input ->
                     val buffer = ByteArray(FILE_CHUNK_SIZE)
@@ -955,6 +1337,7 @@ actual class P2PEngine actual constructor() {
                     filename = transfer.file.name,
                     message = if (completion.completed) null else completion.message
                 )
+                log.i { "data_send_done id=${transfer.transferId} status=${if (completion.completed) "COMPLETED" else "FAILED"}" }
                 stream.close()
             } catch (e: Exception) {
                 val errorMessage = if (e is TimeoutCancellationException) {
@@ -973,6 +1356,7 @@ actual class P2PEngine actual constructor() {
                     filename = transfer.file.name,
                     message = errorMessage
                 )
+                log.w(e) { "data_send_failed id=${transfer.transferId}" }
                 stream.close()
             }
         }
@@ -996,6 +1380,7 @@ actual class P2PEngine actual constructor() {
 
             val sendResult = diskWriteChannel.trySend(bytes)
             if (sendResult.isFailure) {
+                log.w { "data_receive_buffer_overflow id=$transferId" }
                 emitTransferUpdate(
                     transferId = transferId,
                     direction = "INCOMING",
@@ -1014,6 +1399,7 @@ actual class P2PEngine actual constructor() {
             }
 
             if (msg.isReadable) {
+                log.w { "data_receive_oversized_payload id=$transferId extra=${msg.readableBytes()}" }
                 msg.skipBytes(msg.readableBytes())
                 emitTransferUpdate(
                     transferId = transferId,
@@ -1033,6 +1419,7 @@ actual class P2PEngine actual constructor() {
             }
 
             if (receivedFileBytes >= totalBytes) {
+                log.d { "data_receive_complete_bytes id=$transferId bytes=$receivedFileBytes" }
                 diskWriteChannel.close()
             }
         }
@@ -1066,6 +1453,14 @@ actual class P2PEngine actual constructor() {
         return bytesTransferred * 1000L / elapsedMillis
     }
 
+    private data class AcceptedIncomingTransfer(
+        val transferId: String,
+        val peerId: String,
+        val fileName: String,
+        val totalBytes: Long,
+        val savePath: String
+    )
+
     private enum class StreamState {
         READING_CONTROL, WAITING_FOR_RESPONSE, SENDING_FILE, WAITING_FOR_COMPLETION, RECEIVING_FILE, CLOSED
     }
@@ -1073,7 +1468,10 @@ actual class P2PEngine actual constructor() {
     private companion object {
         const val DEFAULT_PORT = 4101
         const val FILE_PROTOCOL_ID = "/sharething/files/1.0.0"
+        const val FILE_CONTROL_PROTOCOL_ID = "/sharething/files/control/1.0.0"
+        const val FILE_DATA_PROTOCOL_ID = "/sharething/files/data/1.0.0"
         const val FILE_CHUNK_SIZE = 64 * 1024
         const val TRANSFER_COMPLETION_TIMEOUT_MILLIS = 15_000L
+        const val MAX_CONTROL_FRAME_BYTES = 1 * 1024 * 1024
     }
 }

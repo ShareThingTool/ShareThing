@@ -6,6 +6,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'core/app_logger.dart';
 import 'core/engine_manager.dart';
 import 'core/storage/app_storage_paths.dart';
 import 'features/discovery/discovered_peer.dart';
@@ -240,6 +241,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _startEngine() async {
+    appLogger.i('ui.startEngine nickname=${_settings.nickname}');
     setState(() {
       _busy = true;
       _errorMessage = null;
@@ -257,6 +259,7 @@ class _MyHomePageState extends State<MyHomePage> {
         _busy = false;
       });
     } catch (error) {
+      appLogger.e('ui.startEngine.failed', error: error);
       if (!mounted) return;
       setState(() {
         _busy = false;
@@ -282,6 +285,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _stopEngine() async {
+    appLogger.i('ui.stopEngine');
     setState(() {
       _busy = true;
       _errorMessage = null;
@@ -304,6 +308,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   void _handleEngineEvent(Map<String, dynamic> event) {
+    appLogger.d('ui.engineEvent $event');
     switch (event['type']) {
       case 'NODE_STARTED':
         final listenAddresses =
@@ -492,8 +497,10 @@ class _MyHomePageState extends State<MyHomePage> {
     });
 
     try {
+      appLogger.i('ui.sendFile targetPeerId=$peerId filePath=$filePath');
       await widget.engine.sendFile(targetPeerId: peerId, filePath: filePath);
     } catch (error) {
+      appLogger.e('ui.sendFile.failed', error: error);
       if (!mounted) return;
       setState(() {
         _errorMessage = '$error';
@@ -522,11 +529,16 @@ class _MyHomePageState extends State<MyHomePage> {
     });
 
     try {
+      appLogger.i(
+        'ui.acceptIncoming transferId=${request.transferId} '
+        'peerId=${request.peerId} savePath=$savePath',
+      );
       await widget.engine.acceptFile(
         transferId: request.transferId,
         savePath: savePath,
       );
     } catch (error) {
+      appLogger.e('ui.acceptIncoming.failed', error: error);
       if (!mounted) return;
       setState(() {
         _errorMessage = '$error';
@@ -547,6 +559,9 @@ class _MyHomePageState extends State<MyHomePage> {
     });
 
     try {
+      appLogger.i(
+        'ui.rejectIncoming transferId=${request.transferId} peerId=${request.peerId}',
+      );
       await widget.engine.rejectFile(transferId: request.transferId);
       if (!mounted) return;
       setState(() {
@@ -554,6 +569,7 @@ class _MyHomePageState extends State<MyHomePage> {
           ..remove(request.transferId);
       });
     } catch (error) {
+      appLogger.e('ui.rejectIncoming.failed', error: error);
       if (!mounted) return;
       setState(() {
         _errorMessage = '$error';

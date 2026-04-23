@@ -6,6 +6,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as p;
 
+import 'app_logger.dart';
+
 class EngineManager {
   static const _commandChannel = MethodChannel('engine/commands');
   static const _eventChannel = EventChannel('engine/events');
@@ -27,6 +29,10 @@ class EngineManager {
     required String nickname,
     required List<String> discoveryServers,
   }) async {
+    appLogger.i(
+      'engine.start requested platform=${Platform.operatingSystem} '
+      'nickname=$nickname discoveryServers=$discoveryServers',
+    );
     if (Platform.isAndroid) {
       if (_androidStarted) return;
       await _listenForAndroidEvents();
@@ -38,6 +44,7 @@ class EngineManager {
       });
       _androidStarted = true;
       await started;
+      appLogger.i('engine.start success (android)');
       return;
     }
 
@@ -50,9 +57,11 @@ class EngineManager {
       'discoveryServers': discoveryServers,
     });
     await started;
+    appLogger.i('engine.start success (desktop)');
   }
 
   Future<void> stop() async {
+    appLogger.i('engine.stop requested');
     if (Platform.isAndroid) {
       if (_androidStarted) {
         await _sendAndroidCommand({'type': 'STOP_NODE'});
@@ -91,12 +100,16 @@ class EngineManager {
 
     _engineProcess = null;
     _desktopReady = null;
+    appLogger.i('engine.stop completed');
   }
 
   Future<void> sendFile({
     required String targetPeerId,
     required String filePath,
   }) async {
+    appLogger.i(
+      'engine.sendFile targetPeerId=$targetPeerId filePath=$filePath',
+    );
     final payload = {
       'type': 'SEND_FILE',
       'targetPeerId': targetPeerId,
@@ -115,6 +128,7 @@ class EngineManager {
     required String transferId,
     required String savePath,
   }) async {
+    appLogger.i('engine.acceptFile transferId=$transferId savePath=$savePath');
     final payload = {
       'type': 'ACCEPT_FILE',
       'transferId': transferId,
@@ -130,6 +144,7 @@ class EngineManager {
   }
 
   Future<void> rejectFile({required String transferId}) async {
+    appLogger.i('engine.rejectFile transferId=$transferId');
     final payload = {'type': 'REJECT_FILE', 'transferId': transferId};
 
     if (Platform.isAndroid) {
@@ -147,15 +162,18 @@ class EngineManager {
       (event) {
         final message = _decodeMessage(event);
         if (message == null) return;
+        appLogger.d('engine.event.android $message');
         _eventController.add(message);
       },
       onError: (error) {
+        appLogger.e('engine.event.android.error', error: error);
         _eventController.add({'type': 'ERROR', 'message': '$error'});
       },
     );
   }
 
   Future<void> _sendAndroidCommand(Map<String, dynamic> payload) async {
+    appLogger.d('engine.command.android $payload');
     await _commandChannel.invokeMethod<void>(
       'commandJson',
       jsonEncode(payload),
@@ -173,6 +191,7 @@ class EngineManager {
 
     _desktopReady = Completer<void>();
     _engineProcess = await Process.start(javaBin, ['-jar', jarPath]);
+    appLogger.i('engine.desktop.process.started jarPath=$jarPath');
 
     _engineProcess!.stdout
         .transform(utf8.decoder)
@@ -193,6 +212,7 @@ class EngineManager {
         );
       }
       _eventController.add({'type': 'NODE_STOPPED', 'exitCode': code});
+      appLogger.w('engine.desktop.process.exited exitCode=$code');
     });
 
     await _desktopReady!.future.timeout(
@@ -207,6 +227,7 @@ class EngineManager {
     if (_engineProcess == null) {
       throw StateError('Desktop engine is not running.');
     }
+    appLogger.d('engine.command.desktop $payload');
     _engineProcess!.stdin.writeln(jsonEncode(payload));
   }
 
@@ -218,10 +239,12 @@ class EngineManager {
     }
 
     if (message['type'] == 'READY') {
+      appLogger.i('engine.desktop.ready');
       _desktopReady?.complete();
       return;
     }
 
+    appLogger.d('engine.event.desktop $message');
     _eventController.add(message);
   }
 
@@ -240,9 +263,11 @@ class EngineManager {
   }
 
   Future<void> _waitForEventTypes(Set<String> types) async {
+    appLogger.d('engine.waitForEventTypes types=${types.toList()}');
     final event = await updates
         .firstWhere((message) => types.contains(message['type']))
         .timeout(const Duration(seconds: 10));
+    appLogger.d('engine.waitForEventTypes.done $event');
 
     if (event['type'] == 'ERROR') {
       throw StateError(event['message']?.toString() ?? 'Node error');

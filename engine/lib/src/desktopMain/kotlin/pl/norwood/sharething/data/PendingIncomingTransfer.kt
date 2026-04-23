@@ -7,5 +7,6 @@ data class PendingIncomingTransfer(
     val peerId: String,
     val fileName: String,
     val totalBytes: Long,
-    val handler: P2PEngine.FileTransferMessageHandler
+    val handler: P2PEngine.FileTransferMessageHandler? = null,
+    val addresses: List<String> = emptyList()
 )
