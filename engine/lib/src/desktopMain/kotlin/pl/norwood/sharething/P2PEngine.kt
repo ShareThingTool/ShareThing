@@ -27,6 +27,8 @@ import pl.norwood.sharething.data.OutgoingTransfer
 import pl.norwood.sharething.data.PendingIncomingTransfer
 import pl.norwood.sharething.data.StoredIdentity
 import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.net.URI
@@ -35,6 +37,8 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
@@ -896,51 +900,86 @@ actual class P2PEngine actual constructor() {
         fun accept(savePath: String) {
             log.i { "data_accept id=$transferId savePath=$savePath" }
             val destination = File(savePath)
+            val partFile = File("$savePath.part")
             destination.parentFile?.mkdirs()
+            partFile.parentFile?.mkdirs()
+            if (partFile.exists() && !partFile.delete()) {
+                log.w { "data_accept could_not_delete_existing_part_file path=${partFile.path}" }
+            }
+
             transferStartMillis = System.currentTimeMillis()
             receivedFileBytes = 0L
+            bytesTransferred = 0L
             state = StreamState.RECEIVING_FILE
 
-            // Decoupled disk writing coroutine
             scope.launch(Dispatchers.IO) {
                 try {
-                    destination.outputStream().use { output ->
-                        for (chunk in diskWriteChannel) {
-                            output.write(chunk)
-                            bytesTransferred += chunk.size
+                    FileOutputStream(partFile).use { output ->
+                        val fileLock = output.channel.tryLock()
+                            ?: throw IOException("Failed to acquire file lock for ${partFile.path}")
+                        try {
+                            for (chunk in diskWriteChannel) {
+                                output.write(chunk)
+                                bytesTransferred += chunk.size
 
-                            emitTransferUpdate(
-                                transferId = transferId,
-                                direction = "INCOMING",
-                                bytesTransferred = bytesTransferred,
-                                totalBytes = totalBytes,
-                                speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
-                                status = "IN_PROGRESS",
-                                peerId = remotePeerId,
-                                filename = fileName
-                            )
+                                emitTransferUpdate(
+                                    transferId = transferId,
+                                    direction = "INCOMING",
+                                    bytesTransferred = bytesTransferred,
+                                    totalBytes = totalBytes,
+                                    speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
+                                    status = "IN_PROGRESS",
+                                    peerId = remotePeerId,
+                                    filename = fileName
+                                )
+                            }
+                            output.flush()
+                            output.fd.sync()
+                        } finally {
+                            fileLock.release()
                         }
                     }
 
-                    val completed = bytesTransferred == totalBytes
-                    val failureMessage = if (completed) null else "Received $bytesTransferred/$totalBytes bytes"
+                    if (bytesTransferred != totalBytes) {
+                        throw IOException("Byte count mismatch: $bytesTransferred/$totalBytes")
+                    }
+
+                    try {
+                        Files.move(
+                            partFile.toPath(),
+                            destination.toPath(),
+                            StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING
+                        )
+                    } catch (_: Exception) {
+                        Files.move(
+                            partFile.toPath(),
+                            destination.toPath(),
+                            StandardCopyOption.REPLACE_EXISTING
+                        )
+                    }
+
+                    log.i { "data_commit_success id=$transferId path=${destination.path}" }
                     emitTransferUpdate(
                         transferId = transferId,
                         direction = "INCOMING",
                         bytesTransferred = bytesTransferred,
                         totalBytes = totalBytes,
                         speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
-                        status = if (completed) "COMPLETED" else "FAILED",
+                        status = "COMPLETED",
                         peerId = remotePeerId,
-                        filename = fileName,
-                        message = failureMessage
+                        filename = fileName
                     )
                     incomingTransfers.remove(transferId)
-                    if (sendCompletion(completed = completed, message = failureMessage)) {
+                    if (sendCompletion(completed = true)) {
                         delay(50.milliseconds)
                     }
                     stream.close()
                 } catch (e: Exception) {
+                    log.e(e) { "data_write_failed id=$transferId partPath=${partFile.path}" }
+                    if (partFile.exists() && !partFile.delete()) {
+                        log.w { "data_write_failed could_not_delete_part_file path=${partFile.path}" }
+                    }
                     emitTransferUpdate(
                         transferId = transferId,
                         direction = "INCOMING",
