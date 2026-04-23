@@ -331,6 +331,7 @@ class _MyHomePageState extends State<MyHomePage> {
           _running = false;
           _statusMessage = 'Node stopped';
           _peerPresence = {..._peerPresence, ...offlinePresence};
+          _discoveredPeers = const {};
         });
         break;
       case 'PEER_DISCOVERED':
@@ -383,6 +384,7 @@ class _MyHomePageState extends State<MyHomePage> {
         if (peerId == null || peerId.isEmpty) return;
         setState(() {
           _peerPresence = {..._peerPresence, peerId: _FriendPresence.offline};
+          _discoveredPeers = Map.of(_discoveredPeers)..remove(peerId);
         });
         break;
       case 'INCOMING_FILE_REQUEST':
@@ -458,6 +460,23 @@ class _MyHomePageState extends State<MyHomePage> {
   int _intValue(dynamic value) {
     if (value is int) return value;
     return int.tryParse(value?.toString() ?? '') ?? 0;
+  }
+
+  String _formatByteSize(int bytes) {
+    if (bytes <= 0) return '0 B';
+
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    var value = bytes.toDouble();
+    var unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex++;
+    }
+
+    if (unitIndex == 0) {
+      return '${value.toInt()} ${units[unitIndex]}';
+    }
+    return '${value.toStringAsFixed(value >= 10 ? 1 : 2)} ${units[unitIndex]}';
   }
 
   String? _friendLabel(String? peerId) {
@@ -1176,7 +1195,7 @@ class _MyHomePageState extends State<MyHomePage> {
           const SizedBox(height: 8),
           Text('From: ${_friendLabel(request.peerId) ?? request.peerId}'),
           const SizedBox(height: 8),
-          Text('Size: ${request.totalBytes} bytes'),
+          Text('Size: ${_formatByteSize(request.totalBytes)}'),
           const SizedBox(height: 12),
           Wrap(
             spacing: 8,
@@ -1258,7 +1277,9 @@ class _MyHomePageState extends State<MyHomePage> {
           LinearProgressIndicator(value: transfer.progress),
           const SizedBox(height: 8),
           Text(
-            '$statusLabel • ${transfer.bytesTransferred}/${transfer.totalBytes} bytes',
+            '$statusLabel • '
+            '${_formatByteSize(transfer.bytesTransferred)}/'
+            '${_formatByteSize(transfer.totalBytes)}',
           ),
           if (transfer.error != null) ...[
             const SizedBox(height: 8),
