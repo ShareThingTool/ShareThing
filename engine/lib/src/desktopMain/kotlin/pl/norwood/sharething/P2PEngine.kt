@@ -2,7 +2,10 @@ package pl.norwood.sharething
 
 import co.touchlab.kermit.Logger
 import dorkbox.notify.Notify
-import io.libp2p.core.*
+import io.libp2p.core.Host
+import io.libp2p.core.PeerId
+import io.libp2p.core.PeerInfo
+import io.libp2p.core.Stream
 import io.libp2p.core.crypto.*
 import io.libp2p.core.dsl.HostBuilder
 import io.libp2p.core.multiformats.Multiaddr
@@ -21,11 +24,7 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.future.await
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import pl.norwood.sharething.data.FileTransferControl
-import pl.norwood.sharething.data.KnownPeer
-import pl.norwood.sharething.data.OutgoingTransfer
-import pl.norwood.sharething.data.PendingIncomingTransfer
-import pl.norwood.sharething.data.StoredIdentity
+import pl.norwood.sharething.data.*
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
@@ -154,9 +153,7 @@ actual class P2PEngine actual constructor() {
 
         val transferId = UUID.randomUUID().toString()
         val transfer = OutgoingTransfer(
-            transferId = transferId,
-            targetPeerId = targetPeerId,
-            file = file
+            transferId = transferId, targetPeerId = targetPeerId, file = file
         )
         log.i {
             "send_file queued id=$transferId target=$targetPeerId file=${file.name} bytes=${file.length()} addrs=${target.addresses.size}"
@@ -461,9 +458,7 @@ actual class P2PEngine actual constructor() {
                             }
                             CommandDispatcher.emit(
                                 EngineEvent.PeerDiscovered(
-                                    peerId = updated.peerId,
-                                    nickname = updated.nickname,
-                                    addresses = updated.addresses
+                                    peerId = updated.peerId, nickname = updated.nickname, addresses = updated.addresses
                                 )
                             )
                         }
@@ -481,6 +476,7 @@ actual class P2PEngine actual constructor() {
         val selfPeerId = node.peerId.toBase58()
         var peerIdStr = peerInfo.peerId.toBase58()
 
+        //Upstream bug: Length prefix is not stripped
         if (peerIdStr.length == 53 && peerIdStr.startsWith("412D")) {
             peerIdStr = peerIdStr.substring(1)
         }
@@ -527,8 +523,7 @@ actual class P2PEngine actual constructor() {
         return HostBuilder().builderModifier { b ->
             b.identity.factory = { privKey }
             b.protocols.add(Identify())
-        }.listen("/ip4/0.0.0.0/tcp/$port")
-            .build()
+        }.listen("/ip4/0.0.0.0/tcp/$port").build()
     }
 
     private fun currentListenAddresses(): List<String> {
@@ -654,20 +649,14 @@ actual class P2PEngine actual constructor() {
             )
         )
         log.d {
-            "transfer_update id=$transferId direction=$direction status=$status " +
-                "bytes=$bytesTransferred/$totalBytes speedBps=$speedBps " +
-                "peer=${peerId ?: "unknown"} file=${filename ?: "unknown"} message=${message ?: "-"}"
+            "transfer_update id=$transferId direction=$direction status=$status " + "bytes=$bytesTransferred/$totalBytes speedBps=$speedBps " + "peer=${peerId ?: "unknown"} file=${filename ?: "unknown"} message=${message ?: "-"}"
         }
 
         if (status == "COMPLETED" || status == "FAILED") {
             val dedupKey = "$transferId:$direction:$status"
             if (transferNotificationDedup.putIfAbsent(dedupKey, true) == null) {
                 notifyTransferTerminal(
-                    direction = direction,
-                    status = status,
-                    peerId = peerId,
-                    filename = filename,
-                    message = message
+                    direction = direction, status = status, peerId = peerId, filename = filename, message = message
                 )
             }
         }
@@ -690,11 +679,7 @@ actual class P2PEngine actual constructor() {
     }
 
     private fun notifyTransferTerminal(
-        direction: String,
-        status: String,
-        peerId: String?,
-        filename: String?,
-        message: String?
+        direction: String, status: String, peerId: String?, filename: String?, message: String?
     ) {
         val safePeerId = peerId ?: "unknown peer"
         val safeFileName = filename ?: "file"
@@ -728,14 +713,10 @@ actual class P2PEngine actual constructor() {
     }
 
     private fun notifyDesktop(
-        title: String,
-        text: String,
-        level: DesktopNotificationLevel
+        title: String, text: String, level: DesktopNotificationLevel
     ) {
         try {
-            val notify = Notify.create()
-                .title(title)
-                .text(text)
+            val notify = Notify.create().title(title).text(text)
 
             when (level) {
                 DesktopNotificationLevel.INFO -> notify.showInformation()
@@ -749,33 +730,29 @@ actual class P2PEngine actual constructor() {
     private fun logControl(control: FileTransferControl, scope: String) {
         when (control) {
             is FileTransferControl.Offer -> log.d {
-                "control[$scope] OFFER id=${control.transferId} peer=${control.peerId} " +
-                    "file=${control.filename} bytes=${control.totalBytes}"
+                "control[$scope] OFFER id=${control.transferId} peer=${control.peerId} " + "file=${control.filename} bytes=${control.totalBytes}"
             }
 
             is FileTransferControl.Response -> log.d {
-                "control[$scope] RESPONSE id=${control.transferId} accepted=${control.accepted} " +
-                    "msg=${control.message ?: "-"}"
+                "control[$scope] RESPONSE id=${control.transferId} accepted=${control.accepted} " + "msg=${control.message ?: "-"}"
             }
 
             is FileTransferControl.Completion -> log.d {
-                "control[$scope] COMPLETION id=${control.transferId} completed=${control.completed} " +
-                    "msg=${control.message ?: "-"}"
+                "control[$scope] COMPLETION id=${control.transferId} completed=${control.completed} " + "msg=${control.message ?: "-"}"
             }
         }
     }
 
     private fun createFileTransferBinding(): ProtocolBinding<FileTransferMessageHandler> {
-        return ProtocolBinding.createSimple(FILE_PROTOCOL_ID, P2PChannelHandler { ch ->
+        return ProtocolBinding.createSimple(FILE_PROTOCOL_ID) { ch ->
             val stream = ch as Stream
             val handler = FileTransferMessageHandler()
             stream.pushHandler(ProtocolMessageHandlerAdapter(stream, handler))
             CompletableFuture.completedFuture(handler)
-        })
+        }
     }
 
-    inner class FileTransferMessageHandler(
-    ) : ProtocolMessageHandler<ByteBuf> {
+    inner class FileTransferMessageHandler : ProtocolMessageHandler<ByteBuf> {
         private var outboundTransfer: OutgoingTransfer? = null
         private val transferJson = Json { ignoreUnknownKeys = true }
         private var state = StreamState.READING_CONTROL
@@ -823,7 +800,6 @@ actual class P2PEngine actual constructor() {
             completionSent = false
             streamClosed = false
             if (transferCompletion.isCompleted) {
-                // New handler instances are created per stream, but keep this safe if reused.
                 log.w { "data_initiate_send called with pre-completed completion future id=$transferId" }
             }
 
@@ -849,13 +825,13 @@ actual class P2PEngine actual constructor() {
                 StreamState.READING_CONTROL, StreamState.WAITING_FOR_RESPONSE, StreamState.WAITING_FOR_COMPLETION -> readControl(
                     msg
                 )
+
                 StreamState.SENDING_FILE -> readControl(msg)
                 StreamState.RECEIVING_FILE -> readFileBytes(msg)
                 StreamState.CLOSED -> {}
             }
         }
 
-        // Signal the coroutine to finish writing buffered bytes and close
         override fun onClosed(stream: Stream) {
             streamClosed = true
             diskWriteChannel.close()
@@ -878,9 +854,7 @@ actual class P2PEngine actual constructor() {
             if (outboundTransfer != null && !transferCompletion.isCompleted) {
                 transferCompletion.complete(
                     FileTransferControl.Completion(
-                        transferId = transferId,
-                        completed = false,
-                        message = cause?.message ?: "Stream error"
+                        transferId = transferId, completed = false, message = cause?.message ?: "Stream error"
                     )
                 )
             }
@@ -953,9 +927,7 @@ actual class P2PEngine actual constructor() {
                         )
                     } catch (_: Exception) {
                         Files.move(
-                            partFile.toPath(),
-                            destination.toPath(),
-                            StandardCopyOption.REPLACE_EXISTING
+                            partFile.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING
                         )
                     }
 
@@ -1071,9 +1043,7 @@ actual class P2PEngine actual constructor() {
                             )
                         )
                         notifyTransferRequestIncoming(
-                            peerId = remotePeerId,
-                            fileName = fileName,
-                            totalBytes = totalBytes
+                            peerId = remotePeerId, fileName = fileName, totalBytes = totalBytes
                         )
                     }
 
@@ -1260,16 +1230,13 @@ actual class P2PEngine actual constructor() {
         }
 
         private fun sendCompletion(
-            completed: Boolean,
-            message: String? = null
+            completed: Boolean, message: String? = null
         ): Boolean {
             if (completionSent || streamClosed) return false
             completionSent = true
             writeControl(
                 FileTransferControl.Completion(
-                    transferId = transferId,
-                    completed = completed,
-                    message = message
+                    transferId = transferId, completed = completed, message = message
                 )
             )
             return true
