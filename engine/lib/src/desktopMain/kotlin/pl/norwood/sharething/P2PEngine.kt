@@ -680,6 +680,7 @@ actual class P2PEngine actual constructor() {
         }
 
         override fun onMessage(stream: Stream, msg: ByteBuf) {
+            println("DEBUG: onMessage received ${msg.readableBytes()} bytes in state: $state")
             when (state) {
                 StreamState.READING_CONTROL, StreamState.WAITING_FOR_RESPONSE -> readControl(msg)
                 StreamState.RECEIVING_FILE -> readFileBytes(msg)
@@ -695,6 +696,8 @@ actual class P2PEngine actual constructor() {
         }
 
         override fun onException(cause: Throwable?) {
+            println("DEBUG FATAL: Stream exception caught! ${cause?.message}")
+            cause?.printStackTrace()
             emitTransferUpdate(
                 transferId = transferId,
                 direction = if (outboundTransfer != null) "OUTGOING" else "INCOMING",
@@ -804,49 +807,58 @@ actual class P2PEngine actual constructor() {
         }
 
         private fun handleControl(payload: String) {
-            when (val control = transferJson.decodeFromString<FileTransferControl>(payload)) {
-                is FileTransferControl.Offer -> {
-                    transferId = control.transferId
-                    remotePeerId = control.peerId
-                    fileName = control.filename
-                    totalBytes = control.totalBytes
-                    incomingTransfers[transferId] = PendingIncomingTransfer(
-                        transferId = transferId,
-                        peerId = remotePeerId,
-                        fileName = fileName,
-                        totalBytes = totalBytes,
-                        handler = this
-                    )
-                    CommandDispatcher.emit(
-                        EngineEvent.IncomingFileRequest(
-                            transferId = transferId, peerId = remotePeerId, filename = fileName, totalBytes = totalBytes
-                        )
-                    )
-                }
-
-                is FileTransferControl.Response -> {
-                    if (!control.accepted) {
-                        emitTransferUpdate(
+            println("DEBUG: Attempting to decode payload: $payload")
+            try {
+                when (val control = transferJson.decodeFromString<FileTransferControl>(payload)) {
+                    is FileTransferControl.Offer -> {
+                        transferId = control.transferId
+                        remotePeerId = control.peerId
+                        fileName = control.filename
+                        totalBytes = control.totalBytes
+                        incomingTransfers[transferId] = PendingIncomingTransfer(
                             transferId = transferId,
-                            direction = "OUTGOING",
-                            bytesTransferred = 0,
-                            totalBytes = totalBytes,
-                            speedBps = 0,
-                            status = "FAILED",
                             peerId = remotePeerId,
-                            filename = fileName,
-                            message = control.message ?: "Rejected"
+                            fileName = fileName,
+                            totalBytes = totalBytes,
+                            handler = this
                         )
-                        stream.close()
-                        return
+                        CommandDispatcher.emit(
+                            EngineEvent.IncomingFileRequest(
+                                transferId = transferId,
+                                peerId = remotePeerId,
+                                filename = fileName,
+                                totalBytes = totalBytes
+                            )
+                        )
                     }
 
-                    transferStartMillis = System.currentTimeMillis()
-                    state = StreamState.SENDING_FILE
-                    scope.launch {
-                        sendFileBytes()
+                    is FileTransferControl.Response -> {
+                        if (!control.accepted) {
+                            emitTransferUpdate(
+                                transferId = transferId,
+                                direction = "OUTGOING",
+                                bytesTransferred = 0,
+                                totalBytes = totalBytes,
+                                speedBps = 0,
+                                status = "FAILED",
+                                peerId = remotePeerId,
+                                filename = fileName,
+                                message = control.message ?: "Rejected"
+                            )
+                            stream.close()
+                            return
+                        }
+
+                        transferStartMillis = System.currentTimeMillis()
+                        state = StreamState.SENDING_FILE
+                        scope.launch {
+                            sendFileBytes()
+                        }
                     }
                 }
+            } catch (e: Exception){
+                println("DEBUG FATAL: JSON Parsing crashed! ${e.message}")
+                e.printStackTrace()
             }
         }
 
