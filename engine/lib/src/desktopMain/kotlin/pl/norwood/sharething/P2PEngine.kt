@@ -152,7 +152,6 @@ actual class P2PEngine actual constructor() {
         val transfer = OutgoingTransfer(
             transferId = transferId,
             targetPeerId = targetPeerId,
-            targetNickname = target.nickname,
             file = file
         )
         log.i {
@@ -736,7 +735,6 @@ actual class P2PEngine actual constructor() {
 
             when (level) {
                 DesktopNotificationLevel.INFO -> notify.showInformation()
-                DesktopNotificationLevel.WARNING -> notify.showWarning()
                 DesktopNotificationLevel.ERROR -> notify.showError()
             }
         } catch (t: Throwable) {
@@ -776,8 +774,6 @@ actual class P2PEngine actual constructor() {
     ) : ProtocolMessageHandler<ByteBuf> {
         private var outboundTransfer: OutgoingTransfer? = null
         private val transferJson = Json { ignoreUnknownKeys = true }
-        val activeFuture = CompletableFuture<FileTransferMessageHandler>()
-
         private var state = StreamState.READING_CONTROL
         private var expectedControlLength = -1
         private var controlHeaderBytesRead = 0
@@ -800,7 +796,6 @@ actual class P2PEngine actual constructor() {
         private var nettyChannel: io.netty.channel.Channel? = null
 
         private val diskWriteChannel = Channel<ByteArray>(Channel.UNLIMITED)
-        private var diskWriteJob: Job? = null
 
         override fun onActivated(stream: Stream) {
             this.stream = stream
@@ -809,8 +804,6 @@ actual class P2PEngine actual constructor() {
                     nettyChannel = ctx.channel()
                 }
             })
-
-            activeFuture.complete(this)
             log.v { "data_stream_activated outbound=${outboundTransfer != null}" }
         }
 
@@ -909,7 +902,7 @@ actual class P2PEngine actual constructor() {
             state = StreamState.RECEIVING_FILE
 
             // Decoupled disk writing coroutine
-            diskWriteJob = scope.launch(Dispatchers.IO) {
+            scope.launch(Dispatchers.IO) {
                 try {
                     destination.outputStream().use { output ->
                         for (chunk in diskWriteChannel) {
@@ -1257,7 +1250,7 @@ actual class P2PEngine actual constructor() {
     }
 
     private enum class DesktopNotificationLevel {
-        INFO, WARNING, ERROR
+        INFO, ERROR
     }
 
     private enum class StreamState {
