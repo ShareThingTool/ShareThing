@@ -40,6 +40,7 @@ kotlin {
             dependencies {
                 implementation("io.libp2p:jvm-libp2p:1.2.2-RELEASE")
                 implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+                implementation("com.dorkbox:Notify:3.7")
             }
         }
     }

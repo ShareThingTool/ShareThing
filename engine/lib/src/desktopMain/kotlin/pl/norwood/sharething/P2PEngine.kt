@@ -1,6 +1,7 @@
 package pl.norwood.sharething
 
 import co.touchlab.kermit.Logger
+import dorkbox.notify.Notify
 import io.libp2p.core.*
 import io.libp2p.core.crypto.*
 import io.libp2p.core.dsl.HostBuilder
@@ -65,6 +66,7 @@ actual class P2PEngine actual constructor() {
 
     private val knownPeers = ConcurrentHashMap<String, KnownPeer>()
     private val incomingTransfers = ConcurrentHashMap<String, PendingIncomingTransfer>()
+    private val transferNotificationDedup = ConcurrentHashMap<String, Boolean>()
     private val fileBinding: ProtocolBinding<FileTransferMessageHandler> = createFileTransferBinding()
 
     actual fun startNode(
@@ -128,6 +130,7 @@ actual class P2PEngine actual constructor() {
 
         knownPeers.clear()
         incomingTransfers.clear()
+        transferNotificationDedup.clear()
         unregisterFromDiscoveryServers()
 
         host?.stop()?.get()
@@ -652,6 +655,93 @@ actual class P2PEngine actual constructor() {
                 "bytes=$bytesTransferred/$totalBytes speedBps=$speedBps " +
                 "peer=${peerId ?: "unknown"} file=${filename ?: "unknown"} message=${message ?: "-"}"
         }
+
+        if (status == "COMPLETED" || status == "FAILED") {
+            val dedupKey = "$transferId:$direction:$status"
+            if (transferNotificationDedup.putIfAbsent(dedupKey, true) == null) {
+                notifyTransferTerminal(
+                    direction = direction,
+                    status = status,
+                    peerId = peerId,
+                    filename = filename,
+                    message = message
+                )
+            }
+        }
+    }
+
+    private fun notifyTransferRequestSent(peerId: String, fileName: String) {
+        notifyDesktop(
+            title = "ShareThing",
+            text = "Transfer request sent to $peerId for $fileName",
+            level = DesktopNotificationLevel.INFO
+        )
+    }
+
+    private fun notifyTransferRequestIncoming(peerId: String, fileName: String, totalBytes: Long) {
+        notifyDesktop(
+            title = "ShareThing",
+            text = "Incoming transfer request from $peerId for $fileName ($totalBytes bytes)",
+            level = DesktopNotificationLevel.INFO
+        )
+    }
+
+    private fun notifyTransferTerminal(
+        direction: String,
+        status: String,
+        peerId: String?,
+        filename: String?,
+        message: String?
+    ) {
+        val safePeerId = peerId ?: "unknown peer"
+        val safeFileName = filename ?: "file"
+        val suffix = if (message.isNullOrBlank()) "" else " ($message)"
+
+        when {
+            direction == "OUTGOING" && status == "COMPLETED" -> notifyDesktop(
+                title = "ShareThing",
+                text = "Transfer complete: sent $safeFileName to $safePeerId",
+                level = DesktopNotificationLevel.INFO
+            )
+
+            direction == "OUTGOING" && status == "FAILED" -> notifyDesktop(
+                title = "ShareThing",
+                text = "Transfer failed: could not send $safeFileName to $safePeerId$suffix",
+                level = DesktopNotificationLevel.ERROR
+            )
+
+            direction == "INCOMING" && status == "COMPLETED" -> notifyDesktop(
+                title = "ShareThing",
+                text = "Transfer complete: received $safeFileName from $safePeerId",
+                level = DesktopNotificationLevel.INFO
+            )
+
+            direction == "INCOMING" && status == "FAILED" -> notifyDesktop(
+                title = "ShareThing",
+                text = "Transfer failed: could not receive $safeFileName from $safePeerId$suffix",
+                level = DesktopNotificationLevel.ERROR
+            )
+        }
+    }
+
+    private fun notifyDesktop(
+        title: String,
+        text: String,
+        level: DesktopNotificationLevel
+    ) {
+        try {
+            val notify = Notify.create()
+                .title(title)
+                .text(text)
+
+            when (level) {
+                DesktopNotificationLevel.INFO -> notify.showInformation()
+                DesktopNotificationLevel.WARNING -> notify.showWarning()
+                DesktopNotificationLevel.ERROR -> notify.showError()
+            }
+        } catch (t: Throwable) {
+            log.w(t) { "desktop_notification_failed title=$title text=$text" }
+        }
     }
 
     private fun logControl(control: FileTransferControl, scope: String) {
@@ -751,6 +841,7 @@ actual class P2PEngine actual constructor() {
             writeControl(offer)
             state = StreamState.WAITING_FOR_RESPONSE
             log.i { "data_offer_sent id=$transferId peer=$remotePeerId file=$fileName bytes=$totalBytes" }
+            notifyTransferRequestSent(peerId = remotePeerId, fileName = fileName)
         }
 
         override fun onMessage(stream: Stream, msg: ByteBuf) {
@@ -946,6 +1037,11 @@ actual class P2PEngine actual constructor() {
                                 filename = fileName,
                                 totalBytes = totalBytes
                             )
+                        )
+                        notifyTransferRequestIncoming(
+                            peerId = remotePeerId,
+                            fileName = fileName,
+                            totalBytes = totalBytes
                         )
                     }
 
@@ -1158,6 +1254,10 @@ actual class P2PEngine actual constructor() {
         if (startMillis <= 0L) return 0L
         val elapsedMillis = (System.currentTimeMillis() - startMillis).coerceAtLeast(1L)
         return bytesTransferred * 1000L / elapsedMillis
+    }
+
+    private enum class DesktopNotificationLevel {
+        INFO, WARNING, ERROR
     }
 
     private enum class StreamState {
