@@ -110,12 +110,13 @@ class _ShareThingAppState extends State<ShareThingApp> {
   }
 }
 
-enum _FriendPresence { unknown, online }
+enum _FriendPresence { unknown, offline, online }
 
 extension _FriendPresenceUi on _FriendPresence {
   String get label {
     return switch (this) {
       _FriendPresence.unknown => 'Unknown',
+      _FriendPresence.offline => 'Offline',
       _FriendPresence.online => 'Online',
     };
   }
@@ -123,6 +124,7 @@ extension _FriendPresenceUi on _FriendPresence {
   IconData get icon {
     return switch (this) {
       _FriendPresence.unknown => Icons.help_outline,
+      _FriendPresence.offline => Icons.portable_wifi_off_outlined,
       _FriendPresence.online => Icons.check_circle_outline,
     };
   }
@@ -131,6 +133,7 @@ extension _FriendPresenceUi on _FriendPresence {
     final colors = Theme.of(context).colorScheme;
     return switch (this) {
       _FriendPresence.unknown => colors.secondary,
+      _FriendPresence.offline => colors.error,
       _FriendPresence.online => Colors.green,
     };
   }
@@ -159,6 +162,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
   List<FriendEntry> _friends = const [];
   Map<String, DiscoveredPeer> _discoveredPeers = const {};
+  Map<String, _FriendPresence> _peerPresence = const {};
   Map<String, FileTransferEntry> _transfers = const {};
   Map<String, IncomingFileRequest> _incomingRequests = const {};
   AppSettings _settings = AppSettings.defaults();
@@ -271,6 +275,7 @@ class _MyHomePageState extends State<MyHomePage> {
       _peerId = 'Unavailable';
       _listenAddresses = const [];
       _discoveredPeers = const {};
+      _peerPresence = const {};
       _incomingRequests = const {};
     });
     await _startEngine();
@@ -293,6 +298,7 @@ class _MyHomePageState extends State<MyHomePage> {
       _listenAddresses = const [];
       _statusMessage = 'Node stopped';
       _discoveredPeers = const {};
+      _peerPresence = const {};
       _incomingRequests = const {};
     });
   }
@@ -312,9 +318,14 @@ class _MyHomePageState extends State<MyHomePage> {
         });
         break;
       case 'NODE_STOPPED':
+        final offlinePresence = <String, _FriendPresence>{
+          for (final peerId in _discoveredPeers.keys)
+            peerId: _FriendPresence.offline,
+        };
         setState(() {
           _running = false;
           _statusMessage = 'Node stopped';
+          _peerPresence = {..._peerPresence, ...offlinePresence};
         });
         break;
       case 'PEER_DISCOVERED':
@@ -335,6 +346,7 @@ class _MyHomePageState extends State<MyHomePage> {
               lastSeen: DateTime.now(),
             ),
           };
+          _peerPresence = {..._peerPresence, peerId: _FriendPresence.online};
         });
         break;
       case 'PEER_NICKNAME_CHANGED':
@@ -360,6 +372,13 @@ class _MyHomePageState extends State<MyHomePage> {
             };
           });
         }
+        break;
+      case 'PEER_OFFLINE':
+        final peerId = event['peerId']?.toString();
+        if (peerId == null || peerId.isEmpty) return;
+        setState(() {
+          _peerPresence = {..._peerPresence, peerId: _FriendPresence.offline};
+        });
         break;
       case 'INCOMING_FILE_REQUEST':
         final transferId = event['transferId']?.toString();
@@ -449,8 +468,16 @@ class _MyHomePageState extends State<MyHomePage> {
     return discovered?.nickname;
   }
 
-  bool _isFriendOnline(FriendEntry friend) =>
-      _discoveredPeers.containsKey(friend.peerId);
+  _FriendPresence _presenceForPeer(String peerId) {
+    final knownPresence = _peerPresence[peerId];
+    if (knownPresence != null) {
+      return knownPresence;
+    }
+    if (_discoveredPeers.containsKey(peerId)) {
+      return _FriendPresence.online;
+    }
+    return _FriendPresence.unknown;
+  }
 
   Future<void> _sendFileToPeer(String peerId) async {
     final result = await FilePicker.platform.pickFiles();
@@ -481,8 +508,13 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _acceptIncomingRequest(IncomingFileRequest request) async {
-    final directory = await widget.storagePaths.receivedFilesDirectory();
-    final savePath = '${directory.path}/${request.fileName}';
+    final savePath = await FilePicker.platform.saveFile(
+      dialogTitle: 'Save incoming file',
+      fileName: request.fileName,
+    );
+    if (savePath == null || savePath.isEmpty) {
+      return;
+    }
 
     setState(() {
       _busy = true;
@@ -897,9 +929,7 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Widget _buildFriendCard(BuildContext context, FriendEntry friend) {
-    final presence = _isFriendOnline(friend)
-        ? _FriendPresence.online
-        : _FriendPresence.unknown;
+    final presence = _presenceForPeer(friend.peerId);
 
     return Container(
       key: ValueKey('friend-card-${friend.peerId}'),
@@ -1042,7 +1072,7 @@ class _MyHomePageState extends State<MyHomePage> {
                 ),
               ),
               const SizedBox(width: 12),
-              _buildPresenceChip(context, _FriendPresence.online),
+              _buildPresenceChip(context, _presenceForPeer(peer.peerId)),
             ],
           ),
           const SizedBox(height: 12),

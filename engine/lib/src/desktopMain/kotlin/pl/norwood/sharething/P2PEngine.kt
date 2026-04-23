@@ -266,7 +266,7 @@ actual class P2PEngine actual constructor() {
 
         peerSweepJob = scope.launch {
             while (isActive && host != null) {
-                delay(10_000)
+                delay(10_000.milliseconds)
                 sweepStalePeers()
             }
         }
@@ -280,14 +280,14 @@ actual class P2PEngine actual constructor() {
         heartbeatJob = scope.launch {
             while (isActive && host != null) {
                 heartbeatDiscoveryServers()
-                delay(15_000)
+                delay(15_000.milliseconds)
             }
         }
 
         discoveryJob = scope.launch {
             while (isActive && host != null) {
                 pollDiscoveryServers()
-                delay(5_000)
+                delay(5_000.milliseconds)
             }
         }
     }
@@ -646,7 +646,11 @@ actual class P2PEngine actual constructor() {
         private var fileName: String = outboundTransfer?.file?.name ?: ""
         private var totalBytes: Long = outboundTransfer?.file?.length() ?: 0L
         private var bytesTransferred: Long = 0L
+        private var receivedFileBytes: Long = 0L
         private var transferStartMillis: Long = 0L
+        private var streamClosed: Boolean = false
+        private var completionSent: Boolean = false
+        private val transferCompletion = CompletableDeferred<FileTransferControl.Completion>()
 
         private lateinit var stream: Stream
         private var nettyChannel: io.netty.channel.Channel? = null
@@ -680,24 +684,43 @@ actual class P2PEngine actual constructor() {
         }
 
         override fun onMessage(stream: Stream, msg: ByteBuf) {
-            println("DEBUG: onMessage received ${msg.readableBytes()} bytes in state: $state")
             when (state) {
-                StreamState.READING_CONTROL, StreamState.WAITING_FOR_RESPONSE -> readControl(msg)
+                StreamState.READING_CONTROL, StreamState.WAITING_FOR_RESPONSE, StreamState.WAITING_FOR_COMPLETION -> readControl(
+                    msg
+                )
+                StreamState.SENDING_FILE -> readControl(msg)
                 StreamState.RECEIVING_FILE -> readFileBytes(msg)
-                StreamState.SENDING_FILE, StreamState.CLOSED -> {}
+                StreamState.CLOSED -> {}
             }
         }
 
         // Signal the coroutine to finish writing buffered bytes and close
         override fun onClosed(stream: Stream) {
+            streamClosed = true
             diskWriteChannel.close()
             incomingTransfers.remove(transferId)
+            if (outboundTransfer != null && !transferCompletion.isCompleted) {
+                transferCompletion.complete(
+                    FileTransferControl.Completion(
+                        transferId = transferId,
+                        completed = false,
+                        message = "Transfer stream closed before completion acknowledgement"
+                    )
+                )
+            }
             state = StreamState.CLOSED
         }
 
         override fun onException(cause: Throwable?) {
-            println("DEBUG FATAL: Stream exception caught! ${cause?.message}")
-            cause?.printStackTrace()
+            if (outboundTransfer != null && !transferCompletion.isCompleted) {
+                transferCompletion.complete(
+                    FileTransferControl.Completion(
+                        transferId = transferId,
+                        completed = false,
+                        message = cause?.message ?: "Stream error"
+                    )
+                )
+            }
             emitTransferUpdate(
                 transferId = transferId,
                 direction = if (outboundTransfer != null) "OUTGOING" else "INCOMING",
@@ -715,6 +738,7 @@ actual class P2PEngine actual constructor() {
             val destination = File(savePath)
             destination.parentFile?.mkdirs()
             transferStartMillis = System.currentTimeMillis()
+            receivedFileBytes = 0L
             state = StreamState.RECEIVING_FILE
 
             // Decoupled disk writing coroutine
@@ -738,18 +762,24 @@ actual class P2PEngine actual constructor() {
                         }
                     }
 
-                    // Final success emit once the stream completes and channel closes
-                    val finalStatus = if (bytesTransferred >= totalBytes) "COMPLETED" else "FAILED"
+                    val completed = bytesTransferred == totalBytes
+                    val failureMessage = if (completed) null else "Received $bytesTransferred/$totalBytes bytes"
                     emitTransferUpdate(
                         transferId = transferId,
                         direction = "INCOMING",
                         bytesTransferred = bytesTransferred,
                         totalBytes = totalBytes,
                         speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
-                        status = finalStatus,
+                        status = if (completed) "COMPLETED" else "FAILED",
                         peerId = remotePeerId,
-                        filename = fileName
+                        filename = fileName,
+                        message = failureMessage
                     )
+                    incomingTransfers.remove(transferId)
+                    if (sendCompletion(completed = completed, message = failureMessage)) {
+                        delay(50.milliseconds)
+                    }
+                    stream.close()
                 } catch (e: Exception) {
                     emitTransferUpdate(
                         transferId = transferId,
@@ -762,6 +792,11 @@ actual class P2PEngine actual constructor() {
                         filename = fileName,
                         message = e.message
                     )
+                    incomingTransfers.remove(transferId)
+                    if (sendCompletion(completed = false, message = e.message ?: "File write failed")) {
+                        delay(50.milliseconds)
+                    }
+                    stream.close()
                 }
             }
 
@@ -807,7 +842,6 @@ actual class P2PEngine actual constructor() {
         }
 
         private fun handleControl(payload: String) {
-            println("DEBUG: Attempting to decode payload: $payload")
             try {
                 when (val control = transferJson.decodeFromString<FileTransferControl>(payload)) {
                     is FileTransferControl.Offer -> {
@@ -833,6 +867,9 @@ actual class P2PEngine actual constructor() {
                     }
 
                     is FileTransferControl.Response -> {
+                        if (control.transferId != transferId) {
+                            return
+                        }
                         if (!control.accepted) {
                             emitTransferUpdate(
                                 transferId = transferId,
@@ -855,10 +892,17 @@ actual class P2PEngine actual constructor() {
                             sendFileBytes()
                         }
                     }
+
+                    is FileTransferControl.Completion -> {
+                        if (outboundTransfer == null || control.transferId != transferId) {
+                            return
+                        }
+                        if (!transferCompletion.isCompleted) {
+                            transferCompletion.complete(control)
+                        }
+                    }
                 }
-            } catch (e: Exception){
-                println("DEBUG FATAL: JSON Parsing crashed! ${e.message}")
-                e.printStackTrace()
+            } catch (_: Exception) {
             }
         }
 
@@ -895,7 +939,10 @@ actual class P2PEngine actual constructor() {
                     }
                 }
 
-                stream.closeWrite().await()
+                state = StreamState.WAITING_FOR_COMPLETION
+                val completion = withTimeout(TRANSFER_COMPLETION_TIMEOUT_MILLIS) {
+                    transferCompletion.await()
+                }
 
                 emitTransferUpdate(
                     transferId = transfer.transferId,
@@ -903,11 +950,18 @@ actual class P2PEngine actual constructor() {
                     bytesTransferred = bytesTransferred,
                     totalBytes = transfer.file.length(),
                     speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
-                    status = "COMPLETED",
+                    status = if (completion.completed) "COMPLETED" else "FAILED",
                     peerId = transfer.targetPeerId,
-                    filename = transfer.file.name
+                    filename = transfer.file.name,
+                    message = if (completion.completed) null else completion.message
                 )
+                stream.close()
             } catch (e: Exception) {
+                val errorMessage = if (e is TimeoutCancellationException) {
+                    "Timed out waiting for receiver acknowledgement"
+                } else {
+                    e.message
+                }
                 emitTransferUpdate(
                     transferId = transfer.transferId,
                     direction = "OUTGOING",
@@ -917,19 +971,86 @@ actual class P2PEngine actual constructor() {
                     status = "FAILED",
                     peerId = transfer.targetPeerId,
                     filename = transfer.file.name,
-                    message = e.message
+                    message = errorMessage
                 )
+                stream.close()
             }
         }
 
         private fun readFileBytes(msg: ByteBuf) {
-            val readable = msg.readableBytes()
-            if (readable <= 0) return
+            val readableBytes = msg.readableBytes()
+            if (readableBytes <= 0) return
 
-            val bytes = ByteArray(readable)
+            val remaining = (totalBytes - receivedFileBytes).coerceAtLeast(0L)
+            if (remaining == 0L) {
+                msg.skipBytes(readableBytes)
+                return
+            }
+
+            val toRead = minOf(readableBytes.toLong(), remaining).toInt()
+            if (toRead <= 0) return
+
+            val bytes = ByteArray(toRead)
             msg.readBytes(bytes)
+            receivedFileBytes += toRead
 
-            diskWriteChannel.trySend(bytes)
+            val sendResult = diskWriteChannel.trySend(bytes)
+            if (sendResult.isFailure) {
+                emitTransferUpdate(
+                    transferId = transferId,
+                    direction = "INCOMING",
+                    bytesTransferred = bytesTransferred,
+                    totalBytes = totalBytes,
+                    speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
+                    status = "FAILED",
+                    peerId = remotePeerId,
+                    filename = fileName,
+                    message = "Incoming transfer buffer overflow"
+                )
+                incomingTransfers.remove(transferId)
+                sendCompletion(completed = false, message = "Incoming transfer buffer overflow")
+                stream.close()
+                return
+            }
+
+            if (msg.isReadable) {
+                msg.skipBytes(msg.readableBytes())
+                emitTransferUpdate(
+                    transferId = transferId,
+                    direction = "INCOMING",
+                    bytesTransferred = bytesTransferred,
+                    totalBytes = totalBytes,
+                    speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
+                    status = "FAILED",
+                    peerId = remotePeerId,
+                    filename = fileName,
+                    message = "Sender exceeded declared transfer size"
+                )
+                incomingTransfers.remove(transferId)
+                sendCompletion(completed = false, message = "Sender exceeded declared transfer size")
+                stream.close()
+                return
+            }
+
+            if (receivedFileBytes >= totalBytes) {
+                diskWriteChannel.close()
+            }
+        }
+
+        private fun sendCompletion(
+            completed: Boolean,
+            message: String? = null
+        ): Boolean {
+            if (completionSent || streamClosed) return false
+            completionSent = true
+            writeControl(
+                FileTransferControl.Completion(
+                    transferId = transferId,
+                    completed = completed,
+                    message = message
+                )
+            )
+            return true
         }
 
         private fun writeControl(control: FileTransferControl) {
@@ -946,12 +1067,13 @@ actual class P2PEngine actual constructor() {
     }
 
     private enum class StreamState {
-        READING_CONTROL, WAITING_FOR_RESPONSE, SENDING_FILE, RECEIVING_FILE, CLOSED
+        READING_CONTROL, WAITING_FOR_RESPONSE, SENDING_FILE, WAITING_FOR_COMPLETION, RECEIVING_FILE, CLOSED
     }
 
     private companion object {
         const val DEFAULT_PORT = 4101
         const val FILE_PROTOCOL_ID = "/sharething/files/1.0.0"
         const val FILE_CHUNK_SIZE = 64 * 1024
+        const val TRANSFER_COMPLETION_TIMEOUT_MILLIS = 15_000L
     }
 }

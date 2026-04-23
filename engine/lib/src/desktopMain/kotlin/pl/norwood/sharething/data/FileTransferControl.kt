@@ -16,4 +16,10 @@ sealed class FileTransferControl {
     data class Response(
         val transferId: String, val accepted: Boolean, val message: String? = null
     ) : FileTransferControl()
+
+    @Serializable
+    @SerialName("COMPLETION")
+    data class Completion(
+        val transferId: String, val completed: Boolean, val message: String? = null
+    ) : FileTransferControl()
 }
