@@ -4,8 +4,10 @@
 *.log
 .vscode/
 
+/.dart_tool/
+/.dart_tool_bak/
 **/build/
-**/.gradle/
+**/.kotlin/
 **/out/
 **/local.properties
 **/captures/
@@ -42,5 +44,3 @@ ui/macos/jre/
 *.so
 *.apk
 *.aar
-*.jar
-!engine/lib/build/libs/lib-desktop.jar

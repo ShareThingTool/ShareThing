@@ -23,8 +23,21 @@ class EngineService : Service() {
                 multiaddr = addr
                 peerId = addr.substringAfterLast("/")
                 println("libp2p node started: $addr")
+                MainActivity.emitEvent(
+                    mapOf(
+                        "type" to "NODE_STARTED",
+                        "peerId" to peerId,
+                        "listenAddresses" to listOf(addr)
+                    )
+                )
             } catch (e: Exception) {
                 e.printStackTrace()
+                MainActivity.emitEvent(
+                    mapOf(
+                        "type" to "ERROR",
+                        "message" to (e.message ?: "Android node failed to start")
+                    )
+                )
             }
         }.start()
     }
@@ -32,6 +45,7 @@ class EngineService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         P2p.stop()
+        MainActivity.emitEvent(mapOf("type" to "NODE_STOPPED"))
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

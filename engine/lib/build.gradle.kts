@@ -24,6 +24,7 @@ kotlin {
         val commonMain by getting {
             dependencies {
                 implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+                implementation("co.touchlab:kermit:2.0.4")
             }
         }
 
@@ -39,6 +40,7 @@ kotlin {
             dependencies {
                 implementation("io.libp2p:jvm-libp2p:1.2.2-RELEASE")
                 implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+                implementation("com.dorkbox:Notify:3.7")
             }
         }
     }

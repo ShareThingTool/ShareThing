@@ -1,37 +1,72 @@
 package pl.norwood.sharething
 
+import co.touchlab.kermit.Logger
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
 object CommandDispatcher {
+    private val log = Logger.withTag("CommandDispatcher")
+
+    data class DispatchResult(
+        val eventJson: String?,
+        val shouldTerminate: Boolean = false
+    )
+
+    private val json = Json {
+        classDiscriminator = "type"
+        ignoreUnknownKeys = true
+    }
 
     var engine = P2PEngine()
         private set
-    private val json = Json { ignoreUnknownKeys = true }
 
-    fun dispatch(input: String): String {
+    fun encodeEvent(event: EngineEvent): String = json.encodeToString(event)
 
+    fun dispatch(input: String): DispatchResult {
+        log.d { "dispatch_input bytes=${input.length}" }
         return try {
-            val command = json.decodeFromString<EngineCommand>(input)
+            when (val command = json.decodeFromString<EngineCommand>(input)) {
+                is EngineCommand.StartNode -> DispatchResult(
+                    eventJson = encodeEvent(
+                        engine.startNode(command.nickname, command.discoveryServers)
+                    )
+                )
 
+                EngineCommand.StopNode -> {
+                    engine.stopNode()
+                    DispatchResult(eventJson = null, shouldTerminate = true)
+                }
 
-            val result = when (command) {
-                is EngineCommand.StartNode -> engine.startNode(command.port)
-                is EngineCommand.StopNode -> engine.stopNode()
-                is EngineCommand.GetId -> engine.getPeerId()
-                is EngineCommand.GetPort -> engine.getPort()
+                is EngineCommand.SendFile -> DispatchResult(
+                    eventJson = encodeEvent(
+                        engine.sendFile(command.targetPeerId, command.filePath)
+                    )
+                )
+
+                is EngineCommand.AcceptFile -> DispatchResult(
+                    eventJson = encodeEvent(
+                        engine.acceptFile(command.transferId, command.savePath)
+                    )
+                )
+
+                is EngineCommand.RejectFile -> DispatchResult(
+                    eventJson = encodeEvent(
+                        engine.rejectFile(command.transferId)
+                    )
+                )
             }
-
-            json.encodeToString(
-                EngineResponse(
-                    requestId = command.requestId,
-                    type = "response",
-                    data = result
+        } catch (e: Exception) {
+            log.e(e) { "dispatch_failed inputBytes=${input.length}" }
+            DispatchResult(
+                eventJson = encodeEvent(
+                    EngineEvent.Error(e.message ?: e::class.simpleName.orEmpty())
                 )
             )
-        } catch (e: Exception) {
-            json.encodeToString(EngineResponse(null, "error", error = e.message))
         }
+    }
 
+    fun emit(event: EngineEvent) {
+        log.v { "emit_event type=${event::class.simpleName}" }
+        EngineRuntime.emit(event)
     }
 }

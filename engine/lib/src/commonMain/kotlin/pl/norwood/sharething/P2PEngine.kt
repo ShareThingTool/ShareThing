@@ -1,24 +1,13 @@
 package pl.norwood.sharething
 
 expect class P2PEngine() {
-    /**
-     * Starts the libp2p node on the specified port.
-     * Returns the PeerID or an error message.
-     */
-    fun startNode(port: Int): String
+    fun startNode(nickname: String, discoveryServers: List<String>): EngineEvent.NodeStarted
 
-    /**
-     * Returns the local PeerID in Base58 format.
-     */
-    fun getPeerId(): String
+    fun stopNode()
 
-    /**
-     * Returns the p2p port.
-     */
-    fun getPort(): String
+    fun sendFile(targetPeerId: String, filePath: String): EngineEvent
 
-    /**
-     * Cleanly stops the node and releases resources.
-     */
-    fun stopNode(): String
+    fun acceptFile(transferId: String, savePath: String): EngineEvent
+
+    fun rejectFile(transferId: String): EngineEvent
 }
