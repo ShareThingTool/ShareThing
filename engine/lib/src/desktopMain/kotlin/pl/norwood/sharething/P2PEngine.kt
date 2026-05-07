@@ -12,6 +12,9 @@ import io.libp2p.discovery.MDnsDiscovery
 import io.libp2p.protocol.Identify
 import io.libp2p.protocol.ProtocolMessageHandler
 import io.libp2p.protocol.ProtocolMessageHandlerAdapter
+import io.libp2p.protocol.circuit.CircuitHopProtocol
+import io.libp2p.protocol.circuit.CircuitStopProtocol
+import io.libp2p.protocol.circuit.RelayTransport
 import io.netty.buffer.ByteBuf
 import io.netty.buffer.Unpooled
 import io.netty.channel.ChannelHandlerContext
@@ -39,8 +42,10 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.time.Duration.Companion.milliseconds
+import java.util.Optional
 
 actual class P2PEngine actual constructor() {
     private var host: Host? = null
@@ -48,6 +53,10 @@ actual class P2PEngine actual constructor() {
     private var nickname: String = ""
     private var mndsService: MDnsDiscovery? = null
     private var discoveryServers: List<String> = emptyList()
+    private var relayAddrs: List<String> = emptyList()
+    private val relayExecutor = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "relay-transport").also { it.isDaemon = true }
+    }
 
     private val identityJson = Json {
         ignoreUnknownKeys = true
@@ -70,13 +79,16 @@ actual class P2PEngine actual constructor() {
     private val fileBinding: ProtocolBinding<FileTransferMessageHandler> = createFileTransferBinding()
 
     actual fun startNode(
-        nickname: String, discoveryServers: List<String>
+        nickname: String,
+        discoveryServers: List<String>,
+        relayAddrs: List<String>
     ): EngineEvent.NodeStarted {
         log.i {
-            "start_node requested nickname=$nickname discoveryServers=${discoveryServers.size}"
+            "start_node requested nickname=$nickname discoveryServers=${discoveryServers.size} relayAddrs=${relayAddrs.size}"
         }
         this.nickname = nickname
         this.discoveryServers = discoveryServers.map(::normalizeDiscoveryServer)
+        this.relayAddrs = relayAddrs
 
         if (host != null) {
             return EngineEvent.NodeStarted(
@@ -91,7 +103,7 @@ actual class P2PEngine actual constructor() {
             try {
                 log.d { "start_node attempting port=$candidatePort" }
                 val privKey = loadOrCreatePrivateKey()
-                val node = buildHost(privKey, candidatePort)
+                val node = buildHost(privKey, candidatePort, relayAddrs)
                 node.addProtocolHandler(fileBinding as ProtocolBinding<Any>)
                 node.start().get()
                 host = node
@@ -520,12 +532,67 @@ actual class P2PEngine actual constructor() {
         }
     }
 
-    private fun buildHost(privKey: PrivKey, port: Int): Host {
+    private fun buildHost(privKey: PrivKey, port: Int, relayAddrs: List<String> = emptyList()): Host {
+        val relayCandidates = buildRelayCandidates(relayAddrs)
+
+        if (relayCandidates.isEmpty()) {
+            return HostBuilder().builderModifier { b ->
+                b.identity.factory = { privKey }
+                b.protocols.add(Identify())
+            }.listen("/ip4/0.0.0.0/tcp/$port").build()
+        }
+
+        log.i { "buildHost relay_transport relays=${relayCandidates.size}" }
+
+        val stopProtocol = CircuitStopProtocol()
+        val stopBinding = CircuitStopProtocol.Binding(stopProtocol)
+
+        // Client-only relay manager: this node does NOT serve as a relay.
+        val clientManager = object : CircuitHopProtocol.RelayManager {
+            override fun hasReservation(peer: PeerId) = false
+            override fun createReservation(peer: PeerId, addr: Multiaddr): Optional<CircuitHopProtocol.Reservation> =
+                Optional.empty()
+            override fun allowConnection(a: PeerId, b: PeerId): Optional<CircuitHopProtocol.Reservation> =
+                Optional.empty()
+        }
+        val hopBinding = CircuitHopProtocol.Binding(clientManager, stopBinding)
+
         return HostBuilder().builderModifier { b ->
             b.identity.factory = { privKey }
             b.protocols.add(Identify())
-        }.listen("/ip4/0.0.0.0/tcp/$port")
-            .build()
+            @Suppress("UNCHECKED_CAST")
+            b.protocols.add(hopBinding as ProtocolBinding<Any>)
+            @Suppress("UNCHECKED_CAST")
+            b.protocols.add(stopBinding as ProtocolBinding<Any>)
+            b.transports.add { upgrader ->
+                val relayTransport = RelayTransport(
+                    hopBinding,
+                    stopBinding,
+                    upgrader,
+                    { _ -> relayCandidates },
+                    relayExecutor
+                )
+                stopProtocol.setTransport(relayTransport)
+                stopBinding.setTransport(relayTransport)
+                relayTransport
+            }
+        }.listen("/ip4/0.0.0.0/tcp/$port").build()
+    }
+
+    private fun buildRelayCandidates(relayAddrs: List<String>): List<RelayTransport.CandidateRelay> {
+        return relayAddrs.mapNotNull { addrStr ->
+            try {
+                val ma = Multiaddr(addrStr)
+                val peerId = ma.getPeerId() ?: return@mapNotNull null
+                val transportAddr = Multiaddr(
+                    ma.components.filter { it.protocol != Protocol.P2P }
+                )
+                RelayTransport.CandidateRelay(peerId, listOf(transportAddr))
+            } catch (e: Exception) {
+                log.w(e) { "invalid relay addr: $addrStr" }
+                null
+            }
+        }
     }
 
     private fun currentListenAddresses(): List<String> {

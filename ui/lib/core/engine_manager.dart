@@ -28,10 +28,11 @@ class EngineManager {
   Future<void> start({
     required String nickname,
     required List<String> discoveryServers,
+    List<String> relayAddrs = const [],
   }) async {
     appLogger.i(
       'engine.start requested platform=${Platform.operatingSystem} '
-      'nickname=$nickname discoveryServers=$discoveryServers',
+      'nickname=$nickname discoveryServers=$discoveryServers relayAddrs=$relayAddrs',
     );
     if (Platform.isAndroid) {
       if (_androidStarted) return;
@@ -41,6 +42,7 @@ class EngineManager {
         'type': 'START_NODE',
         'nickname': nickname,
         'discoveryServers': discoveryServers,
+        'relayAddrs': relayAddrs,
       });
       _androidStarted = true;
       await started;
@@ -55,6 +57,7 @@ class EngineManager {
       'type': 'START_NODE',
       'nickname': nickname,
       'discoveryServers': discoveryServers,
+      'relayAddrs': relayAddrs,
     });
     await started;
     appLogger.i('engine.start success (desktop)');
@@ -78,13 +81,11 @@ class EngineManager {
     try {
       await _sendDesktopCommand({'type': 'STOP_NODE'});
     } catch (_) {
-      // Best effort shutdown.
     }
 
     try {
       await process.stdin.close();
     } catch (_) {
-      // Ignore shutdown races.
     }
 
     try {
@@ -94,7 +95,6 @@ class EngineManager {
       try {
         await process.exitCode.timeout(const Duration(seconds: 2));
       } catch (_) {
-        // Ignore forced shutdown races.
       }
     }
 

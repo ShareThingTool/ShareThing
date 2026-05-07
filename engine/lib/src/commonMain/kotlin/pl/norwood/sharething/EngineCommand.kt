@@ -9,7 +9,8 @@ sealed class EngineCommand {
     @SerialName("START_NODE")
     data class StartNode(
         val nickname: String,
-        val discoveryServers: List<String> = emptyList()
+        val discoveryServers: List<String> = emptyList(),
+        val relayAddrs: List<String> = emptyList()
     ) : EngineCommand()
 
     @Serializable

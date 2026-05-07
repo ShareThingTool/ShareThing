@@ -3,7 +3,8 @@ package pl.norwood.sharething
 actual class P2PEngine actual constructor() {
     actual fun startNode(
         nickname: String,
-        discoveryServers: List<String>
+        discoveryServers: List<String>,
+        relayAddrs: List<String>
     ): EngineEvent.NodeStarted {
         return EngineEvent.NodeStarted(
             peerId = "",
