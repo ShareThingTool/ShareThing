@@ -1,6 +1,8 @@
 package com.example.sharething
 
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -12,9 +14,10 @@ import p2p.P2p
 class MainActivity : FlutterActivity() {
     companion object {
         private var eventSink: EventChannel.EventSink? = null
+        private val mainHandler = Handler(Looper.getMainLooper())
 
         fun emitEvent(payload: Map<String, Any?>) {
-            eventSink?.success(payload)
+            mainHandler.post { eventSink?.success(payload) }
         }
     }
 
