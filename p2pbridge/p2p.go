@@ -151,6 +151,7 @@ func Start(nick, discoveryServers, relayAddrs, deviceIP string) error {
 		libp2p.EnableNATService(),
 		libp2p.EnableAutoNATv2(),
 		libp2p.EnableHolePunching(),
+		libp2p.NATPortMap(),
 	}
 
 	if deviceIP != "" {
