@@ -341,6 +341,14 @@ class _MyHomePageState extends State<MyHomePage> {
             .map((address) => address.toString())
             .toList(growable: false);
 
+        final friendIdx = _friends.indexWhere((f) => f.peerId == peerId);
+        List<FriendEntry>? updatedFriends;
+        if (friendIdx >= 0 && addresses.isNotEmpty) {
+          final updated = [..._friends];
+          updated[friendIdx] = _friends[friendIdx].copyWith(addresses: addresses);
+          updatedFriends = updated;
+        }
+
         setState(() {
           _discoveredPeers = {
             ..._discoveredPeers,
@@ -352,7 +360,9 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
           };
           _peerPresence = {..._peerPresence, peerId: _FriendPresence.online};
+          if (updatedFriends != null) _friends = updatedFriends;
         });
+        if (updatedFriends != null) unawaited(_saveFriends(updatedFriends));
         break;
       case 'PEER_NICKNAME_CHANGED':
         final peerId = event['peerId']?.toString();
@@ -496,9 +506,19 @@ class _MyHomePageState extends State<MyHomePage> {
       _errorMessage = null;
     });
 
+    final knownAddresses = {
+      ...?_discoveredPeers[peerId]?.addresses,
+      for (final f in _friends)
+        if (f.peerId == peerId) ...f.addresses,
+    }.toList(growable: false);
+
     try {
-      appLogger.i('ui.sendFile targetPeerId=$peerId filePath=$filePath');
-      await widget.engine.sendFile(targetPeerId: peerId, filePath: filePath);
+      appLogger.i('ui.sendFile targetPeerId=$peerId filePath=$filePath knownAddresses=$knownAddresses');
+      await widget.engine.sendFile(
+        targetPeerId: peerId,
+        filePath: filePath,
+        knownAddresses: knownAddresses,
+      );
     } catch (error) {
       appLogger.e('ui.sendFile.failed', error: error);
       if (!mounted) return;
@@ -515,10 +535,20 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _acceptIncomingRequest(IncomingFileRequest request) async {
-    final savePath = await FilePicker.platform.saveFile(
-      dialogTitle: 'Save incoming file',
-      fileName: request.fileName,
-    );
+    final String? savePath;
+    if (Platform.isAndroid) {
+      final dir = Directory('/storage/emulated/0/Download');
+      await dir.create(recursive: true);
+      savePath = '${dir.path}/${request.fileName}';
+    } else if (Platform.isIOS) {
+      final dir = await const AppStoragePaths().receivedFilesDirectory();
+      savePath = '${dir.path}/${request.fileName}';
+    } else {
+      savePath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save incoming file',
+        fileName: request.fileName,
+      );
+    }
     if (savePath == null || savePath.isEmpty) {
       return;
     }
@@ -609,94 +639,18 @@ class _MyHomePageState extends State<MyHomePage> {
     FriendEntry? initialFriend,
     DiscoveredPeer? discoveredPeer,
   }) async {
-    final peerIdController = TextEditingController(
-      text: initialFriend?.peerId ?? discoveredPeer?.peerId ?? '',
-    );
-    final nicknameController = TextEditingController(
-      text: initialFriend?.nickname ?? discoveredPeer?.nickname ?? '',
-    );
-
-    FriendEntry? editedFriend;
-
-    await showDialog<void>(
+    final editedFriend = await showDialog<FriendEntry>(
       context: context,
-      builder: (dialogContext) {
-        String? validationError;
-
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              title: Text(initialFriend == null ? 'Add Friend' : 'Edit Friend'),
-              content: SizedBox(
-                width: 460,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    TextField(
-                      controller: peerIdController,
-                      decoration: const InputDecoration(
-                        labelText: 'Peer ID',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: nicknameController,
-                      decoration: const InputDecoration(
-                        labelText: 'Nickname',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    if (validationError != null) ...[
-                      const SizedBox(height: 12),
-                      Text(
-                        validationError!,
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.error,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(dialogContext).pop(),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    final peerId = peerIdController.text.trim();
-                    final nickname = nicknameController.text.trim();
-                    final validationMessage = _validateFriend(
-                      peerId,
-                      nickname,
-                      editingPeerId: initialFriend?.peerId,
-                    );
-                    if (validationMessage != null) {
-                      setDialogState(() {
-                        validationError = validationMessage;
-                      });
-                      return;
-                    }
-
-                    editedFriend = FriendEntry(
-                      peerId: peerId,
-                      nickname: nickname,
-                    );
-                    Navigator.of(dialogContext).pop();
-                  },
-                  child: Text(initialFriend == null ? 'Add' : 'Save'),
-                ),
-              ],
-            );
-          },
-        );
-      },
+      builder: (dialogContext) => _FriendEditorDialog(
+        initialFriend: initialFriend,
+        discoveredPeer: discoveredPeer,
+        validate: (peerId, nickname) => _validateFriend(
+          peerId,
+          nickname,
+          editingPeerId: initialFriend?.peerId,
+        ),
+      ),
     );
-
-    peerIdController.dispose();
-    nicknameController.dispose();
 
     if (editedFriend == null) return;
 
@@ -749,69 +703,13 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _showNicknameEditor() async {
-    final nicknameController = TextEditingController(text: _settings.nickname);
-    String? validationError;
-
     await showDialog<void>(
       context: context,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              title: const Text('Edit Nickname'),
-              content: SizedBox(
-                width: 420,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    TextField(
-                      controller: nicknameController,
-                      decoration: const InputDecoration(
-                        labelText: 'Nickname',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    if (validationError != null) ...[
-                      const SizedBox(height: 12),
-                      Text(
-                        validationError!,
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.error,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(dialogContext).pop(),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton(
-                  onPressed: () async {
-                    final nickname = nicknameController.text.trim();
-                    if (nickname.isEmpty) {
-                      setDialogState(() {
-                        validationError = 'Nickname is required.';
-                      });
-                      return;
-                    }
-
-                    await _saveSettings(_settings.copyWith(nickname: nickname));
-                    if (!dialogContext.mounted) return;
-                    Navigator.of(dialogContext).pop();
-                  },
-                  child: const Text('Save'),
-                ),
-              ],
-            );
-          },
-        );
-      },
+      builder: (dialogContext) => _NicknameEditorDialog(
+        initialNickname: _settings.nickname,
+        onSave: (nickname) => _saveSettings(_settings.copyWith(nickname: nickname)),
+      ),
     );
-
-    nicknameController.dispose();
   }
 
   Future<void> _copyPeerId() async {
@@ -1300,3 +1198,179 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 }
+
+class _NicknameEditorDialog extends StatefulWidget {
+  const _NicknameEditorDialog({required this.initialNickname, required this.onSave});
+
+  final String initialNickname;
+  final Future<void> Function(String) onSave;
+
+  @override
+  State<_NicknameEditorDialog> createState() => _NicknameEditorDialogState();
+}
+
+class _NicknameEditorDialogState extends State<_NicknameEditorDialog> {
+  late final TextEditingController _controller;
+  String? _validationError;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialNickname);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Edit Nickname'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _controller,
+              decoration: const InputDecoration(
+                labelText: 'Nickname',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            if (_validationError != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                _validationError!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () async {
+            final nickname = _controller.text.trim();
+            if (nickname.isEmpty) {
+              setState(() => _validationError = 'Nickname is required.');
+              return;
+            }
+            await widget.onSave(nickname);
+            if (!mounted) return;
+            Navigator.of(context).pop();
+          },
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
+class _FriendEditorDialog extends StatefulWidget {
+  const _FriendEditorDialog({
+    this.initialFriend,
+    this.discoveredPeer,
+    required this.validate,
+  });
+
+  final FriendEntry? initialFriend;
+  final DiscoveredPeer? discoveredPeer;
+  final String? Function(String peerId, String nickname) validate;
+
+  @override
+  State<_FriendEditorDialog> createState() => _FriendEditorDialogState();
+}
+
+class _FriendEditorDialogState extends State<_FriendEditorDialog> {
+  late final TextEditingController _peerIdController;
+  late final TextEditingController _nicknameController;
+  String? _validationError;
+
+  @override
+  void initState() {
+    super.initState();
+    _peerIdController = TextEditingController(
+      text: widget.initialFriend?.peerId ?? widget.discoveredPeer?.peerId ?? '',
+    );
+    _nicknameController = TextEditingController(
+      text: widget.initialFriend?.nickname ?? widget.discoveredPeer?.nickname ?? '',
+    );
+  }
+
+  @override
+  void dispose() {
+    _peerIdController.dispose();
+    _nicknameController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isEditing = widget.initialFriend != null;
+    return AlertDialog(
+      title: Text(isEditing ? 'Edit Friend' : 'Add Friend'),
+      content: SizedBox(
+        width: 460,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _peerIdController,
+              decoration: const InputDecoration(
+                labelText: 'Peer ID',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _nicknameController,
+              decoration: const InputDecoration(
+                labelText: 'Nickname',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            if (_validationError != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                _validationError!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final peerId = _peerIdController.text.trim();
+            final nickname = _nicknameController.text.trim();
+            final error = widget.validate(peerId, nickname);
+            if (error != null) {
+              setState(() => _validationError = error);
+              return;
+            }
+            Navigator.of(context).pop(FriendEntry(
+              peerId: peerId,
+              nickname: nickname,
+              addresses: widget.initialFriend?.addresses ?? widget.discoveredPeer?.addresses ?? const [],
+            ));
+          },
+          child: Text(isEditing ? 'Save' : 'Add'),
+        ),
+      ],
+    );
+  }
+}
+

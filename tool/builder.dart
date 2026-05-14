@@ -168,7 +168,7 @@ Future<void> ensureJreExists(String target) async {
   print("JRE for $target not found. Downloading from Adoptium...");
   
   final parts = target.split('-');
-  final os = parts[0];  linux, windows, macos//
+  final os = parts[0];  //linux, windows, macos
   final arch = parts[1] == 'x64' ? 'x64' : 'aarch64'; 
   
   final url = "https://api.adoptium.net/v3/binary/latest/21/ga/$os/$arch/jre/hotspot/normal/eclipse";

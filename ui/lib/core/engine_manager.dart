@@ -106,14 +106,16 @@ class EngineManager {
   Future<void> sendFile({
     required String targetPeerId,
     required String filePath,
+    List<String> knownAddresses = const [],
   }) async {
     appLogger.i(
-      'engine.sendFile targetPeerId=$targetPeerId filePath=$filePath',
+      'engine.sendFile targetPeerId=$targetPeerId filePath=$filePath knownAddresses=$knownAddresses',
     );
     final payload = {
       'type': 'SEND_FILE',
       'targetPeerId': targetPeerId,
       'filePath': filePath,
+      'knownAddresses': knownAddresses,
     };
 
     if (Platform.isAndroid) {

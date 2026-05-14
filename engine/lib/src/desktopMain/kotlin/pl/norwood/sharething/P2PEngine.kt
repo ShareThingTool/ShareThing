@@ -8,6 +8,7 @@ import io.libp2p.core.dsl.HostBuilder
 import io.libp2p.core.multiformats.Multiaddr
 import io.libp2p.core.multiformats.Protocol
 import io.libp2p.core.multistream.ProtocolBinding
+import io.libp2p.core.mux.StreamMuxerProtocol
 import io.libp2p.discovery.MDnsDiscovery
 import io.libp2p.protocol.Identify
 import io.libp2p.protocol.ProtocolMessageHandler
@@ -24,14 +25,23 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.future.await
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import pl.norwood.sharething.data.FileTransferControl
 import pl.norwood.sharething.data.KnownPeer
 import pl.norwood.sharething.data.OutgoingTransfer
 import pl.norwood.sharething.data.PendingIncomingTransfer
 import pl.norwood.sharething.data.StoredIdentity
 import java.io.File
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.Inet4Address
+import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.MulticastSocket
 import java.net.NetworkInterface
+import java.net.SocketTimeoutException
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
@@ -72,6 +82,7 @@ actual class P2PEngine actual constructor() {
     private var heartbeatJob: Job? = null
     private var discoveryJob: Job? = null
     private var peerSweepJob: Job? = null
+    private var lanBroadcastJob: Job? = null
 
     private val knownPeers = ConcurrentHashMap<String, KnownPeer>()
     private val incomingTransfers = ConcurrentHashMap<String, PendingIncomingTransfer>()
@@ -135,6 +146,8 @@ actual class P2PEngine actual constructor() {
             discoveryJob = null
             peerSweepJob?.cancelAndJoin()
             peerSweepJob = null
+            lanBroadcastJob?.cancelAndJoin()
+            lanBroadcastJob = null
         }
 
         mndsService?.stop()
@@ -284,6 +297,7 @@ actual class P2PEngine actual constructor() {
         heartbeatJob?.cancel()
         discoveryJob?.cancel()
         peerSweepJob?.cancel()
+        lanBroadcastJob?.cancel()
 
         val currentNode = host ?: return
         log.i { "mdns_start serviceTag=_sharething._tcp.local." }
@@ -300,6 +314,8 @@ actual class P2PEngine actual constructor() {
 
         mdns.start()
         mndsService = mdns
+
+        startLANBroadcast(currentNode)
 
         peerSweepJob = scope.launch {
             while (isActive && host != null) {
@@ -539,6 +555,9 @@ actual class P2PEngine actual constructor() {
             return HostBuilder().builderModifier { b ->
                 b.identity.factory = { privKey }
                 b.protocols.add(Identify())
+                b.muxers.clear()
+                b.muxers.add(StreamMuxerProtocol.getYamux())
+                b.muxers.add(StreamMuxerProtocol.Mplex)
             }.listen("/ip4/0.0.0.0/tcp/$port").build()
         }
 
@@ -560,6 +579,9 @@ actual class P2PEngine actual constructor() {
         return HostBuilder().builderModifier { b ->
             b.identity.factory = { privKey }
             b.protocols.add(Identify())
+            b.muxers.clear()
+            b.muxers.add(StreamMuxerProtocol.getYamux())
+            b.muxers.add(StreamMuxerProtocol.Mplex)
             @Suppress("UNCHECKED_CAST")
             b.protocols.add(hopBinding as ProtocolBinding<Any>)
             @Suppress("UNCHECKED_CAST")
@@ -628,6 +650,89 @@ actual class P2PEngine actual constructor() {
         return Collections.list(NetworkInterface.getNetworkInterfaces()).asSequence()
             .filter { it.isUp && !it.isLoopback }.flatMap { Collections.list(it.inetAddresses).asSequence() }
             .filterIsInstance<Inet4Address>().firstOrNull()?.hostAddress
+    }
+
+    private fun startLANBroadcast(host: Host) {
+        val port = 4102
+        val group = InetAddress.getByName("239.255.99.99")
+        val selfId = host.peerId.toBase58()
+
+        // Receiver — join multicast group
+        scope.launch(Dispatchers.IO) {
+            val socket = try {
+                MulticastSocket(port).apply {
+                    soTimeout = 1000
+                    joinGroup(group)
+                }
+            } catch (_: Exception) { return@launch }
+            try {
+                val buf = ByteArray(4096)
+                while (isActive) {
+                    try {
+                        val packet = DatagramPacket(buf, buf.size)
+                        socket.receive(packet)
+                        val text = String(packet.data, 0, packet.length, Charsets.UTF_8)
+                        val obj = Json.parseToJsonElement(text).jsonObject
+                        val peerId = obj["peerId"]?.jsonPrimitive?.content?.takeIf { it.isNotEmpty() } ?: continue
+                        if (peerId == selfId) continue
+                        val nick = obj["nickname"]?.jsonPrimitive?.content?.takeIf { it.isNotEmpty() } ?: peerId
+                        val addrs = obj["addresses"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+                        handleDiscoveredPeer(peerId, nick, addrs)
+                    } catch (_: SocketTimeoutException) {
+                    } catch (_: Exception) { break }
+                }
+            } finally {
+                try { socket.leaveGroup(group) } catch (_: Exception) {}
+                socket.close()
+            }
+        }
+
+        // Sender
+        scope.launch(Dispatchers.IO) {
+            val sendSocket = try { DatagramSocket() } catch (_: Exception) { return@launch }
+            try {
+                while (isActive) {
+                    try {
+                        val addrs = currentListenAddresses()
+                        val payload = buildString {
+                            append("{")
+                            append("\"peerId\":${Json.encodeToString(selfId)},")
+                            append("\"nickname\":${Json.encodeToString(nickname)},")
+                            append("\"addresses\":${Json.encodeToString(addrs)}")
+                            append("}")
+                        }.toByteArray(Charsets.UTF_8)
+                        sendSocket.send(DatagramPacket(payload, payload.size, group, port))
+                    } catch (_: Exception) {}
+                    delay(5_000.milliseconds)
+                }
+            } finally { sendSocket.close() }
+        }
+    }
+
+    private fun handleDiscoveredPeer(peerId: String, nick: String, addrs: List<String>) {
+        val previous = knownPeers[peerId]
+        if (previous == null) {
+            val discovered = KnownPeer(
+                peerId = peerId,
+                nickname = nick,
+                addresses = addrs,
+                lastSeenMillis = System.currentTimeMillis()
+            )
+            knownPeers[peerId] = discovered
+            log.i { "peer_discovered source=lan_broadcast peer=$peerId nick=$nick addrs=${addrs.size}" }
+            CommandDispatcher.emit(
+                EngineEvent.PeerDiscovered(peerId = peerId, nickname = nick, addresses = addrs)
+            )
+        } else {
+            previous.lastSeenMillis = System.currentTimeMillis()
+            if (previous.addresses != addrs && addrs.isNotEmpty()) {
+                val updated = previous.copy(addresses = addrs)
+                knownPeers[peerId] = updated
+                CommandDispatcher.emit(
+                    EngineEvent.PeerDiscovered(peerId = peerId, nickname = nick, addresses = addrs)
+                )
+            }
+        }
     }
 
     private fun getLocalIpv4AddressObject(): Inet4Address? {

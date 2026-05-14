@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -124,7 +125,7 @@ func SetDataDir(path string) {
 // (e.g. "/ip4/1.2.3.4/tcp/4100/p2p/12D3…"). When provided, the node
 // enables AutoRelay (connecting to those relays) and hole punching via
 // DCUtR so it can reach peers behind NAT.
-func Start(nick, discoveryServers, relayAddrs string) error {
+func Start(nick, discoveryServers, relayAddrs, deviceIP string) error {
 	nodeMu.Lock()
 	defer nodeMu.Unlock()
 
@@ -150,6 +151,23 @@ func Start(nick, discoveryServers, relayAddrs string) error {
 		libp2p.EnableNATService(),
 		libp2p.EnableAutoNATv2(),
 		libp2p.EnableHolePunching(),
+	}
+
+	if deviceIP != "" {
+		tcpMA, err1 := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", deviceIP, defaultPort))
+		quicMA, err2 := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", deviceIP, defaultPort))
+		var announced []multiaddr.Multiaddr
+		if err1 == nil {
+			announced = append(announced, tcpMA)
+		}
+		if err2 == nil {
+			announced = append(announced, quicMA)
+		}
+		if len(announced) > 0 {
+			opts = append(opts, libp2p.AddrsFactory(func(_ []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+				return announced
+			}))
+		}
 	}
 
 	if len(relayInfos) > 0 {
@@ -181,6 +199,7 @@ func Start(nick, discoveryServers, relayAddrs string) error {
 
 	go startMDNS(ctx, h)
 	go runPeerSweep(ctx)
+	go runLANBroadcast(ctx, h)
 
 	servers := splitServers(discoveryServers)
 	if len(servers) > 0 {
@@ -219,7 +238,7 @@ func Stop() {
 	emitJSON(map[string]interface{}{"type": "NODE_STOPPED"})
 }
 
-func SendFile(peerID, filePath string) error {
+func SendFile(peerID, filePath, addrsStr string) error {
 	h := node
 	if h == nil {
 		return fmt.Errorf("node not running")
@@ -228,8 +247,46 @@ func SendFile(peerID, filePath string) error {
 	peersMu.RLock()
 	kp := knownPeers[peerID]
 	peersMu.RUnlock()
+
 	if kp == nil {
-		return fmt.Errorf("unknown peer: %s", peerID)
+		pid, err := peer.Decode(peerID)
+		if err != nil {
+			return fmt.Errorf("unknown peer: %s", peerID)
+		}
+
+		addrs := h.Peerstore().Addrs(pid)
+		if len(addrs) == 0 && addrsStr != "" {
+			for _, s := range strings.Split(addrsStr, ";") {
+				s = strings.TrimSpace(s)
+				if s == "" {
+					continue
+				}
+				ma, err := multiaddr.NewMultiaddr(s)
+				if err == nil {
+					addrs = append(addrs, ma)
+				}
+			}
+		}
+
+		if len(addrs) == 0 {
+			return fmt.Errorf("unknown peer: %s", peerID)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: addrs}); err != nil {
+			return fmt.Errorf("could not connect to peer: %w", err)
+		}
+
+		var addrStrs []string
+		for _, a := range addrs {
+			addrStrs = append(addrStrs, fmt.Sprintf("%s/p2p/%s", a, peerID))
+		}
+		upsertPeer(peerID, peerID, addrStrs)
+
+		peersMu.RLock()
+		kp = knownPeers[peerID]
+		peersMu.RUnlock()
 	}
 
 	info, err := os.Stat(filePath)
@@ -880,4 +937,83 @@ func newUUID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+const lanDiscoveryPort = 4102
+const lanDiscoveryGroup = "239.255.99.99"
+
+type lanBroadcastMsg struct {
+	PeerID    string   `json:"peerId"`
+	Nickname  string   `json:"nickname"`
+	Addresses []string `json:"addresses"`
+}
+
+func runLANBroadcast(ctx context.Context, h host.Host) {
+	go lanMulticastReceive(ctx)
+	go lanMulticastSend(ctx, h)
+}
+
+func lanMulticastReceive(ctx context.Context) {
+	groupAddr := &net.UDPAddr{IP: net.ParseIP(lanDiscoveryGroup), Port: lanDiscoveryPort}
+	conn, err := net.ListenMulticastUDP("udp4", nil, groupAddr)
+	if err != nil {
+		return
+	}
+	conn.SetReadBuffer(65536)
+	go func() {
+		<-ctx.Done()
+		conn.Close()
+	}()
+	buf := make([]byte, 4096)
+	for {
+		conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			continue
+		}
+		var msg lanBroadcastMsg
+		if json.Unmarshal(buf[:n], &msg) != nil || msg.PeerID == nodePeerID {
+			continue
+		}
+		nick := msg.Nickname
+		if nick == "" {
+			nick = msg.PeerID
+		}
+		upsertPeer(msg.PeerID, nick, msg.Addresses)
+	}
+}
+
+func lanMulticastSend(ctx context.Context, h host.Host) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	addr := &net.UDPAddr{IP: net.ParseIP(lanDiscoveryGroup), Port: lanDiscoveryPort}
+	send := func() {
+		var addrs []string
+		for _, a := range h.Addrs() {
+			addrs = append(addrs, fmt.Sprintf("%s/p2p/%s", a, h.ID()))
+		}
+		payload, _ := json.Marshal(lanBroadcastMsg{
+			PeerID:    h.ID().String(),
+			Nickname:  nodeNickname,
+			Addresses: addrs,
+		})
+		conn, err := net.DialUDP("udp4", nil, addr)
+		if err != nil {
+			return
+		}
+		conn.Write(payload)
+		conn.Close()
+	}
+	send()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			send()
+		}
+	}
 }

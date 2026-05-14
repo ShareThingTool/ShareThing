@@ -100,9 +100,13 @@ class MainActivity : FlutterActivity() {
             "SEND_FILE" -> {
                 val targetPeerId = json.optString("targetPeerId")
                 val filePath = json.optString("filePath")
+                val addrsArray = json.optJSONArray("knownAddresses")
+                val knownAddresses = if (addrsArray != null)
+                    (0 until addrsArray.length()).joinToString(";") { addrsArray.getString(it) }
+                else ""
                 Thread {
                     try {
-                        P2p.sendFile(targetPeerId, filePath)
+                        P2p.sendFile(targetPeerId, filePath, knownAddresses)
                         result.success(null)
                     } catch (e: Exception) {
                         result.error("SEND_FILE_FAILED", e.message, null)

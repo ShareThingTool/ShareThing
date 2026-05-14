@@ -26,7 +26,9 @@ class AppSettings {
   }
 
   AppSettings copyWith({String? nickname}) {
-    return AppSettings(nickname: nickname ?? this.nickname);
+    return AppSettings(
+      nickname: nickname ?? this.nickname,
+    );
   }
 
   static String _sanitizeHostname(String hostname) {
