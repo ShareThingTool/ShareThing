@@ -157,6 +157,11 @@ class EngineManager {
     await _sendDesktopCommand(payload);
   }
 
+  Future<void> openFileLocation(String path) async {
+    if (!Platform.isAndroid) return;
+    await _sendAndroidCommand({'type': 'OPEN_FILE_LOCATION', 'path': path});
+  }
+
   Future<void> _listenForAndroidEvents() async {
     if (_androidEventSubscription != null) return;
 

@@ -1,5 +1,6 @@
 package com.example.sharething
 
+import android.app.DownloadManager
 import android.content.Intent
 import android.os.Handler
 import android.os.Looper
@@ -137,6 +138,18 @@ class MainActivity : FlutterActivity() {
                         result.error("REJECT_FILE_FAILED", e.message, null)
                     }
                 }.start()
+            }
+
+            "OPEN_FILE_LOCATION" -> {
+                try {
+                    val intent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    startActivity(Intent.createChooser(intent, "Open with"))
+                    result.success(null)
+                } catch (e: Exception) {
+                    result.error("OPEN_FAILED", e.message, null)
+                }
             }
 
             else -> result.error("UNKNOWN_COMMAND", json.optString("type"), null)

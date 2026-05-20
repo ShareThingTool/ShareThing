@@ -12,6 +12,7 @@ import 'core/storage/app_storage_paths.dart';
 import 'features/discovery/discovered_peer.dart';
 import 'features/file_transfer/file_transfer_entry.dart';
 import 'features/file_transfer/incoming_file_request.dart';
+import 'features/file_transfer/transfer_history_repository.dart';
 import 'features/friends/friend.dart';
 import 'features/friends/friends_repository.dart';
 import 'features/settings/app_settings.dart';
@@ -28,15 +29,19 @@ class ShareThingApp extends StatefulWidget {
     EngineManager? engine,
     FriendsRepository? friendsRepository,
     SettingsRepository? settingsRepository,
+    TransferHistoryRepository? transferHistoryRepository,
     AppStoragePaths? storagePaths,
   }) : engine = engine ?? EngineManager(),
        friendsRepository = friendsRepository ?? JsonFriendsRepository(),
        settingsRepository = settingsRepository ?? JsonSettingsRepository(),
+       transferHistoryRepository =
+           transferHistoryRepository ?? JsonTransferHistoryRepository(),
        storagePaths = storagePaths ?? const AppStoragePaths();
 
   final EngineManager engine;
   final FriendsRepository friendsRepository;
   final SettingsRepository settingsRepository;
+  final TransferHistoryRepository transferHistoryRepository;
   final AppStoragePaths storagePaths;
 
   @override
@@ -105,6 +110,7 @@ class _ShareThingAppState extends State<ShareThingApp> {
         engine: widget.engine,
         friendsRepository: widget.friendsRepository,
         settingsRepository: widget.settingsRepository,
+        transferHistoryRepository: widget.transferHistoryRepository,
         storagePaths: widget.storagePaths,
       ),
     );
@@ -146,12 +152,14 @@ class MyHomePage extends StatefulWidget {
     required this.engine,
     required this.friendsRepository,
     required this.settingsRepository,
+    required this.transferHistoryRepository,
     required this.storagePaths,
   });
 
   final EngineManager engine;
   final FriendsRepository friendsRepository;
   final SettingsRepository settingsRepository;
+  final TransferHistoryRepository transferHistoryRepository;
   final AppStoragePaths storagePaths;
 
   @override
@@ -166,6 +174,7 @@ class _MyHomePageState extends State<MyHomePage> {
   Map<String, _FriendPresence> _peerPresence = const {};
   Map<String, FileTransferEntry> _transfers = const {};
   Map<String, IncomingFileRequest> _incomingRequests = const {};
+  final Map<String, String> _pendingSavePaths = {};
   AppSettings _settings = AppSettings.defaults();
 
   bool _running = false;
@@ -191,7 +200,26 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<void> _bootstrap() async {
     await _loadSettings();
     await _loadFriends();
+    await _loadTransferHistory();
     await _startEngine();
+  }
+
+  Future<void> _loadTransferHistory() async {
+    final history = await widget.transferHistoryRepository.loadHistory();
+    if (!mounted) return;
+    setState(() {
+      _transfers = {for (final e in history) e.id: e};
+    });
+  }
+
+  Future<void> _saveTransferHistory() async {
+    final entries = _transfers.values.toList(growable: false)
+      ..sort((a, b) {
+        final aTime = a.startedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final bTime = b.startedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        return aTime.compareTo(bTime);
+      });
+    await widget.transferHistoryRepository.saveHistory(entries);
   }
 
   Future<void> _loadSettings() async {
@@ -430,6 +458,7 @@ class _MyHomePageState extends State<MyHomePage> {
         };
 
         final existing = _transfers[transferId];
+        final now = DateTime.now();
         final updated = FileTransferEntry(
           id: transferId,
           direction: direction,
@@ -446,15 +475,29 @@ class _MyHomePageState extends State<MyHomePage> {
           error: status == FileTransferStatus.failed
               ? (event['message']?.toString() ?? existing?.error)
               : existing?.error,
+          localPath: _pendingSavePaths[transferId] ?? existing?.localPath,
+          startedAt: existing?.startedAt ??
+              (status == FileTransferStatus.queued ||
+                      status == FileTransferStatus.inProgress
+                  ? now
+                  : null),
+          completedAt: (status == FileTransferStatus.completed ||
+                  status == FileTransferStatus.failed)
+              ? (existing?.completedAt ?? now)
+              : existing?.completedAt,
         );
+
+        final terminal = status == FileTransferStatus.completed ||
+            status == FileTransferStatus.failed;
 
         setState(() {
           _transfers = {..._transfers, transferId: updated};
-          if (status == FileTransferStatus.completed ||
-              status == FileTransferStatus.failed) {
+          if (terminal) {
             _incomingRequests = Map.of(_incomingRequests)..remove(transferId);
           }
         });
+        if (terminal) _pendingSavePaths.remove(transferId);
+        unawaited(_saveTransferHistory());
         break;
       case 'ERROR':
         setState(() {
@@ -552,6 +595,8 @@ class _MyHomePageState extends State<MyHomePage> {
     if (savePath == null || savePath.isEmpty) {
       return;
     }
+
+    _pendingSavePaths[request.transferId] = savePath;
 
     setState(() {
       _busy = true;
@@ -773,6 +818,18 @@ class _MyHomePageState extends State<MyHomePage> {
               spacing: 12,
               runSpacing: 12,
               children: [
+                if (_running)
+                  OutlinedButton.icon(
+                    onPressed: _busy ? null : _stopEngine,
+                    icon: const Icon(Icons.stop_outlined),
+                    label: const Text('Stop Node'),
+                  )
+                else
+                  FilledButton.icon(
+                    onPressed: _busy ? null : _startEngine,
+                    icon: const Icon(Icons.play_arrow_outlined),
+                    label: const Text('Start Node'),
+                  ),
                 FilledButton.tonalIcon(
                   onPressed: _running ? _copyPeerId : null,
                   icon: const Icon(Icons.badge_outlined),
@@ -1097,7 +1154,11 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Widget _buildTransfersCard(BuildContext context) {
     final transfers = _transfers.values.toList(growable: false)
-      ..sort((left, right) => right.id.compareTo(left.id));
+      ..sort((a, b) {
+        final aTime = a.startedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final bTime = b.startedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        return bTime.compareTo(aTime);
+      });
 
     return Card(
       child: Padding(
@@ -1117,6 +1178,28 @@ class _MyHomePageState extends State<MyHomePage> {
                     if (index < transfers.length - 1)
                       const SizedBox(height: 12),
                   ],
+                  const SizedBox(height: 16),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: OutlinedButton.icon(
+                      onPressed: () => _confirmClearHistory(context),
+                      icon: Icon(
+                        Icons.delete_outline,
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                      label: Text(
+                        'Clear History',
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        side: BorderSide(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                  ),
                 ],
               ),
           ],
@@ -1125,49 +1208,246 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  Future<void> _confirmClearHistory(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear transfer history?'),
+        content: const Text(
+          'All transfer history will be permanently deleted.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: TextButton.styleFrom(
+              foregroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    setState(() => _transfers = const {});
+    unawaited(_saveTransferHistory());
+  }
+
   Widget _buildTransferCard(BuildContext context, FileTransferEntry transfer) {
-    final statusLabel = switch (transfer.status) {
-      FileTransferStatus.queued => 'Queued',
-      FileTransferStatus.inProgress => 'In Progress',
-      FileTransferStatus.completed => 'Completed',
-      FileTransferStatus.failed => 'Failed',
+    final colors = Theme.of(context).colorScheme;
+    final (statusLabel, statusColor, statusIcon) = switch (transfer.status) {
+      FileTransferStatus.queued => ('Queued', colors.secondary, Icons.schedule),
+      FileTransferStatus.inProgress => (
+        'In Progress',
+        colors.primary,
+        Icons.sync,
+      ),
+      FileTransferStatus.completed => (
+        'Completed',
+        Colors.green,
+        Icons.check_circle_outline,
+      ),
+      FileTransferStatus.failed => (
+        'Failed',
+        colors.error,
+        Icons.error_outline,
+      ),
     };
     final directionLabel = switch (transfer.direction) {
       FileTransferDirection.incoming => 'Incoming',
       FileTransferDirection.outgoing => 'Outgoing',
     };
+    final directionIcon = switch (transfer.direction) {
+      FileTransferDirection.incoming => Icons.arrow_downward,
+      FileTransferDirection.outgoing => Icons.arrow_upward,
+    };
+    final timestamp = transfer.completedAt ?? transfer.startedAt;
+    final timeLabel = timestamp != null ? _formatTimestamp(timestamp) : null;
+    final sizeLabel = _formatBytes(transfer.totalBytes);
+    final active = transfer.status == FileTransferStatus.queued ||
+        transfer.status == FileTransferStatus.inProgress;
 
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+        border: Border.all(color: colors.outlineVariant),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            transfer.fileName,
-            style: Theme.of(context).textTheme.titleMedium,
+          Row(
+            children: [
+              Icon(directionIcon, size: 16, color: colors.onSurfaceVariant),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  transfer.fileName,
+                  style: Theme.of(context).textTheme.titleMedium,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Icon(statusIcon, size: 16, color: statusColor),
+              const SizedBox(width: 4),
+              Text(
+                statusLabel,
+                style: TextStyle(color: statusColor, fontSize: 12),
+              ),
+            ],
           ),
-          const SizedBox(height: 8),
-          Text('$directionLabel • ${transfer.peerLabel}'),
-          const SizedBox(height: 8),
-          LinearProgressIndicator(value: transfer.progress),
-          const SizedBox(height: 8),
-          Text(
-            '$statusLabel • ${transfer.bytesTransferred}/${transfer.totalBytes} bytes',
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Text(
+                '$directionLabel • ${transfer.peerLabel} • $sizeLabel',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+              if (timeLabel != null) ...[
+                const Spacer(),
+                Text(timeLabel, style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ],
           ),
-          if (transfer.error != null) ...[
+          if (active) ...[
             const SizedBox(height: 8),
+            LinearProgressIndicator(value: transfer.progress),
+            const SizedBox(height: 4),
+            Text(
+              '${_formatBytes(transfer.bytesTransferred)} / $sizeLabel',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+          if (transfer.error != null) ...[
+            const SizedBox(height: 6),
             Text(
               transfer.error!,
-              style: TextStyle(color: Theme.of(context).colorScheme.error),
+              style: TextStyle(color: colors.error, fontSize: 12),
+            ),
+          ],
+          if (transfer.status == FileTransferStatus.completed &&
+              transfer.direction == FileTransferDirection.incoming &&
+              transfer.localPath != null) ...[
+            const SizedBox(height: 4),
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: () => unawaited(
+                  _openFileLocation(context, transfer.localPath!),
+                ),
+                icon: const Icon(Icons.folder_open_outlined, size: 16),
+                label: Text(_showInFilesLabel),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ),
             ),
           ],
         ],
       ),
     );
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes <= 0) return '0 B';
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
+  String _formatTimestamp(DateTime dt) {
+    final now = DateTime.now();
+    final diff = now.difference(dt);
+    if (diff.inSeconds < 60) return 'just now';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+    if (diff.inHours < 24) return '${diff.inHours}h ago';
+    if (diff.inDays < 7) return '${diff.inDays}d ago';
+    return '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
+  }
+
+  String get _showInFilesLabel {
+    if (Platform.isMacOS) return 'Show in Finder';
+    if (Platform.isWindows) return 'Show in Explorer';
+    return 'Show in Files';
+  }
+
+  Future<void> _openFileLocation(BuildContext context, String path) async {
+    if (Platform.isMacOS) {
+      await Process.run('open', ['-R', path]);
+      return;
+    }
+    if (Platform.isWindows) {
+      await Process.run('explorer.exe', ['/select,', path]);
+      return;
+    }
+    if (Platform.isLinux) {
+      await _openFileLocationLinux(context, path);
+      return;
+    }
+    if (Platform.isAndroid) {
+      await widget.engine.openFileLocation(path);
+    }
+  }
+
+  static const _linuxManagers = <({String name, String exec, bool selectsFile})>[
+    (name: 'Nautilus', exec: 'nautilus', selectsFile: true),
+    (name: 'Dolphin', exec: 'dolphin', selectsFile: true),
+    (name: 'Nemo', exec: 'nemo', selectsFile: true),
+    (name: 'Thunar', exec: 'thunar', selectsFile: false),
+    (name: 'PCManFM', exec: 'pcmanfm', selectsFile: false),
+    (name: 'Caja', exec: 'caja', selectsFile: false),
+  ];
+
+  Future<void> _openFileLocationLinux(BuildContext context, String path) async {
+    final dir = File(path).parent.path;
+
+    final available = <({String name, List<String> cmd})>[];
+    for (final m in _linuxManagers) {
+      final result = await Process.run('which', [m.exec]);
+      if (result.exitCode == 0) {
+        available.add((
+          name: m.name,
+          cmd: m.selectsFile ? [m.exec, path] : [m.exec, dir],
+        ));
+      }
+    }
+
+    if (available.isEmpty) {
+      await Process.run('xdg-open', [dir]);
+      return;
+    }
+
+    if (available.length == 1) {
+      final c = available.first.cmd;
+      await Process.run(c.first, c.sublist(1));
+      return;
+    }
+
+    if (!context.mounted) return;
+    final chosen = await showDialog<List<String>>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Open with'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final m in available)
+              ListTile(
+                title: Text(m.name),
+                onTap: () => Navigator.of(ctx).pop(m.cmd),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (chosen == null) return;
+    await Process.run(chosen.first, chosen.sublist(1));
   }
 
   @override
@@ -1189,11 +1469,6 @@ class _MyHomePageState extends State<MyHomePage> {
             _buildTransfersCard(context),
           ],
         ),
-      ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _busy ? null : (_running ? _stopEngine : _startEngine),
-        label: Text(_running ? 'Stop Node' : 'Start Node'),
-        icon: Icon(_running ? Icons.stop : Icons.play_arrow),
       ),
     );
   }
