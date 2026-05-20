@@ -301,19 +301,22 @@ actual class P2PEngine actual constructor() {
 
         val currentNode = host ?: return
         log.i { "mdns_start serviceTag=_sharething._tcp.local." }
-        val mdns = MDnsDiscovery(
-            host = currentNode,
-            serviceTag = "_sharething._tcp.local.",
-            queryInterval = 120,
-            address = getLocalIpv4AddressObject()
-        )
-        mdns.addHandler { peerInfo ->
-            log.v { "mdns_payload peer=${peerInfo.peerId.toBase58()}" }
-            handleMdnsPeerFound(peerInfo)
+        try {
+            val mdns = MDnsDiscovery(
+                host = currentNode,
+                serviceTag = "_sharething._tcp.local.",
+                queryInterval = 120,
+                address = getLocalIpv4AddressObject()
+            )
+            mdns.addHandler { peerInfo ->
+                log.v { "mdns_payload peer=${peerInfo.peerId.toBase58()}" }
+                handleMdnsPeerFound(peerInfo)
+            }
+            mdns.start()
+            mndsService = mdns
+        } catch (e: Exception) {
+            log.w(e) { "mdns_start_failed discovery continues without mdns" }
         }
-
-        mdns.start()
-        mndsService = mdns
 
         startLANBroadcast(currentNode)
 
