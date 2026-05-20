@@ -701,14 +701,14 @@ class _MyHomePageState extends State<MyHomePage> {
 
     final updatedFriends = [
       for (final friend in _friends)
-        if (friend.peerId == editedFriend!.peerId ||
+        if (friend.peerId == editedFriend.peerId ||
             friend.peerId == initialFriend?.peerId)
-          editedFriend!
+          editedFriend
         else
           friend,
-      if (_friends.every((friend) => friend.peerId != editedFriend!.peerId) &&
+      if (_friends.every((friend) => friend.peerId != editedFriend.peerId) &&
           initialFriend == null)
-        editedFriend!,
+        editedFriend,
     ];
 
     await _saveFriends(updatedFriends);
@@ -1301,12 +1301,15 @@ class _MyHomePageState extends State<MyHomePage> {
           const SizedBox(height: 6),
           Row(
             children: [
-              Text(
-                '$directionLabel • ${transfer.peerLabel} • $sizeLabel',
-                style: Theme.of(context).textTheme.bodySmall,
+              Expanded(
+                child: Text(
+                  '$directionLabel • ${transfer.peerLabel} • $sizeLabel',
+                  style: Theme.of(context).textTheme.bodySmall,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
               if (timeLabel != null) ...[
-                const Spacer(),
+                const SizedBox(width: 8),
                 Text(timeLabel, style: Theme.of(context).textTheme.bodySmall),
               ],
             ],
@@ -1538,9 +1541,10 @@ class _NicknameEditorDialogState extends State<_NicknameEditorDialog> {
               setState(() => _validationError = 'Nickname is required.');
               return;
             }
+            final navigator = Navigator.of(context);
             await widget.onSave(nickname);
             if (!mounted) return;
-            Navigator.of(context).pop();
+            navigator.pop();
           },
           child: const Text('Save'),
         ),

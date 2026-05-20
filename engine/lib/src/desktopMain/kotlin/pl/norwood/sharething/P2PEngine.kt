@@ -646,23 +646,49 @@ actual class P2PEngine actual constructor() {
         return tcpComponent?.stringValue?.toIntOrNull() ?: DEFAULT_PORT
     }
 
-    private fun localIpv4Address(): String? {
-        return Collections.list(NetworkInterface.getNetworkInterfaces()).asSequence()
-            .filter { it.isUp && !it.isLoopback }.flatMap { Collections.list(it.inetAddresses).asSequence() }
-            .filterIsInstance<Inet4Address>().firstOrNull()?.hostAddress
+    private fun preferredLocalIpv4(): Pair<NetworkInterface, Inet4Address>? {
+        val virtualKeywords = listOf("virtualbox", "vmware", "hyper-v", "vethernet", "vbox", "virtual")
+        return NetworkInterface.getNetworkInterfaces()?.asSequence()
+            ?.filter { it.isUp && !it.isLoopback && !it.isVirtual }
+            ?.filter { iface ->
+                val name = (iface.displayName ?: iface.name).lowercase()
+                virtualKeywords.none { name.contains(it) }
+            }
+            ?.flatMap { iface ->
+                iface.inetAddresses.asSequence()
+                    .filterIsInstance<Inet4Address>()
+                    .filter { !it.isLoopbackAddress }
+                    .map { iface to it }
+            }
+            ?.firstOrNull()
+            ?: NetworkInterface.getNetworkInterfaces()?.asSequence()
+                ?.filter { it.isUp && !it.isLoopback }
+                ?.flatMap { iface ->
+                    iface.inetAddresses.asSequence()
+                        .filterIsInstance<Inet4Address>()
+                        .filter { !it.isLoopbackAddress }
+                        .map { iface to it }
+                }
+                ?.firstOrNull()
     }
+
+    private fun localIpv4Address(): String? = preferredLocalIpv4()?.second?.hostAddress
 
     private fun startLANBroadcast(host: Host) {
         val port = 4102
         val group = InetAddress.getByName("239.255.99.99")
         val selfId = host.peerId.toBase58()
+        val iface = preferredLocalIpv4()?.first
 
-        // Receiver — join multicast group
         scope.launch(Dispatchers.IO) {
             val socket = try {
                 MulticastSocket(port).apply {
                     soTimeout = 1000
-                    joinGroup(group)
+                    if (iface != null) {
+                        joinGroup(InetSocketAddress(group, port), iface)
+                    } else {
+                        joinGroup(group)
+                    }
                 }
             } catch (_: Exception) { return@launch }
             try {
@@ -682,14 +708,21 @@ actual class P2PEngine actual constructor() {
                     } catch (_: Exception) { break }
                 }
             } finally {
-                try { socket.leaveGroup(group) } catch (_: Exception) {}
+                try {
+                    if (iface != null) socket.leaveGroup(InetSocketAddress(group, port), iface)
+                    else socket.leaveGroup(group)
+                } catch (_: Exception) {}
                 socket.close()
             }
         }
 
-        // Sender
         scope.launch(Dispatchers.IO) {
-            val sendSocket = try { DatagramSocket() } catch (_: Exception) { return@launch }
+            val sendSocket = try {
+                MulticastSocket().apply {
+                    if (iface != null) networkInterface = iface
+                    timeToLive = 4
+                }
+            } catch (_: Exception) { return@launch }
             try {
                 while (isActive) {
                     try {
@@ -735,10 +768,7 @@ actual class P2PEngine actual constructor() {
         }
     }
 
-    private fun getLocalIpv4AddressObject(): Inet4Address? {
-        return NetworkInterface.getNetworkInterfaces().asSequence().filter { it.isUp && !it.isLoopback }
-            .flatMap { it.inetAddresses.asSequence() }.filterIsInstance<Inet4Address>().firstOrNull()
-    }
+    private fun getLocalIpv4AddressObject(): Inet4Address? = preferredLocalIpv4()?.second
 
     private fun loadOrCreatePrivateKey(): PrivKey {
         val file = identityFile()

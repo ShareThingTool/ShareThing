@@ -192,7 +192,9 @@ class EngineManager {
     final javaBin = await _findJava();
     if (javaBin == null) {
       throw StateError(
-        'Java 17+ was not found. Set JAVA_HOME before starting ShareThing.',
+        Platform.isWindows
+            ? 'Java 17+ was not found. Set JAVA_HOME to your JDK directory or add java.exe to PATH.'
+            : 'Java 17+ was not found. Set JAVA_HOME before starting ShareThing.',
       );
     }
 
@@ -314,32 +316,116 @@ class EngineManager {
   }
 
   Future<String?> _findJava() async {
-    try {
+    if (Platform.isWindows) {
       final home = Platform.environment['JAVA_HOME'];
       if (home != null) {
-        final candidate = p.join(home, 'bin', 'java');
+        final candidate = p.join(home.trim(), 'bin', 'java.exe');
         if (await File(candidate).exists()) return candidate;
       }
 
-      if (Platform.isMacOS) {
-        final result = await Process.run('/usr/libexec/java_home', [
-          '-v',
-          '17',
-        ]);
+      try {
+        final result = await Process.run('where', ['java.exe']);
+        if (result.exitCode == 0) {
+          final candidate =
+              (result.stdout as String).trim().split('\n').first.trim();
+          if (candidate.isNotEmpty) return candidate;
+        }
+      } catch (_) {}
+
+      for (final regKey in [
+        r'HKLM\SOFTWARE\JavaSoft\JDK',
+        r'HKLM\SOFTWARE\Eclipse Adoptium\JDK',
+        r'HKLM\SOFTWARE\Microsoft\JDK',
+        r'HKLM\SOFTWARE\Amazon Corretto\JDK',
+        r'HKLM\SOFTWARE\WOW6432Node\JavaSoft\JDK',
+      ]) {
+        try {
+          final listResult = await Process.run('reg', ['query', regKey]);
+          if (listResult.exitCode != 0) continue;
+          for (final line in (listResult.stdout as String).split('\n')) {
+            final subkey = line.trim();
+            if (!subkey.toUpperCase().startsWith('HKEY')) continue;
+            final homeResult =
+                await Process.run('reg', ['query', subkey, '/v', 'JavaHome']);
+            if (homeResult.exitCode != 0) continue;
+            final match = RegExp(r'JavaHome\s+REG_SZ\s+(.+)')
+                .firstMatch(homeResult.stdout as String);
+            if (match == null) continue;
+            final candidate =
+                p.join(match.group(1)!.trim(), 'bin', 'java.exe');
+            if (await File(candidate).exists()) return candidate;
+          }
+        } catch (_) {}
+      }
+
+      final bases = <String>[
+        Platform.environment['ProgramFiles'] ?? r'C:\Program Files',
+        Platform.environment['ProgramFiles(x86)'] ?? r'C:\Program Files (x86)',
+      ];
+      const vendors = [
+        'Java', 'Eclipse Adoptium', 'Microsoft', 'Amazon Corretto',
+        'BellSoft', 'Azul Systems',
+      ];
+      for (final base in bases) {
+        for (final vendor in vendors) {
+          final vendorDir = Directory(p.join(base, vendor));
+          if (!await vendorDir.exists()) continue;
+          await for (final entity in vendorDir.list()) {
+            if (entity is! Directory) continue;
+            final candidate = p.join(entity.path, 'bin', 'java.exe');
+            if (await File(candidate).exists()) return candidate;
+          }
+        }
+      }
+
+      final userHome = Platform.environment['USERPROFILE'];
+      if (userHome != null) {
+        for (final jdkRoot in [
+          p.join(userHome, '.jdks'),
+          p.join(userHome, '.gradle', 'jdks'),
+        ]) {
+          final dir = Directory(jdkRoot);
+          if (!await dir.exists()) continue;
+          await for (final entity in dir.list()) {
+            if (entity is! Directory) continue;
+            final candidate = p.join(entity.path, 'bin', 'java.exe');
+            if (await File(candidate).exists()) return candidate;
+          }
+        }
+      }
+
+      return null;
+    }
+
+    try {
+      final execDir = File(Platform.resolvedExecutable).parent.path;
+      final bundled = File(
+        p.join(execDir, 'data', 'flutter_assets', 'assets', 'jre', 'bin', 'java'),
+      );
+      if (await bundled.exists()) return bundled.path;
+    } catch (_) {}
+
+    final home = Platform.environment['JAVA_HOME'];
+    if (home != null) {
+      final candidate = p.join(home.trim(), 'bin', 'java');
+      if (await File(candidate).exists()) return candidate;
+    }
+
+    if (Platform.isMacOS) {
+      try {
+        final result = await Process.run('/usr/libexec/java_home', ['-v', '17']);
         final resolvedHome = (result.stdout as String).trim();
         if (resolvedHome.isNotEmpty) {
           return p.join(resolvedHome, 'bin', 'java');
         }
-      }
+      } catch (_) {}
+    }
 
+    try {
       final result = await Process.run('which', ['java']);
       final candidate = (result.stdout as String).trim();
-      if (candidate.isNotEmpty) {
-        return candidate;
-      }
-    } catch (_) {
-      return null;
-    }
+      if (candidate.isNotEmpty) return candidate;
+    } catch (_) {}
 
     return null;
   }
