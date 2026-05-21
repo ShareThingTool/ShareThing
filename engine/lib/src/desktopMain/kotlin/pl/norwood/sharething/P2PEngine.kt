@@ -22,6 +22,9 @@ import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelInboundHandlerAdapter
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.future.await
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -559,7 +562,7 @@ actual class P2PEngine actual constructor() {
                 b.identity.factory = { privKey }
                 b.protocols.add(Identify())
                 b.muxers.clear()
-                b.muxers.add(StreamMuxerProtocol.getYamux())
+                b.muxers.add(StreamMuxerProtocol.getYamux(32 * 1024 * 1024))
                 b.muxers.add(StreamMuxerProtocol.Mplex)
             }.listen("/ip4/0.0.0.0/tcp/$port").build()
         }
@@ -583,7 +586,7 @@ actual class P2PEngine actual constructor() {
             b.identity.factory = { privKey }
             b.protocols.add(Identify())
             b.muxers.clear()
-            b.muxers.add(StreamMuxerProtocol.getYamux())
+            b.muxers.add(StreamMuxerProtocol.getYamux(32 * 1024 * 1024))
             b.muxers.add(StreamMuxerProtocol.Mplex)
             @Suppress("UNCHECKED_CAST")
             b.protocols.add(hopBinding as ProtocolBinding<Any>)
@@ -965,6 +968,10 @@ actual class P2PEngine actual constructor() {
                 "control[$scope] COMPLETION id=${control.transferId} completed=${control.completed} " +
                     "msg=${control.message ?: "-"}"
             }
+
+            is FileTransferControl.DataAck -> log.v {
+                "control[$scope] DATA_ACK id=${control.transferId} bytesReceived=${control.bytesReceived}"
+            }
         }
     }
 
@@ -1000,6 +1007,9 @@ actual class P2PEngine actual constructor() {
         private var streamClosed: Boolean = false
         private var completionSent: Boolean = false
         private val transferCompletion = CompletableDeferred<FileTransferControl.Completion>()
+
+        private val ackedBytesFlow = MutableStateFlow(0L)
+        private var nextAckAt = ACK_INTERVAL_BYTES
 
         private lateinit var stream: Stream
         private var nettyChannel: io.netty.channel.Channel? = null
@@ -1120,6 +1130,14 @@ actual class P2PEngine actual constructor() {
                         for (chunk in diskWriteChannel) {
                             output.write(chunk)
                             bytesTransferred += chunk.size
+
+                            if (bytesTransferred >= nextAckAt) {
+                                writeControl(FileTransferControl.DataAck(
+                                    transferId = transferId,
+                                    bytesReceived = bytesTransferred
+                                ))
+                                nextAckAt = bytesTransferred + ACK_INTERVAL_BYTES
+                            }
 
                             emitTransferUpdate(
                                 transferId = transferId,
@@ -1289,6 +1307,10 @@ actual class P2PEngine actual constructor() {
                             transferCompletion.complete(control)
                         }
                     }
+
+                    is FileTransferControl.DataAck -> {
+                        ackedBytesFlow.update { maxOf(it, control.bytesReceived) }
+                    }
                 }
             } catch (e: Exception) {
                 log.w(e) { "data_control_decode_failed transferId=$transferId payloadSize=${payload.length}" }
@@ -1302,6 +1324,14 @@ actual class P2PEngine actual constructor() {
                 transfer.file.inputStream().use { input ->
                     val buffer = ByteArray(FILE_CHUNK_SIZE)
                     while (isActive) {
+                        val unacked = bytesTransferred - ackedBytesFlow.value
+                        if (unacked >= MAX_UNACKED_BYTES) {
+                            val threshold = bytesTransferred - MAX_UNACKED_BYTES
+                            withTimeout(ACK_TIMEOUT_MILLIS) {
+                                ackedBytesFlow.first { it >= threshold }
+                            }
+                        }
+
                         val read = input.read(buffer)
                         if (read < 0) break
                         val bytes = buffer.copyOf(read)
@@ -1475,5 +1505,8 @@ actual class P2PEngine actual constructor() {
         const val FILE_CHUNK_SIZE = 64 * 1024
         const val TRANSFER_COMPLETION_TIMEOUT_MILLIS = 15_000L
         const val MAX_CONTROL_FRAME_BYTES = 1 * 1024 * 1024
+        const val ACK_INTERVAL_BYTES = 1 * 1024 * 1024L
+        const val MAX_UNACKED_BYTES = 4 * 1024 * 1024L
+        const val ACK_TIMEOUT_MILLIS = 30_000L
     }
 }

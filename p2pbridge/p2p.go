@@ -83,15 +83,16 @@ func (pt *pendingTransfer) resolve(d transferDecision) {
 }
 
 type controlMsg struct {
-	Type       string `json:"type"`
-	TransferID string `json:"transferId,omitempty"`
-	PeerID     string `json:"peerId,omitempty"`
-	Nickname   string `json:"nickname,omitempty"`
-	Filename   string `json:"filename,omitempty"`
-	TotalBytes int64  `json:"totalBytes,omitempty"`
-	Accepted   *bool  `json:"accepted,omitempty"`
-	Completed  *bool  `json:"completed,omitempty"`
-	Message    string `json:"message,omitempty"`
+	Type          string `json:"type"`
+	TransferID    string `json:"transferId,omitempty"`
+	PeerID        string `json:"peerId,omitempty"`
+	Nickname      string `json:"nickname,omitempty"`
+	Filename      string `json:"filename,omitempty"`
+	TotalBytes    int64  `json:"totalBytes,omitempty"`
+	Accepted      *bool  `json:"accepted,omitempty"`
+	Completed     *bool  `json:"completed,omitempty"`
+	Message       string `json:"message,omitempty"`
+	BytesReceived int64  `json:"bytesReceived,omitempty"`
 }
 
 type discoveryRegisterRequest struct {
@@ -405,12 +406,63 @@ func doSendFile(h host.Host, kp *knownPeer, transferID, filePath, filename strin
 	}
 	defer f.Close()
 
+	type incomingMsg struct {
+		msg controlMsg
+		err error
+	}
+	incomingCh := make(chan incomingMsg, 64)
+	go func() {
+		for {
+			var m controlMsg
+			err := readControl(stream, &m)
+			incomingCh <- incomingMsg{m, err}
+			if err != nil || m.Type == "COMPLETION" {
+				return
+			}
+		}
+	}()
+
+	drainACKs := func(ackedBytes *int64) error {
+		for {
+			select {
+			case res := <-incomingCh:
+				if res.err != nil {
+					return fmt.Errorf("send: reading ack: %w", res.err)
+				}
+				if res.msg.Type == "DATA_ACK" && res.msg.BytesReceived > *ackedBytes {
+					*ackedBytes = res.msg.BytesReceived
+				}
+			default:
+				return nil
+			}
+		}
+	}
+
 	buf := make([]byte, 64*1024)
-	var sent int64
+	var sent, ackedBytes int64
 	start := time.Now()
 	emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "IN_PROGRESS", kp.PeerID, filename, "")
 
 	for {
+		if err := drainACKs(&ackedBytes); err != nil {
+			return err
+		}
+		for sent-ackedBytes >= maxUnacked {
+			timer := time.NewTimer(ackTimeout)
+			select {
+			case res := <-incomingCh:
+				timer.Stop()
+				if res.err != nil {
+					return fmt.Errorf("send: reading ack: %w", res.err)
+				}
+				if res.msg.Type == "DATA_ACK" && res.msg.BytesReceived > ackedBytes {
+					ackedBytes = res.msg.BytesReceived
+				}
+			case <-timer.C:
+				return fmt.Errorf("send: timed out waiting for DATA_ACK after %s", ackTimeout)
+			}
+		}
+
 		n, readErr := f.Read(buf)
 		if n > 0 {
 			if _, writeErr := stream.Write(buf[:n]); writeErr != nil {
@@ -429,19 +481,22 @@ func doSendFile(h host.Host, kp *knownPeer, transferID, filePath, filename strin
 
 	stream.CloseWrite()
 
-	var completion controlMsg
-	if err := readControl(stream, &completion); err != nil {
-		return fmt.Errorf("completion: %w", err)
+	for {
+		res := <-incomingCh
+		if res.err != nil {
+			return fmt.Errorf("completion: %w", res.err)
+		}
+		if res.msg.Type == "COMPLETION" {
+			status := "COMPLETED"
+			msg := ""
+			if res.msg.Completed == nil || !*res.msg.Completed {
+				status = "FAILED"
+				msg = res.msg.Message
+			}
+			emitTransferUpdate(transferID, "OUTGOING", sent, totalBytes, 0, status, kp.PeerID, filename, msg)
+			return nil
+		}
 	}
-
-	status := "COMPLETED"
-	msg := ""
-	if completion.Completed == nil || !*completion.Completed {
-		status = "FAILED"
-		msg = completion.Message
-	}
-	emitTransferUpdate(transferID, "OUTGOING", sent, totalBytes, 0, status, kp.PeerID, filename, msg)
-	return nil
 }
 
 func handleIncomingStream(stream network.Stream) {
@@ -502,6 +557,12 @@ func handleIncomingStream(stream network.Stream) {
 	receiveFile(stream, offer.TransferID, remotePeerID, offer.Filename, offer.TotalBytes, decision.savePath)
 }
 
+const (
+	ackInterval = 1 * 1024 * 1024
+	maxUnacked  = 4 * 1024 * 1024
+	ackTimeout  = 30 * time.Second
+)
+
 func receiveFile(stream network.Stream, transferID, peerID, filename string, totalBytes int64, savePath string) {
 	partPath := savePath + ".part"
 
@@ -522,6 +583,7 @@ func receiveFile(stream network.Stream, transferID, peerID, filename string, tot
 
 	buf := make([]byte, 64*1024)
 	var received int64
+	var nextAckAt int64 = ackInterval
 	start := time.Now()
 	emitTransferUpdate(transferID, "INCOMING", 0, totalBytes, 0, "IN_PROGRESS", peerID, filename, "")
 
@@ -538,6 +600,10 @@ func receiveFile(stream network.Stream, transferID, peerID, filename string, tot
 				break
 			}
 			received += int64(n)
+			if received >= nextAckAt {
+				writeControl(stream, controlMsg{Type: "DATA_ACK", TransferID: transferID, BytesReceived: received})
+				nextAckAt = received + ackInterval
+			}
 			emitTransferUpdate(transferID, "INCOMING", received, totalBytes, calcSpeed(received, start), "IN_PROGRESS", peerID, filename, "")
 		}
 		if readErr == io.EOF {

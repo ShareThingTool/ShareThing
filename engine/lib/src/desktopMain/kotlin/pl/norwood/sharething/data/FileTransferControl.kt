@@ -22,4 +22,10 @@ sealed class FileTransferControl {
     data class Completion(
         val transferId: String, val completed: Boolean, val message: String? = null
     ) : FileTransferControl()
+
+    @Serializable
+    @SerialName("DATA_ACK")
+    data class DataAck(
+        val transferId: String, val bytesReceived: Long
+    ) : FileTransferControl()
 }
