@@ -1,18 +1,24 @@
 package com.example.sharething
 
+import android.app.DownloadManager
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import org.json.JSONArray
 import org.json.JSONObject
+import p2p.P2p
 
 class MainActivity : FlutterActivity() {
     companion object {
         private var eventSink: EventChannel.EventSink? = null
+        private val mainHandler = Handler(Looper.getMainLooper())
 
         fun emitEvent(payload: Map<String, Any?>) {
-            eventSink?.success(payload)
+            mainHandler.post { eventSink?.success(payload) }
         }
     }
 
@@ -32,10 +38,8 @@ class MainActivity : FlutterActivity() {
                             result.error("INVALID_ARGUMENT", "payload is null", null)
                             return@setMethodCallHandler
                         }
-
                         handleJsonCommand(payload, result)
                     }
-
                     else -> result.notImplemented()
                 }
             }
@@ -70,9 +74,18 @@ class MainActivity : FlutterActivity() {
                     return
                 }
 
+                val nickname = json.optString("nickname")
+                val discoveryServers = json.optJSONArray("discoveryServers")
+                    ?.let { arr -> (0 until arr.length()).joinToString(";") { arr.getString(it) } }
+                    ?: ""
+                val relayAddrs = json.optJSONArray("relayAddrs")
+                    ?.let { arr -> (0 until arr.length()).joinToString(";") { arr.getString(it) } }
+                    ?: ""
+
                 val intent = Intent(this, EngineService::class.java).apply {
-                    putExtra("nickname", json.optString("nickname"))
-                    putExtra("discoveryServers", json.optJSONArray("discoveryServers")?.toString())
+                    putExtra("nickname", nickname)
+                    putExtra("discoveryServers", discoveryServers)
+                    putExtra("relayAddrs", relayAddrs)
                 }
                 startForegroundService(intent)
                 started = true
@@ -85,14 +98,58 @@ class MainActivity : FlutterActivity() {
                 result.success(null)
             }
 
-            "SEND_FILE",
-            "ACCEPT_FILE",
+            "SEND_FILE" -> {
+                val targetPeerId = json.optString("targetPeerId")
+                val filePath = json.optString("filePath")
+                val addrsArray = json.optJSONArray("knownAddresses")
+                val knownAddresses = if (addrsArray != null)
+                    (0 until addrsArray.length()).joinToString(";") { addrsArray.getString(it) }
+                else ""
+                Thread {
+                    try {
+                        P2p.sendFile(targetPeerId, filePath, knownAddresses)
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("SEND_FILE_FAILED", e.message, null)
+                    }
+                }.start()
+            }
+
+            "ACCEPT_FILE" -> {
+                val transferId = json.optString("transferId")
+                val savePath = json.optString("savePath")
+                Thread {
+                    try {
+                        P2p.acceptFile(transferId, savePath)
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("ACCEPT_FILE_FAILED", e.message, null)
+                    }
+                }.start()
+            }
+
             "REJECT_FILE" -> {
-                result.error(
-                    "UNSUPPORTED",
-                    "${json.optString("type")} is not implemented in the Android bridge yet",
-                    null
-                )
+                val transferId = json.optString("transferId")
+                Thread {
+                    try {
+                        P2p.rejectFile(transferId)
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("REJECT_FILE_FAILED", e.message, null)
+                    }
+                }.start()
+            }
+
+            "OPEN_FILE_LOCATION" -> {
+                try {
+                    val intent = Intent(DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    }
+                    startActivity(Intent.createChooser(intent, "Open with"))
+                    result.success(null)
+                } catch (e: Exception) {
+                    result.error("OPEN_FAILED", e.message, null)
+                }
             }
 
             else -> result.error("UNKNOWN_COMMAND", json.optString("type"), null)

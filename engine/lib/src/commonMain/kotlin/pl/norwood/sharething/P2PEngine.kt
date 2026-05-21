@@ -1,7 +1,11 @@
 package pl.norwood.sharething
 
 expect class P2PEngine() {
-    fun startNode(nickname: String, discoveryServers: List<String>): EngineEvent.NodeStarted
+    fun startNode(
+        nickname: String,
+        discoveryServers: List<String>,
+        relayAddrs: List<String> = emptyList()
+    ): EngineEvent.NodeStarted
 
     fun stopNode()
 

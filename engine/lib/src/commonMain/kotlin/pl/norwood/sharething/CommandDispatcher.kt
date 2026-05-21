@@ -28,7 +28,7 @@ object CommandDispatcher {
             when (val command = json.decodeFromString<EngineCommand>(input)) {
                 is EngineCommand.StartNode -> DispatchResult(
                     eventJson = encodeEvent(
-                        engine.startNode(command.nickname, command.discoveryServers)
+                        engine.startNode(command.nickname, command.discoveryServers, command.relayAddrs)
                     )
                 )
 

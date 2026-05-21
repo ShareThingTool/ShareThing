@@ -75,6 +75,31 @@ fvm flutter test
 fvm flutter build linux
 ```
 
-### Android Go Bridge
+### Building the Android Engine (go-libp2p)
 
-The Android bridge source lives in `p2pbridge/`, but the checked-in Android app currently consumes a prebuilt bridge artifact in `ui/android/app/libs/`.
+Android does not support JVM-based libp2p, so a separate Go bridge is used instead.
+This must be built once and copied into the Flutter project before running on Android.
+
+#### 1. Install Go
+Download and install Go from https://go.dev/dl/ (1.21 or newer).
+go get github.com/libp2p/go-libp2p@v0.38.1
+
+#### 2. Install gomobile
+```bash
+go install golang.org/x/mobile/cmd/gomobile@latest
+gomobile init
+```
+
+#### 3. Build the .aar
+```bash
+cd p2pbridge
+gomobile bind -target android/arm64 -androidapi 21 -o p2p.aar .
+```
+
+This produces two files: `p2p.aar` and `p2p-sources.jar`.
+
+#### 4. Copy into the Flutter project
+```bash
+cp p2p.aar ../ui/android/app/libs/
+cp p2p-sources.jar ../ui/android/app/libs/
+```

@@ -12,6 +12,7 @@ import 'core/storage/app_storage_paths.dart';
 import 'features/discovery/discovered_peer.dart';
 import 'features/file_transfer/file_transfer_entry.dart';
 import 'features/file_transfer/incoming_file_request.dart';
+import 'features/file_transfer/transfer_history_repository.dart';
 import 'features/friends/friend.dart';
 import 'features/friends/friends_repository.dart';
 import 'features/settings/app_settings.dart';
@@ -28,15 +29,19 @@ class ShareThingApp extends StatefulWidget {
     EngineManager? engine,
     FriendsRepository? friendsRepository,
     SettingsRepository? settingsRepository,
+    TransferHistoryRepository? transferHistoryRepository,
     AppStoragePaths? storagePaths,
   }) : engine = engine ?? EngineManager(),
        friendsRepository = friendsRepository ?? JsonFriendsRepository(),
        settingsRepository = settingsRepository ?? JsonSettingsRepository(),
+       transferHistoryRepository =
+           transferHistoryRepository ?? JsonTransferHistoryRepository(),
        storagePaths = storagePaths ?? const AppStoragePaths();
 
   final EngineManager engine;
   final FriendsRepository friendsRepository;
   final SettingsRepository settingsRepository;
+  final TransferHistoryRepository transferHistoryRepository;
   final AppStoragePaths storagePaths;
 
   @override
@@ -105,6 +110,7 @@ class _ShareThingAppState extends State<ShareThingApp> {
         engine: widget.engine,
         friendsRepository: widget.friendsRepository,
         settingsRepository: widget.settingsRepository,
+        transferHistoryRepository: widget.transferHistoryRepository,
         storagePaths: widget.storagePaths,
       ),
     );
@@ -146,12 +152,14 @@ class MyHomePage extends StatefulWidget {
     required this.engine,
     required this.friendsRepository,
     required this.settingsRepository,
+    required this.transferHistoryRepository,
     required this.storagePaths,
   });
 
   final EngineManager engine;
   final FriendsRepository friendsRepository;
   final SettingsRepository settingsRepository;
+  final TransferHistoryRepository transferHistoryRepository;
   final AppStoragePaths storagePaths;
 
   @override
@@ -166,6 +174,7 @@ class _MyHomePageState extends State<MyHomePage> {
   Map<String, _FriendPresence> _peerPresence = const {};
   Map<String, FileTransferEntry> _transfers = const {};
   Map<String, IncomingFileRequest> _incomingRequests = const {};
+  final Map<String, String> _pendingSavePaths = {};
   AppSettings _settings = AppSettings.defaults();
 
   bool _running = false;
@@ -191,7 +200,26 @@ class _MyHomePageState extends State<MyHomePage> {
   Future<void> _bootstrap() async {
     await _loadSettings();
     await _loadFriends();
+    await _loadTransferHistory();
     await _startEngine();
+  }
+
+  Future<void> _loadTransferHistory() async {
+    final history = await widget.transferHistoryRepository.loadHistory();
+    if (!mounted) return;
+    setState(() {
+      _transfers = {for (final e in history) e.id: e};
+    });
+  }
+
+  Future<void> _saveTransferHistory() async {
+    final entries = _transfers.values.toList(growable: false)
+      ..sort((a, b) {
+        final aTime = a.startedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final bTime = b.startedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        return aTime.compareTo(bTime);
+      });
+    await widget.transferHistoryRepository.saveHistory(entries);
   }
 
   Future<void> _loadSettings() async {
@@ -331,7 +359,6 @@ class _MyHomePageState extends State<MyHomePage> {
           _running = false;
           _statusMessage = 'Node stopped';
           _peerPresence = {..._peerPresence, ...offlinePresence};
-          _discoveredPeers = const {};
         });
         break;
       case 'PEER_DISCOVERED':
@@ -341,6 +368,14 @@ class _MyHomePageState extends State<MyHomePage> {
         final addresses = (event['addresses'] as List<dynamic>? ?? const [])
             .map((address) => address.toString())
             .toList(growable: false);
+
+        final friendIdx = _friends.indexWhere((f) => f.peerId == peerId);
+        List<FriendEntry>? updatedFriends;
+        if (friendIdx >= 0 && addresses.isNotEmpty) {
+          final updated = [..._friends];
+          updated[friendIdx] = _friends[friendIdx].copyWith(addresses: addresses);
+          updatedFriends = updated;
+        }
 
         setState(() {
           _discoveredPeers = {
@@ -353,7 +388,9 @@ class _MyHomePageState extends State<MyHomePage> {
             ),
           };
           _peerPresence = {..._peerPresence, peerId: _FriendPresence.online};
+          if (updatedFriends != null) _friends = updatedFriends;
         });
+        if (updatedFriends != null) unawaited(_saveFriends(updatedFriends));
         break;
       case 'PEER_NICKNAME_CHANGED':
         final peerId = event['peerId']?.toString();
@@ -384,7 +421,6 @@ class _MyHomePageState extends State<MyHomePage> {
         if (peerId == null || peerId.isEmpty) return;
         setState(() {
           _peerPresence = {..._peerPresence, peerId: _FriendPresence.offline};
-          _discoveredPeers = Map.of(_discoveredPeers)..remove(peerId);
         });
         break;
       case 'INCOMING_FILE_REQUEST':
@@ -422,6 +458,7 @@ class _MyHomePageState extends State<MyHomePage> {
         };
 
         final existing = _transfers[transferId];
+        final now = DateTime.now();
         final updated = FileTransferEntry(
           id: transferId,
           direction: direction,
@@ -438,15 +475,29 @@ class _MyHomePageState extends State<MyHomePage> {
           error: status == FileTransferStatus.failed
               ? (event['message']?.toString() ?? existing?.error)
               : existing?.error,
+          localPath: _pendingSavePaths[transferId] ?? existing?.localPath,
+          startedAt: existing?.startedAt ??
+              (status == FileTransferStatus.queued ||
+                      status == FileTransferStatus.inProgress
+                  ? now
+                  : null),
+          completedAt: (status == FileTransferStatus.completed ||
+                  status == FileTransferStatus.failed)
+              ? (existing?.completedAt ?? now)
+              : existing?.completedAt,
         );
+
+        final terminal = status == FileTransferStatus.completed ||
+            status == FileTransferStatus.failed;
 
         setState(() {
           _transfers = {..._transfers, transferId: updated};
-          if (status == FileTransferStatus.completed ||
-              status == FileTransferStatus.failed) {
+          if (terminal) {
             _incomingRequests = Map.of(_incomingRequests)..remove(transferId);
           }
         });
+        if (terminal) _pendingSavePaths.remove(transferId);
+        unawaited(_saveTransferHistory());
         break;
       case 'ERROR':
         setState(() {
@@ -460,23 +511,6 @@ class _MyHomePageState extends State<MyHomePage> {
   int _intValue(dynamic value) {
     if (value is int) return value;
     return int.tryParse(value?.toString() ?? '') ?? 0;
-  }
-
-  String _formatByteSize(int bytes) {
-    if (bytes <= 0) return '0 B';
-
-    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-    var value = bytes.toDouble();
-    var unitIndex = 0;
-    while (value >= 1024 && unitIndex < units.length - 1) {
-      value /= 1024;
-      unitIndex++;
-    }
-
-    if (unitIndex == 0) {
-      return '${value.toInt()} ${units[unitIndex]}';
-    }
-    return '${value.toStringAsFixed(value >= 10 ? 1 : 2)} ${units[unitIndex]}';
   }
 
   String? _friendLabel(String? peerId) {
@@ -504,8 +538,14 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _sendFileToPeer(String peerId) async {
-    final result = await FilePicker.platform.pickFiles();
-    final filePath = result?.files.singleOrNull?.path;
+    final String? filePath;
+    if (Platform.isLinux) {
+      if (!mounted) return;
+      filePath = await _pickFileLinux(context);
+    } else {
+      final result = await FilePicker.platform.pickFiles();
+      filePath = result?.files.singleOrNull?.path;
+    }
     if (filePath == null || filePath.isEmpty) {
       return;
     }
@@ -515,9 +555,19 @@ class _MyHomePageState extends State<MyHomePage> {
       _errorMessage = null;
     });
 
+    final knownAddresses = {
+      ...?_discoveredPeers[peerId]?.addresses,
+      for (final f in _friends)
+        if (f.peerId == peerId) ...f.addresses,
+    }.toList(growable: false);
+
     try {
-      appLogger.i('ui.sendFile targetPeerId=$peerId filePath=$filePath');
-      await widget.engine.sendFile(targetPeerId: peerId, filePath: filePath);
+      appLogger.i('ui.sendFile targetPeerId=$peerId filePath=$filePath knownAddresses=$knownAddresses');
+      await widget.engine.sendFile(
+        targetPeerId: peerId,
+        filePath: filePath,
+        knownAddresses: knownAddresses,
+      );
     } catch (error) {
       appLogger.e('ui.sendFile.failed', error: error);
       if (!mounted) return;
@@ -533,14 +583,131 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
-  Future<void> _acceptIncomingRequest(IncomingFileRequest request) async {
-    final savePath = await FilePicker.platform.saveFile(
-      dialogTitle: 'Save incoming file',
-      fileName: request.fileName,
+  Future<String?> _pickFileLinux(BuildContext context) async {
+    for (final tool in ['zenity', 'kdialog', 'yad']) {
+      final which = await Process.run('which', [tool]);
+      if (which.exitCode != 0) continue;
+
+      final ProcessResult result;
+      if (tool == 'zenity') {
+        result = await Process.run('zenity', ['--file-selection', '--title=Select file to send']);
+      } else if (tool == 'kdialog') {
+        result = await Process.run('kdialog', ['--getopenfilename', Platform.environment['HOME'] ?? '/']);
+      } else {
+        result = await Process.run('yad', ['--file-selection', '--title=Select file to send']);
+      }
+
+      if (result.exitCode == 0) {
+        final path = result.stdout.toString().trim();
+        if (path.isNotEmpty) return path;
+      }
+      return null;
+    }
+
+    if (!context.mounted) return null;
+    return _showManualPathDialog(context, title: 'File path to send', hint: 'Enter full path to file');
+  }
+
+  Future<String?> _saveFileLinux(BuildContext context, String suggestedName) async {
+    final home = Platform.environment['HOME'] ?? '/tmp';
+    final suggested = '$home/$suggestedName';
+
+    for (final tool in ['zenity', 'kdialog', 'yad']) {
+      final which = await Process.run('which', [tool]);
+      if (which.exitCode != 0) continue;
+
+      final ProcessResult result;
+      if (tool == 'zenity') {
+        result = await Process.run('zenity', [
+          '--file-selection', '--save', '--confirm-overwrite',
+          '--title=Save incoming file',
+          '--filename=$suggested',
+        ]);
+      } else if (tool == 'kdialog') {
+        result = await Process.run('kdialog', ['--getsavefilename', suggested]);
+      } else {
+        result = await Process.run('yad', [
+          '--file-selection', '--save',
+          '--title=Save incoming file',
+          '--filename=$suggested',
+        ]);
+      }
+
+      if (result.exitCode == 0) {
+        final path = result.stdout.toString().trim();
+        if (path.isNotEmpty) return path;
+      }
+      return null;
+    }
+
+    if (!context.mounted) return null;
+    return _showManualPathDialog(context, title: 'Save file as', initialValue: suggested, hint: 'Enter full path including filename');
+  }
+
+  Future<String?> _showManualPathDialog(
+    BuildContext context, {
+    required String title,
+    String? initialValue,
+    String? hint,
+  }) async {
+    final controller = TextEditingController(text: initialValue ?? '');
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: SizedBox(
+          width: 460,
+          child: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: InputDecoration(
+              labelText: 'Path',
+              hintText: hint,
+              border: const OutlineInputBorder(),
+            ),
+            onSubmitted: (value) => Navigator.of(ctx).pop(value.trim()),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(null),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
     );
+    controller.dispose();
+    final path = result?.trim();
+    return (path == null || path.isEmpty) ? null : path;
+  }
+
+  Future<void> _acceptIncomingRequest(IncomingFileRequest request) async {
+    final String? savePath;
+    if (Platform.isAndroid) {
+      final dir = Directory('/storage/emulated/0/Download');
+      await dir.create(recursive: true);
+      savePath = '${dir.path}/${request.fileName}';
+    } else if (Platform.isIOS) {
+      final dir = await const AppStoragePaths().receivedFilesDirectory();
+      savePath = '${dir.path}/${request.fileName}';
+    } else if (Platform.isLinux) {
+      if (!mounted) return;
+      savePath = await _saveFileLinux(context, request.fileName);
+    } else {
+      savePath = await FilePicker.platform.saveFile(
+        dialogTitle: 'Save incoming file',
+        fileName: request.fileName,
+      );
+    }
     if (savePath == null || savePath.isEmpty) {
       return;
     }
+
+    _pendingSavePaths[request.transferId] = savePath;
 
     setState(() {
       _busy = true;
@@ -628,107 +795,31 @@ class _MyHomePageState extends State<MyHomePage> {
     FriendEntry? initialFriend,
     DiscoveredPeer? discoveredPeer,
   }) async {
-    final peerIdController = TextEditingController(
-      text: initialFriend?.peerId ?? discoveredPeer?.peerId ?? '',
-    );
-    final nicknameController = TextEditingController(
-      text: initialFriend?.nickname ?? discoveredPeer?.nickname ?? '',
-    );
-
-    FriendEntry? editedFriend;
-
-    await showDialog<void>(
+    final editedFriend = await showDialog<FriendEntry>(
       context: context,
-      builder: (dialogContext) {
-        String? validationError;
-
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              title: Text(initialFriend == null ? 'Add Friend' : 'Edit Friend'),
-              content: SizedBox(
-                width: 460,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    TextField(
-                      controller: peerIdController,
-                      decoration: const InputDecoration(
-                        labelText: 'Peer ID',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    const SizedBox(height: 12),
-                    TextField(
-                      controller: nicknameController,
-                      decoration: const InputDecoration(
-                        labelText: 'Nickname',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    if (validationError != null) ...[
-                      const SizedBox(height: 12),
-                      Text(
-                        validationError!,
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.error,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(dialogContext).pop(),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton(
-                  onPressed: () {
-                    final peerId = peerIdController.text.trim();
-                    final nickname = nicknameController.text.trim();
-                    final validationMessage = _validateFriend(
-                      peerId,
-                      nickname,
-                      editingPeerId: initialFriend?.peerId,
-                    );
-                    if (validationMessage != null) {
-                      setDialogState(() {
-                        validationError = validationMessage;
-                      });
-                      return;
-                    }
-
-                    editedFriend = FriendEntry(
-                      peerId: peerId,
-                      nickname: nickname,
-                    );
-                    Navigator.of(dialogContext).pop();
-                  },
-                  child: Text(initialFriend == null ? 'Add' : 'Save'),
-                ),
-              ],
-            );
-          },
-        );
-      },
+      builder: (dialogContext) => _FriendEditorDialog(
+        initialFriend: initialFriend,
+        discoveredPeer: discoveredPeer,
+        validate: (peerId, nickname) => _validateFriend(
+          peerId,
+          nickname,
+          editingPeerId: initialFriend?.peerId,
+        ),
+      ),
     );
-
-    peerIdController.dispose();
-    nicknameController.dispose();
 
     if (editedFriend == null) return;
 
     final updatedFriends = [
       for (final friend in _friends)
-        if (friend.peerId == editedFriend!.peerId ||
+        if (friend.peerId == editedFriend.peerId ||
             friend.peerId == initialFriend?.peerId)
-          editedFriend!
+          editedFriend
         else
           friend,
-      if (_friends.every((friend) => friend.peerId != editedFriend!.peerId) &&
+      if (_friends.every((friend) => friend.peerId != editedFriend.peerId) &&
           initialFriend == null)
-        editedFriend!,
+        editedFriend,
     ];
 
     await _saveFriends(updatedFriends);
@@ -768,69 +859,13 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _showNicknameEditor() async {
-    final nicknameController = TextEditingController(text: _settings.nickname);
-    String? validationError;
-
     await showDialog<void>(
       context: context,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              title: const Text('Edit Nickname'),
-              content: SizedBox(
-                width: 420,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    TextField(
-                      controller: nicknameController,
-                      decoration: const InputDecoration(
-                        labelText: 'Nickname',
-                        border: OutlineInputBorder(),
-                      ),
-                    ),
-                    if (validationError != null) ...[
-                      const SizedBox(height: 12),
-                      Text(
-                        validationError!,
-                        style: TextStyle(
-                          color: Theme.of(context).colorScheme.error,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(dialogContext).pop(),
-                  child: const Text('Cancel'),
-                ),
-                FilledButton(
-                  onPressed: () async {
-                    final nickname = nicknameController.text.trim();
-                    if (nickname.isEmpty) {
-                      setDialogState(() {
-                        validationError = 'Nickname is required.';
-                      });
-                      return;
-                    }
-
-                    await _saveSettings(_settings.copyWith(nickname: nickname));
-                    if (!dialogContext.mounted) return;
-                    Navigator.of(dialogContext).pop();
-                  },
-                  child: const Text('Save'),
-                ),
-              ],
-            );
-          },
-        );
-      },
+      builder: (dialogContext) => _NicknameEditorDialog(
+        initialNickname: _settings.nickname,
+        onSave: (nickname) => _saveSettings(_settings.copyWith(nickname: nickname)),
+      ),
     );
-
-    nicknameController.dispose();
   }
 
   Future<void> _copyPeerId() async {
@@ -894,6 +929,18 @@ class _MyHomePageState extends State<MyHomePage> {
               spacing: 12,
               runSpacing: 12,
               children: [
+                if (_running)
+                  OutlinedButton.icon(
+                    onPressed: _busy ? null : _stopEngine,
+                    icon: const Icon(Icons.stop_outlined),
+                    label: const Text('Stop Node'),
+                  )
+                else
+                  FilledButton.icon(
+                    onPressed: _busy ? null : _startEngine,
+                    icon: const Icon(Icons.play_arrow_outlined),
+                    label: const Text('Start Node'),
+                  ),
                 FilledButton.tonalIcon(
                   onPressed: _running ? _copyPeerId : null,
                   icon: const Icon(Icons.badge_outlined),
@@ -1195,7 +1242,7 @@ class _MyHomePageState extends State<MyHomePage> {
           const SizedBox(height: 8),
           Text('From: ${_friendLabel(request.peerId) ?? request.peerId}'),
           const SizedBox(height: 8),
-          Text('Size: ${_formatByteSize(request.totalBytes)}'),
+          Text('Size: ${request.totalBytes} bytes'),
           const SizedBox(height: 12),
           Wrap(
             spacing: 8,
@@ -1218,7 +1265,11 @@ class _MyHomePageState extends State<MyHomePage> {
 
   Widget _buildTransfersCard(BuildContext context) {
     final transfers = _transfers.values.toList(growable: false)
-      ..sort((left, right) => right.id.compareTo(left.id));
+      ..sort((a, b) {
+        final aTime = a.startedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        final bTime = b.startedAt ?? DateTime.fromMillisecondsSinceEpoch(0);
+        return bTime.compareTo(aTime);
+      });
 
     return Card(
       child: Padding(
@@ -1238,6 +1289,28 @@ class _MyHomePageState extends State<MyHomePage> {
                     if (index < transfers.length - 1)
                       const SizedBox(height: 12),
                   ],
+                  const SizedBox(height: 16),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: OutlinedButton.icon(
+                      onPressed: () => _confirmClearHistory(context),
+                      icon: Icon(
+                        Icons.delete_outline,
+                        color: Theme.of(context).colorScheme.error,
+                      ),
+                      label: Text(
+                        'Clear History',
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        side: BorderSide(
+                          color: Theme.of(context).colorScheme.error,
+                        ),
+                      ),
+                    ),
+                  ),
                 ],
               ),
           ],
@@ -1246,51 +1319,249 @@ class _MyHomePageState extends State<MyHomePage> {
     );
   }
 
+  Future<void> _confirmClearHistory(BuildContext context) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Clear transfer history?'),
+        content: const Text(
+          'All transfer history will be permanently deleted.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            style: TextButton.styleFrom(
+              foregroundColor: Theme.of(ctx).colorScheme.error,
+            ),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true) return;
+    setState(() => _transfers = const {});
+    unawaited(_saveTransferHistory());
+  }
+
   Widget _buildTransferCard(BuildContext context, FileTransferEntry transfer) {
-    final statusLabel = switch (transfer.status) {
-      FileTransferStatus.queued => 'Queued',
-      FileTransferStatus.inProgress => 'In Progress',
-      FileTransferStatus.completed => 'Completed',
-      FileTransferStatus.failed => 'Failed',
+    final colors = Theme.of(context).colorScheme;
+    final (statusLabel, statusColor, statusIcon) = switch (transfer.status) {
+      FileTransferStatus.queued => ('Queued', colors.secondary, Icons.schedule),
+      FileTransferStatus.inProgress => (
+        'In Progress',
+        colors.primary,
+        Icons.sync,
+      ),
+      FileTransferStatus.completed => (
+        'Completed',
+        Colors.green,
+        Icons.check_circle_outline,
+      ),
+      FileTransferStatus.failed => (
+        'Failed',
+        colors.error,
+        Icons.error_outline,
+      ),
     };
     final directionLabel = switch (transfer.direction) {
       FileTransferDirection.incoming => 'Incoming',
       FileTransferDirection.outgoing => 'Outgoing',
     };
+    final directionIcon = switch (transfer.direction) {
+      FileTransferDirection.incoming => Icons.arrow_downward,
+      FileTransferDirection.outgoing => Icons.arrow_upward,
+    };
+    final timestamp = transfer.completedAt ?? transfer.startedAt;
+    final timeLabel = timestamp != null ? _formatTimestamp(timestamp) : null;
+    final sizeLabel = _formatBytes(transfer.totalBytes);
+    final active = transfer.status == FileTransferStatus.queued ||
+        transfer.status == FileTransferStatus.inProgress;
 
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+        border: Border.all(color: colors.outlineVariant),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            transfer.fileName,
-            style: Theme.of(context).textTheme.titleMedium,
+          Row(
+            children: [
+              Icon(directionIcon, size: 16, color: colors.onSurfaceVariant),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  transfer.fileName,
+                  style: Theme.of(context).textTheme.titleMedium,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              Icon(statusIcon, size: 16, color: statusColor),
+              const SizedBox(width: 4),
+              Text(
+                statusLabel,
+                style: TextStyle(color: statusColor, fontSize: 12),
+              ),
+            ],
           ),
-          const SizedBox(height: 8),
-          Text('$directionLabel • ${transfer.peerLabel}'),
-          const SizedBox(height: 8),
-          LinearProgressIndicator(value: transfer.progress),
-          const SizedBox(height: 8),
-          Text(
-            '$statusLabel • '
-            '${_formatByteSize(transfer.bytesTransferred)}/'
-            '${_formatByteSize(transfer.totalBytes)}',
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '$directionLabel • ${transfer.peerLabel} • $sizeLabel',
+                  style: Theme.of(context).textTheme.bodySmall,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              if (timeLabel != null) ...[
+                const SizedBox(width: 8),
+                Text(timeLabel, style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ],
           ),
-          if (transfer.error != null) ...[
+          if (active) ...[
             const SizedBox(height: 8),
+            LinearProgressIndicator(value: transfer.progress),
+            const SizedBox(height: 4),
+            Text(
+              '${_formatBytes(transfer.bytesTransferred)} / $sizeLabel',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+          if (transfer.error != null) ...[
+            const SizedBox(height: 6),
             Text(
               transfer.error!,
-              style: TextStyle(color: Theme.of(context).colorScheme.error),
+              style: TextStyle(color: colors.error, fontSize: 12),
+            ),
+          ],
+          if (transfer.status == FileTransferStatus.completed &&
+              transfer.direction == FileTransferDirection.incoming &&
+              transfer.localPath != null) ...[
+            const SizedBox(height: 4),
+            Align(
+              alignment: Alignment.centerRight,
+              child: TextButton.icon(
+                onPressed: () => unawaited(
+                  _openFileLocation(context, transfer.localPath!),
+                ),
+                icon: const Icon(Icons.folder_open_outlined, size: 16),
+                label: Text(_showInFilesLabel),
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ),
             ),
           ],
         ],
       ),
     );
+  }
+
+  String _formatBytes(int bytes) {
+    if (bytes <= 0) return '0 B';
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
+  String _formatTimestamp(DateTime dt) {
+    final now = DateTime.now();
+    final diff = now.difference(dt);
+    if (diff.inSeconds < 60) return 'just now';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+    if (diff.inHours < 24) return '${diff.inHours}h ago';
+    if (diff.inDays < 7) return '${diff.inDays}d ago';
+    return '${dt.year}-${dt.month.toString().padLeft(2, '0')}-${dt.day.toString().padLeft(2, '0')}';
+  }
+
+  String get _showInFilesLabel {
+    if (Platform.isMacOS) return 'Show in Finder';
+    if (Platform.isWindows) return 'Show in Explorer';
+    return 'Show in Files';
+  }
+
+  Future<void> _openFileLocation(BuildContext context, String path) async {
+    if (Platform.isMacOS) {
+      await Process.run('open', ['-R', path]);
+      return;
+    }
+    if (Platform.isWindows) {
+      await Process.run('explorer.exe', ['/select,', path]);
+      return;
+    }
+    if (Platform.isLinux) {
+      await _openFileLocationLinux(context, path);
+      return;
+    }
+    if (Platform.isAndroid) {
+      await widget.engine.openFileLocation(path);
+    }
+  }
+
+  static const _linuxManagers = <({String name, String exec, bool selectsFile})>[
+    (name: 'Nautilus', exec: 'nautilus', selectsFile: true),
+    (name: 'Dolphin', exec: 'dolphin', selectsFile: true),
+    (name: 'Nemo', exec: 'nemo', selectsFile: true),
+    (name: 'Thunar', exec: 'thunar', selectsFile: false),
+    (name: 'PCManFM', exec: 'pcmanfm', selectsFile: false),
+    (name: 'Caja', exec: 'caja', selectsFile: false),
+  ];
+
+  Future<void> _openFileLocationLinux(BuildContext context, String path) async {
+    final dir = File(path).parent.path;
+
+    final available = <({String name, List<String> cmd})>[];
+    for (final m in _linuxManagers) {
+      final result = await Process.run('which', [m.exec]);
+      if (result.exitCode == 0) {
+        available.add((
+          name: m.name,
+          cmd: m.selectsFile ? [m.exec, path] : [m.exec, dir],
+        ));
+      }
+    }
+
+    if (available.isEmpty) {
+      await Process.run('xdg-open', [dir]);
+      return;
+    }
+
+    if (available.length == 1) {
+      final c = available.first.cmd;
+      await Process.run(c.first, c.sublist(1));
+      return;
+    }
+
+    if (!context.mounted) return;
+    final chosen = await showDialog<List<String>>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Open with'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (final m in available)
+              ListTile(
+                title: Text(m.name),
+                onTap: () => Navigator.of(ctx).pop(m.cmd),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (chosen == null) return;
+    await Process.run(chosen.first, chosen.sublist(1));
   }
 
   @override
@@ -1313,11 +1584,183 @@ class _MyHomePageState extends State<MyHomePage> {
           ],
         ),
       ),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _busy ? null : (_running ? _stopEngine : _startEngine),
-        label: Text(_running ? 'Stop Node' : 'Start Node'),
-        icon: Icon(_running ? Icons.stop : Icons.play_arrow),
-      ),
     );
   }
 }
+
+class _NicknameEditorDialog extends StatefulWidget {
+  const _NicknameEditorDialog({required this.initialNickname, required this.onSave});
+
+  final String initialNickname;
+  final Future<void> Function(String) onSave;
+
+  @override
+  State<_NicknameEditorDialog> createState() => _NicknameEditorDialogState();
+}
+
+class _NicknameEditorDialogState extends State<_NicknameEditorDialog> {
+  late final TextEditingController _controller;
+  String? _validationError;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController(text: widget.initialNickname);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Edit Nickname'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _controller,
+              decoration: const InputDecoration(
+                labelText: 'Nickname',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            if (_validationError != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                _validationError!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () async {
+            final nickname = _controller.text.trim();
+            if (nickname.isEmpty) {
+              setState(() => _validationError = 'Nickname is required.');
+              return;
+            }
+            final navigator = Navigator.of(context);
+            await widget.onSave(nickname);
+            if (!mounted) return;
+            navigator.pop();
+          },
+          child: const Text('Save'),
+        ),
+      ],
+    );
+  }
+}
+
+class _FriendEditorDialog extends StatefulWidget {
+  const _FriendEditorDialog({
+    this.initialFriend,
+    this.discoveredPeer,
+    required this.validate,
+  });
+
+  final FriendEntry? initialFriend;
+  final DiscoveredPeer? discoveredPeer;
+  final String? Function(String peerId, String nickname) validate;
+
+  @override
+  State<_FriendEditorDialog> createState() => _FriendEditorDialogState();
+}
+
+class _FriendEditorDialogState extends State<_FriendEditorDialog> {
+  late final TextEditingController _peerIdController;
+  late final TextEditingController _nicknameController;
+  String? _validationError;
+
+  @override
+  void initState() {
+    super.initState();
+    _peerIdController = TextEditingController(
+      text: widget.initialFriend?.peerId ?? widget.discoveredPeer?.peerId ?? '',
+    );
+    _nicknameController = TextEditingController(
+      text: widget.initialFriend?.nickname ?? widget.discoveredPeer?.nickname ?? '',
+    );
+  }
+
+  @override
+  void dispose() {
+    _peerIdController.dispose();
+    _nicknameController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isEditing = widget.initialFriend != null;
+    return AlertDialog(
+      title: Text(isEditing ? 'Edit Friend' : 'Add Friend'),
+      content: SizedBox(
+        width: 460,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _peerIdController,
+              decoration: const InputDecoration(
+                labelText: 'Peer ID',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _nicknameController,
+              decoration: const InputDecoration(
+                labelText: 'Nickname',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            if (_validationError != null) ...[
+              const SizedBox(height: 12),
+              Text(
+                _validationError!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final peerId = _peerIdController.text.trim();
+            final nickname = _nicknameController.text.trim();
+            final error = widget.validate(peerId, nickname);
+            if (error != null) {
+              setState(() => _validationError = error);
+              return;
+            }
+            Navigator.of(context).pop(FriendEntry(
+              peerId: peerId,
+              nickname: nickname,
+              addresses: widget.initialFriend?.addresses ?? widget.discoveredPeer?.addresses ?? const [],
+            ));
+          },
+          child: Text(isEditing ? 'Save' : 'Add'),
+        ),
+      ],
+    );
+  }
+}
+

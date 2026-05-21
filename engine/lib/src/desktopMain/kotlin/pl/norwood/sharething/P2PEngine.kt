@@ -2,21 +2,17 @@ package pl.norwood.sharething
 
 import co.touchlab.kermit.Logger
 import dorkbox.notify.Notify
-import io.libp2p.core.Host
-import io.libp2p.core.PeerId
-import io.libp2p.core.PeerInfo
-import io.libp2p.core.Stream
+import io.libp2p.core.*
 import io.libp2p.core.crypto.*
 import io.libp2p.core.dsl.HostBuilder
 import io.libp2p.core.multiformats.Multiaddr
 import io.libp2p.core.multiformats.Protocol
 import io.libp2p.core.multistream.ProtocolBinding
+import io.libp2p.core.mux.StreamMuxerProtocol
 import io.libp2p.discovery.MDnsDiscovery
 import io.libp2p.protocol.Identify
 import io.libp2p.protocol.ProtocolMessageHandler
 import io.libp2p.protocol.ProtocolMessageHandlerAdapter
-import io.libp2p.protocol.autonat.AutonatProtocol
-import io.libp2p.protocol.autonat.pb.Autonat
 import io.libp2p.protocol.circuit.CircuitHopProtocol
 import io.libp2p.protocol.circuit.CircuitStopProtocol
 import io.libp2p.protocol.circuit.RelayTransport
@@ -26,32 +22,43 @@ import io.netty.channel.ChannelHandlerContext
 import io.netty.channel.ChannelInboundHandlerAdapter
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.future.await
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import pl.norwood.sharething.data.*
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import pl.norwood.sharething.data.FileTransferControl
+import pl.norwood.sharething.data.KnownPeer
+import pl.norwood.sharething.data.OutgoingTransfer
+import pl.norwood.sharething.data.PendingIncomingTransfer
+import pl.norwood.sharething.data.StoredIdentity
 import java.io.File
-import java.io.FileOutputStream
-import java.io.IOException
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
+import java.net.InetSocketAddress
+import java.net.MulticastSocket
 import java.net.NetworkInterface
+import java.net.SocketTimeoutException
 import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
-import java.nio.file.Files
-import java.nio.file.StandardCopyOption
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 import kotlin.time.Duration.Companion.milliseconds
+import java.util.Optional
 
 actual class P2PEngine actual constructor() {
     private var host: Host? = null
@@ -59,6 +66,10 @@ actual class P2PEngine actual constructor() {
     private var nickname: String = ""
     private var mndsService: MDnsDiscovery? = null
     private var discoveryServers: List<String> = emptyList()
+    private var relayAddrs: List<String> = emptyList()
+    private val relayExecutor = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "relay-transport").also { it.isDaemon = true }
+    }
 
     private val identityJson = Json {
         ignoreUnknownKeys = true
@@ -74,14 +85,7 @@ actual class P2PEngine actual constructor() {
     private var heartbeatJob: Job? = null
     private var discoveryJob: Job? = null
     private var peerSweepJob: Job? = null
-    private var autoNatJob: Job? = null
-    private var autoNatBinding: AutonatProtocol.Binding? = null
-    private var relayTransport: RelayTransport? = null
-    private var relayScheduler: ScheduledExecutorService? = null
-    private var bootstrapRelays: List<BootstrapRelay> = emptyList()
-    private var observedPublicAddress: Multiaddr? = null
-    private var natReachability: NatReachability = NatReachability.UNKNOWN
-    private var lastAdvertisedAddresses: List<String> = emptyList()
+    private var lanBroadcastJob: Job? = null
 
     private val knownPeers = ConcurrentHashMap<String, KnownPeer>()
     private val incomingTransfers = ConcurrentHashMap<String, PendingIncomingTransfer>()
@@ -89,13 +93,16 @@ actual class P2PEngine actual constructor() {
     private val fileBinding: ProtocolBinding<FileTransferMessageHandler> = createFileTransferBinding()
 
     actual fun startNode(
-        nickname: String, discoveryServers: List<String>
+        nickname: String,
+        discoveryServers: List<String>,
+        relayAddrs: List<String>
     ): EngineEvent.NodeStarted {
         log.i {
-            "start_node requested nickname=$nickname discoveryServers=${discoveryServers.size}"
+            "start_node requested nickname=$nickname discoveryServers=${discoveryServers.size} relayAddrs=${relayAddrs.size}"
         }
         this.nickname = nickname
         this.discoveryServers = discoveryServers.map(::normalizeDiscoveryServer)
+        this.relayAddrs = relayAddrs
 
         if (host != null) {
             return EngineEvent.NodeStarted(
@@ -110,15 +117,11 @@ actual class P2PEngine actual constructor() {
             try {
                 log.d { "start_node attempting port=$candidatePort" }
                 val privKey = loadOrCreatePrivateKey()
-                val node = buildHost(privKey, candidatePort)
+                val node = buildHost(privKey, candidatePort, relayAddrs)
                 node.addProtocolHandler(fileBinding as ProtocolBinding<Any>)
                 node.start().get()
                 host = node
-                relayTransport?.setHost(node)
-                relayTransport?.initialize()
                 port = currentPort(node)
-                connectToBootstrapRelays()
-                startAutoNatMonitor()
                 startDiscoveryLoops()
                 log.i {
                     "start_node success peerId=${node.peerId.toBase58()} listenAddresses=${currentListenAddresses().size}"
@@ -146,8 +149,8 @@ actual class P2PEngine actual constructor() {
             discoveryJob = null
             peerSweepJob?.cancelAndJoin()
             peerSweepJob = null
-            autoNatJob?.cancelAndJoin()
-            autoNatJob = null
+            lanBroadcastJob?.cancelAndJoin()
+            lanBroadcastJob = null
         }
 
         mndsService?.stop()
@@ -159,14 +162,6 @@ actual class P2PEngine actual constructor() {
         unregisterFromDiscoveryServers()
 
         host?.stop()?.get()
-        relayScheduler?.shutdownNow()
-        relayScheduler = null
-        relayTransport = null
-        autoNatBinding = null
-        bootstrapRelays = emptyList()
-        observedPublicAddress = null
-        natReachability = NatReachability.UNKNOWN
-        lastAdvertisedAddresses = emptyList()
         host = null
         port = 0
         log.i { "stop_node completed" }
@@ -183,7 +178,10 @@ actual class P2PEngine actual constructor() {
 
         val transferId = UUID.randomUUID().toString()
         val transfer = OutgoingTransfer(
-            transferId = transferId, targetPeerId = targetPeerId, file = file
+            transferId = transferId,
+            targetPeerId = targetPeerId,
+            targetNickname = target.nickname,
+            file = file
         )
         log.i {
             "send_file queued id=$transferId target=$targetPeerId file=${file.name} bytes=${file.length()} addrs=${target.addresses.size}"
@@ -204,17 +202,9 @@ actual class P2PEngine actual constructor() {
             try {
                 val nodeRef = host ?: throw IllegalStateException("Desktop node is not running")
                 val peerIdObj = PeerId.fromBase58(target.peerId)
-                val addresses = prioritizeDialAddresses(
-                    nodeRef, target.addresses.map { Multiaddr(it) }
-                ).toTypedArray()
+                val addresses = target.addresses.map { Multiaddr(it) }.toTypedArray()
 
-                if (addresses.isEmpty()) {
-                    throw IllegalStateException("No supported dial addresses for peer $targetPeerId")
-                }
-
-                log.d {
-                    "send_file dial_start id=$transferId target=$targetPeerId addrs=${addresses.size} prioritized=${addresses.joinToString()}"
-                }
+                log.d { "send_file dial_start id=$transferId target=$targetPeerId addrs=${target.addresses.size}" }
                 val handler = fileBinding.dial(nodeRef, peerIdObj, *addresses).controller.await()
                 log.i { "send_file stream_established id=$transferId target=$targetPeerId" }
                 handler.initiateSend(transfer)
@@ -310,22 +300,28 @@ actual class P2PEngine actual constructor() {
         heartbeatJob?.cancel()
         discoveryJob?.cancel()
         peerSweepJob?.cancel()
+        lanBroadcastJob?.cancel()
 
         val currentNode = host ?: return
         log.i { "mdns_start serviceTag=_sharething._tcp.local." }
-        val mdns = MDnsDiscovery(
-            host = currentNode,
-            serviceTag = "_sharething._tcp.local.",
-            queryInterval = 120,
-            address = getLocalIpv4AddressObject()
-        )
-        mdns.addHandler { peerInfo ->
-            log.v { "mdns_payload peer=${peerInfo.peerId.toBase58()}" }
-            handleMdnsPeerFound(peerInfo)
+        try {
+            val mdns = MDnsDiscovery(
+                host = currentNode,
+                serviceTag = "_sharething._tcp.local.",
+                queryInterval = 120,
+                address = getLocalIpv4AddressObject()
+            )
+            mdns.addHandler { peerInfo ->
+                log.v { "mdns_payload peer=${peerInfo.peerId.toBase58()}" }
+                handleMdnsPeerFound(peerInfo)
+            }
+            mdns.start()
+            mndsService = mdns
+        } catch (e: Exception) {
+            log.w(e) { "mdns_start_failed discovery continues without mdns" }
         }
 
-        mdns.start()
-        mndsService = mdns
+        startLANBroadcast(currentNode)
 
         peerSweepJob = scope.launch {
             while (isActive && host != null) {
@@ -342,7 +338,6 @@ actual class P2PEngine actual constructor() {
 
         heartbeatJob = scope.launch {
             while (isActive && host != null) {
-                syncDiscoveryRegistrationIfNeeded()
                 heartbeatDiscoveryServers()
                 delay(15_000.milliseconds)
             }
@@ -381,13 +376,7 @@ actual class P2PEngine actual constructor() {
         val node = host ?: return@withContext false
         try {
             val peerIdObj = PeerId.fromBase58(peer.peerId)
-            val multiaddrs = prioritizeDialAddresses(
-                node, peer.addresses.map { Multiaddr(it) }
-            ).toTypedArray()
-
-            if (multiaddrs.isEmpty()) {
-                return@withContext false
-            }
+            val multiaddrs = peer.addresses.map { Multiaddr(it) }.toTypedArray()
 
             node.network.connect(peerIdObj, *multiaddrs).get(5, TimeUnit.SECONDS)
             true
@@ -398,11 +387,9 @@ actual class P2PEngine actual constructor() {
 
     private fun registerWithDiscoveryServers() {
         val node = host ?: return
-        val addresses = currentListenAddresses()
         val request = DiscoveryRegisterRequest(
-            peerId = node.peerId.toBase58(), nick = nickname, addresses = addresses, platform = "desktop"
+            peerId = node.peerId.toBase58(), nick = nickname, addresses = currentListenAddresses(), platform = "desktop"
         )
-        lastAdvertisedAddresses = addresses
 
         for (server in discoveryServers) {
             try {
@@ -445,20 +432,6 @@ actual class P2PEngine actual constructor() {
         }
     }
 
-    private fun syncDiscoveryRegistrationIfNeeded() {
-        if (discoveryServers.isEmpty()) {
-            return
-        }
-
-        val currentAddresses = currentListenAddresses()
-        if (currentAddresses != lastAdvertisedAddresses) {
-            log.i {
-                "discovery_addresses_changed direct=${currentAddresses.count { !it.contains("/p2p-circuit") }} relay=${currentAddresses.count { it.contains("/p2p-circuit") }}"
-            }
-            registerWithDiscoveryServers()
-        }
-    }
-
     private fun pollDiscoveryServers() {
         val node = host ?: return
         val selfPeerId = node.peerId.toBase58()
@@ -477,13 +450,55 @@ actual class P2PEngine actual constructor() {
                 for (peer in payload.peers) {
                     if (peer.peerId == selfPeerId) continue
 
+                    val previous = knownPeers[peer.peerId]
                     val resolvedNickname = peer.nick?.takeIf { it.isNotBlank() } ?: peer.peerId
-                    upsertKnownPeer(
-                        source = "discovery",
-                        peerId = peer.peerId,
-                        nickname = resolvedNickname,
-                        addresses = peer.addresses
-                    )
+
+                    if (previous == null) {
+                        val discovered = KnownPeer(
+                            peerId = peer.peerId,
+                            nickname = resolvedNickname,
+                            addresses = peer.addresses,
+                            lastSeenMillis = System.currentTimeMillis()
+                        )
+                        knownPeers[peer.peerId] = discovered
+                        log.i {
+                            "peer_discovered source=discovery peer=${discovered.peerId} nick=${discovered.nickname} addrs=${discovered.addresses.size}"
+                        }
+                        CommandDispatcher.emit(
+                            EngineEvent.PeerDiscovered(
+                                peerId = discovered.peerId,
+                                nickname = discovered.nickname,
+                                addresses = discovered.addresses
+                            )
+                        )
+                    } else {
+                        previous.lastSeenMillis = System.currentTimeMillis()
+
+                        if (previous.nickname != resolvedNickname) {
+                            log.i {
+                                "peer_nick_changed source=discovery peer=${peer.peerId} newNick=$resolvedNickname"
+                            }
+                            CommandDispatcher.emit(
+                                EngineEvent.PeerNicknameChanged(
+                                    peerId = peer.peerId, newNickname = resolvedNickname
+                                )
+                            )
+                        }
+                        if (previous.addresses != peer.addresses) {
+                            val updated = previous.copy(nickname = resolvedNickname, addresses = peer.addresses)
+                            knownPeers[peer.peerId] = updated
+                            log.d {
+                                "peer_addresses_changed source=discovery peer=${updated.peerId} addrs=${updated.addresses.size}"
+                            }
+                            CommandDispatcher.emit(
+                                EngineEvent.PeerDiscovered(
+                                    peerId = updated.peerId,
+                                    nickname = updated.nickname,
+                                    addresses = updated.addresses
+                                )
+                            )
+                        }
+                    }
                 }
                 return
             } catch (_: Exception) {
@@ -497,74 +512,136 @@ actual class P2PEngine actual constructor() {
         val selfPeerId = node.peerId.toBase58()
         var peerIdStr = peerInfo.peerId.toBase58()
 
-        //Upstream bug: Length prefix is not stripped
         if (peerIdStr.length == 53 && peerIdStr.startsWith("412D")) {
             peerIdStr = peerIdStr.substring(1)
         }
 
         if (peerIdStr == selfPeerId) return
 
-        val resolvedNickname = knownPeers[peerIdStr]?.nickname ?: peerIdStr
-        upsertKnownPeer(
-            source = "mdns",
-            peerId = peerIdStr,
-            nickname = resolvedNickname,
-            addresses = peerInfo.addresses.map { it.toString() }
-        )
+        val previous = knownPeers[peerIdStr]
+        val resolvedNickname = previous?.nickname ?: peerIdStr
+        val newAddresses = peerInfo.addresses.map { it.toString() }
+
+        if (previous == null) {
+            val discovered = KnownPeer(
+                peerId = peerIdStr,
+                nickname = resolvedNickname,
+                addresses = newAddresses,
+                lastSeenMillis = System.currentTimeMillis()
+            )
+            knownPeers[peerIdStr] = discovered
+            log.i {
+                "peer_discovered source=mdns peer=${discovered.peerId} nick=${discovered.nickname} addrs=${discovered.addresses.size}"
+            }
+            CommandDispatcher.emit(
+                EngineEvent.PeerDiscovered(
+                    peerId = discovered.peerId, nickname = discovered.nickname, addresses = discovered.addresses
+                )
+            )
+        } else {
+            previous.lastSeenMillis = System.currentTimeMillis()
+
+            if (previous.addresses != newAddresses) {
+                val updated = previous.copy(addresses = newAddresses)
+                knownPeers[peerIdStr] = updated
+                log.d { "peer_addresses_changed source=mdns peer=${updated.peerId} addrs=${updated.addresses.size}" }
+                CommandDispatcher.emit(
+                    EngineEvent.PeerDiscovered(
+                        peerId = updated.peerId, nickname = updated.nickname, addresses = updated.addresses
+                    )
+                )
+            }
+        }
     }
 
-    private fun buildHost(privKey: PrivKey, port: Int): Host {
-        val autoNatBinding = AutonatProtocol.Binding()
-        val circuitStopBinding = CircuitStopProtocol.Binding(CircuitStopProtocol())
-        val circuitHopBinding = CircuitHopProtocol.Binding(NoRelayManager, circuitStopBinding)
-        val bootstrapRelays = loadBootstrapRelays()
-        val relayScheduler = Executors.newSingleThreadScheduledExecutor { runnable ->
-            Thread(runnable, "sharething-relay").apply { isDaemon = true }
-        }
-        var relayTransport: RelayTransport? = null
+    private fun buildHost(privKey: PrivKey, port: Int, relayAddrs: List<String> = emptyList()): Host {
+        val relayCandidates = buildRelayCandidates(relayAddrs)
 
-        val host = HostBuilder().builderModifier { b ->
+        if (relayCandidates.isEmpty()) {
+            return HostBuilder().builderModifier { b ->
+                b.identity.factory = { privKey }
+                b.protocols.add(Identify())
+                b.muxers.clear()
+                b.muxers.add(StreamMuxerProtocol.getYamux(32 * 1024 * 1024))
+                b.muxers.add(StreamMuxerProtocol.Mplex)
+            }.listen("/ip4/0.0.0.0/tcp/$port").build()
+        }
+
+        log.i { "buildHost relay_transport relays=${relayCandidates.size}" }
+
+        val stopProtocol = CircuitStopProtocol()
+        val stopBinding = CircuitStopProtocol.Binding(stopProtocol)
+
+        // Client-only relay manager: this node does NOT serve as a relay.
+        val clientManager = object : CircuitHopProtocol.RelayManager {
+            override fun hasReservation(peer: PeerId) = false
+            override fun createReservation(peer: PeerId, addr: Multiaddr): Optional<CircuitHopProtocol.Reservation> =
+                Optional.empty()
+            override fun allowConnection(a: PeerId, b: PeerId): Optional<CircuitHopProtocol.Reservation> =
+                Optional.empty()
+        }
+        val hopBinding = CircuitHopProtocol.Binding(clientManager, stopBinding)
+
+        return HostBuilder().builderModifier { b ->
             b.identity.factory = { privKey }
             b.protocols.add(Identify())
-            b.protocols.add(autoNatBinding)
-            b.protocols.add(circuitHopBinding)
-            b.protocols.add(circuitStopBinding)
+            b.muxers.clear()
+            b.muxers.add(StreamMuxerProtocol.getYamux(32 * 1024 * 1024))
+            b.muxers.add(StreamMuxerProtocol.Mplex)
+            @Suppress("UNCHECKED_CAST")
+            b.protocols.add(hopBinding as ProtocolBinding<Any>)
+            @Suppress("UNCHECKED_CAST")
+            b.protocols.add(stopBinding as ProtocolBinding<Any>)
             b.transports.add { upgrader ->
-                RelayTransport(
-                    circuitHopBinding,
-                    circuitStopBinding,
+                val relayTransport = RelayTransport(
+                    hopBinding,
+                    stopBinding,
                     upgrader,
-                    { bootstrapRelays.map(BootstrapRelay::toCandidateRelay) },
-                    relayScheduler
-                ).also { relay ->
-                    relay.setRelayCount(if (bootstrapRelays.isEmpty()) 0 else DEFAULT_RELAY_RESERVATIONS.coerceAtMost(bootstrapRelays.size))
-                    relayTransport = relay
-                }
+                    { _ -> relayCandidates },
+                    relayExecutor
+                )
+                stopProtocol.setTransport(relayTransport)
+                stopBinding.setTransport(relayTransport)
+                relayTransport
             }
         }.listen("/ip4/0.0.0.0/tcp/$port").build()
+    }
 
-        this.autoNatBinding = autoNatBinding
-        this.bootstrapRelays = bootstrapRelays
-        this.relayScheduler = relayScheduler
-        this.relayTransport = relayTransport
-        this.observedPublicAddress = null
-        this.natReachability = NatReachability.UNKNOWN
-        this.lastAdvertisedAddresses = emptyList()
-
-        log.w {
-            "wan_transport_partial using TCP + circuit-relay + AutoNAT; current jvm-libp2p release does not expose desktop QUIC transport or DCUtR"
+    private fun buildRelayCandidates(relayAddrs: List<String>): List<RelayTransport.CandidateRelay> {
+        return relayAddrs.mapNotNull { addrStr ->
+            try {
+                val ma = Multiaddr(addrStr)
+                val peerId = ma.getPeerId() ?: return@mapNotNull null
+                val transportAddr = Multiaddr(
+                    ma.components.filter { it.protocol != Protocol.P2P }
+                )
+                RelayTransport.CandidateRelay(peerId, listOf(transportAddr))
+            } catch (e: Exception) {
+                log.w(e) { "invalid relay addr: $addrStr" }
+                null
+            }
         }
-
-        if (bootstrapRelays.isEmpty()) {
-            log.w { "relay_bootstrap_empty relay reservations disabled until SHARETHING_BOOTSTRAP_RELAYS or -Dsharething.bootstrapRelays is configured" }
-        }
-
-        return host
     }
 
     private fun currentListenAddresses(): List<String> {
         val node = host ?: return emptyList()
-        return currentListenMultiaddrs(node).map { it.toString() }
+        val peerId = node.peerId.toBase58()
+        val synthesizedIpv4 = localIpv4Address()?.let {
+            "/ip4/$it/tcp/$port/p2p/$peerId"
+        }
+
+        val advertised = node.listenAddresses().map { address ->
+            if (address.getPeerId() == null) {
+                address.withP2P(node.peerId).toString()
+            } else {
+                address.toString()
+            }
+        }.sorted()
+
+        return linkedSetOf<String>().apply {
+            synthesizedIpv4?.let { add(it) }
+            addAll(advertised)
+        }.toList()
     }
 
     private fun currentPort(node: Host): Int {
@@ -575,291 +652,129 @@ actual class P2PEngine actual constructor() {
         return tcpComponent?.stringValue?.toIntOrNull() ?: DEFAULT_PORT
     }
 
-    private fun localIpv4Address(): String? {
-        return Collections.list(NetworkInterface.getNetworkInterfaces()).asSequence()
-            .filter { it.isUp && !it.isLoopback }.flatMap { Collections.list(it.inetAddresses).asSequence() }
-            .filterIsInstance<Inet4Address>().firstOrNull()?.hostAddress
+    private fun preferredLocalIpv4(): Pair<NetworkInterface, Inet4Address>? {
+        val virtualKeywords = listOf("virtualbox", "vmware", "hyper-v", "vethernet", "vbox", "virtual")
+        return NetworkInterface.getNetworkInterfaces()?.asSequence()
+            ?.filter { it.isUp && !it.isLoopback && !it.isVirtual }
+            ?.filter { iface ->
+                val name = (iface.displayName ?: iface.name).lowercase()
+                virtualKeywords.none { name.contains(it) }
+            }
+            ?.flatMap { iface ->
+                iface.inetAddresses.asSequence()
+                    .filterIsInstance<Inet4Address>()
+                    .filter { !it.isLoopbackAddress }
+                    .map { iface to it }
+            }
+            ?.firstOrNull()
+            ?: NetworkInterface.getNetworkInterfaces()?.asSequence()
+                ?.filter { it.isUp && !it.isLoopback }
+                ?.flatMap { iface ->
+                    iface.inetAddresses.asSequence()
+                        .filterIsInstance<Inet4Address>()
+                        .filter { !it.isLoopbackAddress }
+                        .map { iface to it }
+                }
+                ?.firstOrNull()
     }
 
-    private fun getLocalIpv4AddressObject(): Inet4Address? {
-        return NetworkInterface.getNetworkInterfaces().asSequence().filter { it.isUp && !it.isLoopback }
-            .flatMap { it.inetAddresses.asSequence() }.filterIsInstance<Inet4Address>().firstOrNull()
-    }
+    private fun localIpv4Address(): String? = preferredLocalIpv4()?.second?.hostAddress
 
-    private fun currentListenMultiaddrs(node: Host, includeRelay: Boolean = true): List<Multiaddr> {
-        val addresses = linkedMapOf<String, Multiaddr>()
+    private fun startLANBroadcast(host: Host) {
+        val port = 4102
+        val group = InetAddress.getByName("239.255.99.99")
+        val selfId = host.peerId.toBase58()
+        val iface = preferredLocalIpv4()?.first
 
-        fun add(address: Multiaddr?) {
-            if (address == null) {
-                return
-            }
-
-            val normalized = if (address.getPeerId() == null) {
-                address.withP2P(node.peerId)
-            } else {
-                address
-            }
-
-            if (!includeRelay && normalized.has(Protocol.P2PCIRCUIT)) {
-                return
-            }
-
-            addresses.putIfAbsent(normalized.toString(), normalized)
-        }
-
-        localIpv4Address()?.let { add(Multiaddr("/ip4/$it/tcp/$port")) }
-        observedPublicAddress?.let { add(it) }
-        node.listenAddresses().forEach(::add)
-
-        return addresses.values.sortedBy(Multiaddr::toString)
-    }
-
-    private fun connectToBootstrapRelays() {
-        if (bootstrapRelays.isEmpty()) {
-            return
-        }
-
-        scope.launch {
-            val node = host ?: return@launch
-            for (relay in bootstrapRelays) {
-                try {
-                    node.addressBook.addAddrs(relay.peerId, RELAY_ADDRESS_TTL_MILLIS, *relay.dialAddresses.toTypedArray()).get()
-                    node.network.connect(relay.peerId, *relay.dialAddresses.toTypedArray()).get(10, TimeUnit.SECONDS)
-                    log.i {
-                        "relay_bootstrap_connected peer=${relay.peerId.toBase58()} addrs=${relay.dialAddresses.size}"
+        scope.launch(Dispatchers.IO) {
+            val socket = try {
+                MulticastSocket(port).apply {
+                    soTimeout = 1000
+                    if (iface != null) {
+                        joinGroup(InetSocketAddress(group, port), iface)
+                    } else {
+                        joinGroup(group)
                     }
-                } catch (e: Exception) {
-                    log.w(e) { "relay_bootstrap_failed peer=${relay.peerId.toBase58()}" }
                 }
-            }
-        }
-    }
-
-    private fun startAutoNatMonitor() {
-        autoNatJob?.cancel()
-
-        if (bootstrapRelays.isEmpty()) {
-            return
-        }
-
-        autoNatJob = scope.launch {
-            while (isActive && host != null) {
-                probeAutoNatStatus()
-                delay(AUTONAT_POLL_INTERVAL_MILLIS.milliseconds)
-            }
-        }
-    }
-
-    private suspend fun probeAutoNatStatus() {
-        val node = host ?: return
-        val binding = autoNatBinding ?: return
-        val directAddresses = currentListenMultiaddrs(node, includeRelay = false)
-            .filterNot { it.has(Protocol.P2PCIRCUIT) }
-            .map { if (it.getPeerId() == null) it.withP2P(node.peerId) else it }
-
-        if (directAddresses.isEmpty()) {
-            updateNatStatus(NatReachability.UNKNOWN, null, null, "no direct listen addresses")
-            return
-        }
-
-        for (relay in bootstrapRelays) {
+            } catch (_: Exception) { return@launch }
             try {
-                val controller = binding.dial(node, relay.peerId, *relay.dialAddresses.toTypedArray()).controller.await()
-                val response = controller.requestDial(node.peerId, directAddresses).await()
-                val observedAddress = if (response.hasAddr()) {
-                    Multiaddr.deserialize(response.addr.toByteArray())
-                } else {
-                    null
+                val buf = ByteArray(4096)
+                while (isActive) {
+                    try {
+                        val packet = DatagramPacket(buf, buf.size)
+                        socket.receive(packet)
+                        val text = String(packet.data, 0, packet.length, Charsets.UTF_8)
+                        val obj = Json.parseToJsonElement(text).jsonObject
+                        val peerId = obj["peerId"]?.jsonPrimitive?.content?.takeIf { it.isNotEmpty() } ?: continue
+                        if (peerId == selfId) continue
+                        val nick = obj["nickname"]?.jsonPrimitive?.content?.takeIf { it.isNotEmpty() } ?: peerId
+                        val addrs = obj["addresses"]?.jsonArray?.map { it.jsonPrimitive.content } ?: emptyList()
+                        handleDiscoveredPeer(peerId, nick, addrs)
+                    } catch (_: SocketTimeoutException) {
+                    } catch (_: Exception) { break }
                 }
-                val status = when (response.status) {
-                    Autonat.Message.ResponseStatus.OK -> NatReachability.PUBLIC
-                    Autonat.Message.ResponseStatus.E_DIAL_ERROR,
-                    Autonat.Message.ResponseStatus.E_DIAL_REFUSED -> NatReachability.PRIVATE
-                    else -> NatReachability.UNKNOWN
+            } finally {
+                try {
+                    if (iface != null) socket.leaveGroup(InetSocketAddress(group, port), iface)
+                    else socket.leaveGroup(group)
+                } catch (_: Exception) {}
+                socket.close()
+            }
+        }
+
+        scope.launch(Dispatchers.IO) {
+            val sendSocket = try {
+                MulticastSocket().apply {
+                    if (iface != null) networkInterface = iface
+                    timeToLive = 4
                 }
-                updateNatStatus(status, observedAddress, relay.peerId.toBase58(), response.statusText.takeIf { response.hasStatusText() })
-                return
-            } catch (e: Exception) {
-                log.w(e) { "autonat_probe_failed peer=${relay.peerId.toBase58()}" }
-            }
-        }
-
-        updateNatStatus(NatReachability.UNKNOWN, null, null, "all bootstrap relays failed")
-    }
-
-    private fun updateNatStatus(
-        newStatus: NatReachability,
-        observedAddress: Multiaddr?,
-        viaPeerId: String?,
-        detail: String?
-    ) {
-        val normalizedObserved = observedAddress?.let {
-            if (it.getPeerId() == null) it else stripTrailingPeerId(it)
-        }
-        val changed = natReachability != newStatus || observedPublicAddress?.toString() != normalizedObserved?.toString()
-        natReachability = newStatus
-        observedPublicAddress = if (newStatus == NatReachability.PUBLIC) normalizedObserved else null
-
-        if (changed) {
-            log.i {
-                "autonat_status status=$newStatus observed=${this.observedPublicAddress?.toString() ?: "-"} via=${viaPeerId ?: "-"} detail=${detail ?: "-"}"
-            }
-            syncDiscoveryRegistrationIfNeeded()
+            } catch (_: Exception) { return@launch }
+            try {
+                while (isActive) {
+                    try {
+                        val addrs = currentListenAddresses()
+                        val payload = buildString {
+                            append("{")
+                            append("\"peerId\":${Json.encodeToString(selfId)},")
+                            append("\"nickname\":${Json.encodeToString(nickname)},")
+                            append("\"addresses\":${Json.encodeToString(addrs)}")
+                            append("}")
+                        }.toByteArray(Charsets.UTF_8)
+                        sendSocket.send(DatagramPacket(payload, payload.size, group, port))
+                    } catch (_: Exception) {}
+                    delay(5_000.milliseconds)
+                }
+            } finally { sendSocket.close() }
         }
     }
 
-    private fun prioritizeDialAddresses(node: Host, addresses: List<Multiaddr>): List<Multiaddr> {
-        return addresses.distinctBy(Multiaddr::toString)
-            .filter { supportsDialAddress(node, it) }
-            .sortedWith(compareBy<Multiaddr> { dialPriority(it) }.thenBy { it.toString() })
-    }
-
-    private fun supportsDialAddress(node: Host, address: Multiaddr): Boolean {
-        return node.network.transports.any { transport ->
-            runCatching { transport.handles(address) }.getOrDefault(false)
-        }
-    }
-
-    private fun dialPriority(address: Multiaddr): Int {
-        return when {
-            address.has(Protocol.P2PCIRCUIT) -> 2
-            isLanAddress(address) -> 0
-            else -> 1
-        }
-    }
-
-    private fun isLanAddress(address: Multiaddr): Boolean {
-        if (address.hasAny(Protocol.DNS, Protocol.DNS4, Protocol.DNS6, Protocol.DNSADDR)) {
-            return false
-        }
-
-        val ip = address.getFirstComponent(Protocol.IP4)?.stringValue ?: address.getFirstComponent(Protocol.IP6)?.stringValue
-        if (ip.isNullOrBlank()) {
-            return false
-        }
-
-        return runCatching {
-            val inetAddress = InetAddress.getByName(ip)
-            inetAddress.isSiteLocalAddress || inetAddress.isLinkLocalAddress || inetAddress.isLoopbackAddress
-        }.getOrDefault(false)
-    }
-
-    private fun loadBootstrapRelays(): List<BootstrapRelay> {
-        val configuredRelays = sequenceOf(
-            System.getProperty("sharething.bootstrapRelays"),
-            System.getenv("SHARETHING_BOOTSTRAP_RELAYS")
-        ).filterNotNull().flatMap { raw ->
-            raw.split(',', ';', '\n').asSequence().map(String::trim).filter(String::isNotBlank)
-        }
-
-        return (DEFAULT_BOOTSTRAP_RELAYS.asSequence() + configuredRelays)
-            .mapNotNull(::parseBootstrapRelay)
-            .groupBy(BootstrapRelayEndpoint::peerId)
-            .values
-            .map { entries ->
-                BootstrapRelay(
-                    peerId = entries.first().peerId,
-                    dialAddresses = entries.flatMap { it.dialAddresses }.distinctBy(Multiaddr::toString)
-                )
-            }
-    }
-
-    private fun parseBootstrapRelay(raw: String): BootstrapRelayEndpoint? {
-        return try {
-            val address = Multiaddr(raw)
-            val peerId = address.getPeerId()
-            if (peerId == null) {
-                log.w { "relay_bootstrap_invalid missing_peer_id=$raw" }
-                null
-            } else if (address.has(Protocol.P2PCIRCUIT)) {
-                log.w { "relay_bootstrap_invalid nested_relay=$raw" }
-                null
-            } else {
-                BootstrapRelayEndpoint(
-                    peerId = peerId,
-                    dialAddresses = listOf(stripTrailingPeerId(address))
-                )
-            }
-        } catch (e: Exception) {
-            log.w(e) { "relay_bootstrap_invalid value=$raw" }
-            null
-        }
-    }
-
-    private fun stripTrailingPeerId(address: Multiaddr): Multiaddr {
-        val components = address.components
-        val lastProtocol = components.lastOrNull()?.protocol
-        return if (lastProtocol == Protocol.P2P || lastProtocol == Protocol.IPFS) {
-            Multiaddr(components.dropLast(1))
-        } else {
-            address
-        }
-    }
-
-    private fun upsertKnownPeer(source: String, peerId: String, nickname: String, addresses: List<String>) {
-        val normalizedAddresses = mergePeerAddresses(knownPeers[peerId]?.addresses.orEmpty(), addresses)
-        val now = System.currentTimeMillis()
+    private fun handleDiscoveredPeer(peerId: String, nick: String, addrs: List<String>) {
         val previous = knownPeers[peerId]
-
         if (previous == null) {
             val discovered = KnownPeer(
                 peerId = peerId,
-                nickname = nickname,
-                addresses = normalizedAddresses,
-                lastSeenMillis = now
+                nickname = nick,
+                addresses = addrs,
+                lastSeenMillis = System.currentTimeMillis()
             )
             knownPeers[peerId] = discovered
-            log.i {
-                "peer_discovered source=$source peer=${discovered.peerId} nick=${discovered.nickname} addrs=${discovered.addresses.size}"
-            }
+            log.i { "peer_discovered source=lan_broadcast peer=$peerId nick=$nick addrs=${addrs.size}" }
             CommandDispatcher.emit(
-                EngineEvent.PeerDiscovered(
-                    peerId = discovered.peerId,
-                    nickname = discovered.nickname,
-                    addresses = discovered.addresses
-                )
+                EngineEvent.PeerDiscovered(peerId = peerId, nickname = nick, addresses = addrs)
             )
-            return
-        }
-
-        previous.lastSeenMillis = now
-
-        if (previous.nickname != nickname) {
-            log.i {
-                "peer_nick_changed source=$source peer=$peerId newNick=$nickname"
+        } else {
+            previous.lastSeenMillis = System.currentTimeMillis()
+            if (previous.addresses != addrs && addrs.isNotEmpty()) {
+                val updated = previous.copy(addresses = addrs)
+                knownPeers[peerId] = updated
+                CommandDispatcher.emit(
+                    EngineEvent.PeerDiscovered(peerId = peerId, nickname = nick, addresses = addrs)
+                )
             }
-            CommandDispatcher.emit(
-                EngineEvent.PeerNicknameChanged(
-                    peerId = peerId,
-                    newNickname = nickname
-                )
-            )
-        }
-
-        if (previous.nickname != nickname || previous.addresses != normalizedAddresses) {
-            val updated = previous.copy(nickname = nickname, addresses = normalizedAddresses, lastSeenMillis = now)
-            knownPeers[peerId] = updated
-            log.d {
-                "peer_addresses_changed source=$source peer=${updated.peerId} addrs=${updated.addresses.size}"
-            }
-            CommandDispatcher.emit(
-                EngineEvent.PeerDiscovered(
-                    peerId = updated.peerId,
-                    nickname = updated.nickname,
-                    addresses = updated.addresses
-                )
-            )
         }
     }
 
-    private fun mergePeerAddresses(existing: List<String>, incoming: List<String>): List<String> {
-        return linkedSetOf<String>().apply {
-            addAll(existing)
-            addAll(incoming)
-        }.sortedWith(compareBy<String>({ address ->
-            runCatching { dialPriority(Multiaddr(address)) }.getOrDefault(Int.MAX_VALUE)
-        }, { it }))
-    }
+    private fun getLocalIpv4AddressObject(): Inet4Address? = preferredLocalIpv4()?.second
 
     private fun loadOrCreatePrivateKey(): PrivKey {
         val file = identityFile()
@@ -944,14 +859,20 @@ actual class P2PEngine actual constructor() {
             )
         )
         log.d {
-            "transfer_update id=$transferId direction=$direction status=$status " + "bytes=$bytesTransferred/$totalBytes speedBps=$speedBps " + "peer=${peerId ?: "unknown"} file=${filename ?: "unknown"} message=${message ?: "-"}"
+            "transfer_update id=$transferId direction=$direction status=$status " +
+                "bytes=$bytesTransferred/$totalBytes speedBps=$speedBps " +
+                "peer=${peerId ?: "unknown"} file=${filename ?: "unknown"} message=${message ?: "-"}"
         }
 
         if (status == "COMPLETED" || status == "FAILED") {
             val dedupKey = "$transferId:$direction:$status"
             if (transferNotificationDedup.putIfAbsent(dedupKey, true) == null) {
                 notifyTransferTerminal(
-                    direction = direction, status = status, peerId = peerId, filename = filename, message = message
+                    direction = direction,
+                    status = status,
+                    peerId = peerId,
+                    filename = filename,
+                    message = message
                 )
             }
         }
@@ -974,7 +895,11 @@ actual class P2PEngine actual constructor() {
     }
 
     private fun notifyTransferTerminal(
-        direction: String, status: String, peerId: String?, filename: String?, message: String?
+        direction: String,
+        status: String,
+        peerId: String?,
+        filename: String?,
+        message: String?
     ) {
         val safePeerId = peerId ?: "unknown peer"
         val safeFileName = filename ?: "file"
@@ -1008,13 +933,18 @@ actual class P2PEngine actual constructor() {
     }
 
     private fun notifyDesktop(
-        title: String, text: String, level: DesktopNotificationLevel
+        title: String,
+        text: String,
+        level: DesktopNotificationLevel
     ) {
         try {
-            val notify = Notify.create().title(title).text(text)
+            val notify = Notify.create()
+                .title(title)
+                .text(text)
 
             when (level) {
                 DesktopNotificationLevel.INFO -> notify.showInformation()
+                DesktopNotificationLevel.WARNING -> notify.showWarning()
                 DesktopNotificationLevel.ERROR -> notify.showError()
             }
         } catch (t: Throwable) {
@@ -1025,31 +955,41 @@ actual class P2PEngine actual constructor() {
     private fun logControl(control: FileTransferControl, scope: String) {
         when (control) {
             is FileTransferControl.Offer -> log.d {
-                "control[$scope] OFFER id=${control.transferId} peer=${control.peerId} " + "file=${control.filename} bytes=${control.totalBytes}"
+                "control[$scope] OFFER id=${control.transferId} peer=${control.peerId} " +
+                    "file=${control.filename} bytes=${control.totalBytes}"
             }
 
             is FileTransferControl.Response -> log.d {
-                "control[$scope] RESPONSE id=${control.transferId} accepted=${control.accepted} " + "msg=${control.message ?: "-"}"
+                "control[$scope] RESPONSE id=${control.transferId} accepted=${control.accepted} " +
+                    "msg=${control.message ?: "-"}"
             }
 
             is FileTransferControl.Completion -> log.d {
-                "control[$scope] COMPLETION id=${control.transferId} completed=${control.completed} " + "msg=${control.message ?: "-"}"
+                "control[$scope] COMPLETION id=${control.transferId} completed=${control.completed} " +
+                    "msg=${control.message ?: "-"}"
+            }
+
+            is FileTransferControl.DataAck -> log.v {
+                "control[$scope] DATA_ACK id=${control.transferId} bytesReceived=${control.bytesReceived}"
             }
         }
     }
 
     private fun createFileTransferBinding(): ProtocolBinding<FileTransferMessageHandler> {
-        return ProtocolBinding.createSimple(FILE_PROTOCOL_ID) { ch ->
+        return ProtocolBinding.createSimple(FILE_PROTOCOL_ID, P2PChannelHandler { ch ->
             val stream = ch as Stream
             val handler = FileTransferMessageHandler()
             stream.pushHandler(ProtocolMessageHandlerAdapter(stream, handler))
             CompletableFuture.completedFuture(handler)
-        }
+        })
     }
 
-    inner class FileTransferMessageHandler : ProtocolMessageHandler<ByteBuf> {
+    inner class FileTransferMessageHandler(
+    ) : ProtocolMessageHandler<ByteBuf> {
         private var outboundTransfer: OutgoingTransfer? = null
         private val transferJson = Json { ignoreUnknownKeys = true }
+        val activeFuture = CompletableFuture<FileTransferMessageHandler>()
+
         private var state = StreamState.READING_CONTROL
         private var expectedControlLength = -1
         private var controlHeaderBytesRead = 0
@@ -1068,10 +1008,14 @@ actual class P2PEngine actual constructor() {
         private var completionSent: Boolean = false
         private val transferCompletion = CompletableDeferred<FileTransferControl.Completion>()
 
+        private val ackedBytesFlow = MutableStateFlow(0L)
+        private var nextAckAt = ACK_INTERVAL_BYTES
+
         private lateinit var stream: Stream
         private var nettyChannel: io.netty.channel.Channel? = null
 
         private val diskWriteChannel = Channel<ByteArray>(Channel.UNLIMITED)
+        private var diskWriteJob: Job? = null
 
         override fun onActivated(stream: Stream) {
             this.stream = stream
@@ -1080,6 +1024,8 @@ actual class P2PEngine actual constructor() {
                     nettyChannel = ctx.channel()
                 }
             })
+
+            activeFuture.complete(this)
             log.v { "data_stream_activated outbound=${outboundTransfer != null}" }
         }
 
@@ -1095,6 +1041,7 @@ actual class P2PEngine actual constructor() {
             completionSent = false
             streamClosed = false
             if (transferCompletion.isCompleted) {
+                // New handler instances are created per stream, but keep this safe if reused.
                 log.w { "data_initiate_send called with pre-completed completion future id=$transferId" }
             }
 
@@ -1120,13 +1067,13 @@ actual class P2PEngine actual constructor() {
                 StreamState.READING_CONTROL, StreamState.WAITING_FOR_RESPONSE, StreamState.WAITING_FOR_COMPLETION -> readControl(
                     msg
                 )
-
                 StreamState.SENDING_FILE -> readControl(msg)
                 StreamState.RECEIVING_FILE -> readFileBytes(msg)
                 StreamState.CLOSED -> {}
             }
         }
 
+        // Signal the coroutine to finish writing buffered bytes and close
         override fun onClosed(stream: Stream) {
             streamClosed = true
             diskWriteChannel.close()
@@ -1149,7 +1096,9 @@ actual class P2PEngine actual constructor() {
             if (outboundTransfer != null && !transferCompletion.isCompleted) {
                 transferCompletion.complete(
                     FileTransferControl.Completion(
-                        transferId = transferId, completed = false, message = cause?.message ?: "Stream error"
+                        transferId = transferId,
+                        completed = false,
+                        message = cause?.message ?: "Stream error"
                     )
                 )
             }
@@ -1169,84 +1118,59 @@ actual class P2PEngine actual constructor() {
         fun accept(savePath: String) {
             log.i { "data_accept id=$transferId savePath=$savePath" }
             val destination = File(savePath)
-            val partFile = File("$savePath.part")
             destination.parentFile?.mkdirs()
-            partFile.parentFile?.mkdirs()
-            if (partFile.exists() && !partFile.delete()) {
-                log.w { "data_accept could_not_delete_existing_part_file path=${partFile.path}" }
-            }
-
             transferStartMillis = System.currentTimeMillis()
             receivedFileBytes = 0L
-            bytesTransferred = 0L
             state = StreamState.RECEIVING_FILE
 
-            scope.launch(Dispatchers.IO) {
+            // Decoupled disk writing coroutine
+            diskWriteJob = scope.launch(Dispatchers.IO) {
                 try {
-                    FileOutputStream(partFile).use { output ->
-                        val fileLock = output.channel.tryLock()
-                            ?: throw IOException("Failed to acquire file lock for ${partFile.path}")
-                        try {
-                            for (chunk in diskWriteChannel) {
-                                output.write(chunk)
-                                bytesTransferred += chunk.size
+                    destination.outputStream().use { output ->
+                        for (chunk in diskWriteChannel) {
+                            output.write(chunk)
+                            bytesTransferred += chunk.size
 
-                                emitTransferUpdate(
+                            if (bytesTransferred >= nextAckAt) {
+                                writeControl(FileTransferControl.DataAck(
                                     transferId = transferId,
-                                    direction = "INCOMING",
-                                    bytesTransferred = bytesTransferred,
-                                    totalBytes = totalBytes,
-                                    speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
-                                    status = "IN_PROGRESS",
-                                    peerId = remotePeerId,
-                                    filename = fileName
-                                )
+                                    bytesReceived = bytesTransferred
+                                ))
+                                nextAckAt = bytesTransferred + ACK_INTERVAL_BYTES
                             }
-                            output.flush()
-                            output.fd.sync()
-                        } finally {
-                            fileLock.release()
+
+                            emitTransferUpdate(
+                                transferId = transferId,
+                                direction = "INCOMING",
+                                bytesTransferred = bytesTransferred,
+                                totalBytes = totalBytes,
+                                speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
+                                status = "IN_PROGRESS",
+                                peerId = remotePeerId,
+                                filename = fileName
+                            )
                         }
                     }
 
-                    if (bytesTransferred != totalBytes) {
-                        throw IOException("Byte count mismatch: $bytesTransferred/$totalBytes")
-                    }
-
-                    try {
-                        Files.move(
-                            partFile.toPath(),
-                            destination.toPath(),
-                            StandardCopyOption.ATOMIC_MOVE,
-                            StandardCopyOption.REPLACE_EXISTING
-                        )
-                    } catch (_: Exception) {
-                        Files.move(
-                            partFile.toPath(), destination.toPath(), StandardCopyOption.REPLACE_EXISTING
-                        )
-                    }
-
-                    log.i { "data_commit_success id=$transferId path=${destination.path}" }
+                    val completed = bytesTransferred == totalBytes
+                    val failureMessage = if (completed) null else "Received $bytesTransferred/$totalBytes bytes"
                     emitTransferUpdate(
                         transferId = transferId,
                         direction = "INCOMING",
                         bytesTransferred = bytesTransferred,
                         totalBytes = totalBytes,
                         speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
-                        status = "COMPLETED",
+                        status = if (completed) "COMPLETED" else "FAILED",
                         peerId = remotePeerId,
-                        filename = fileName
+                        filename = fileName,
+                        message = failureMessage
                     )
                     incomingTransfers.remove(transferId)
-                    if (sendCompletion(completed = true)) {
+                    if (sendCompletion(completed = completed, message = failureMessage)) {
                         delay(50.milliseconds)
                     }
                     stream.close()
                 } catch (e: Exception) {
-                    log.e(e) { "data_write_failed id=$transferId partPath=${partFile.path}" }
-                    if (partFile.exists() && !partFile.delete()) {
-                        log.w { "data_write_failed could_not_delete_part_file path=${partFile.path}" }
-                    }
                     emitTransferUpdate(
                         transferId = transferId,
                         direction = "INCOMING",
@@ -1338,7 +1262,9 @@ actual class P2PEngine actual constructor() {
                             )
                         )
                         notifyTransferRequestIncoming(
-                            peerId = remotePeerId, fileName = fileName, totalBytes = totalBytes
+                            peerId = remotePeerId,
+                            fileName = fileName,
+                            totalBytes = totalBytes
                         )
                     }
 
@@ -1381,6 +1307,10 @@ actual class P2PEngine actual constructor() {
                             transferCompletion.complete(control)
                         }
                     }
+
+                    is FileTransferControl.DataAck -> {
+                        ackedBytesFlow.update { maxOf(it, control.bytesReceived) }
+                    }
                 }
             } catch (e: Exception) {
                 log.w(e) { "data_control_decode_failed transferId=$transferId payloadSize=${payload.length}" }
@@ -1394,6 +1324,14 @@ actual class P2PEngine actual constructor() {
                 transfer.file.inputStream().use { input ->
                     val buffer = ByteArray(FILE_CHUNK_SIZE)
                     while (isActive) {
+                        val unacked = bytesTransferred - ackedBytesFlow.value
+                        if (unacked >= MAX_UNACKED_BYTES) {
+                            val threshold = bytesTransferred - MAX_UNACKED_BYTES
+                            withTimeout(ACK_TIMEOUT_MILLIS) {
+                                ackedBytesFlow.first { it >= threshold }
+                            }
+                        }
+
                         val read = input.read(buffer)
                         if (read < 0) break
                         val bytes = buffer.copyOf(read)
@@ -1525,13 +1463,16 @@ actual class P2PEngine actual constructor() {
         }
 
         private fun sendCompletion(
-            completed: Boolean, message: String? = null
+            completed: Boolean,
+            message: String? = null
         ): Boolean {
             if (completionSent || streamClosed) return false
             completionSent = true
             writeControl(
                 FileTransferControl.Completion(
-                    transferId = transferId, completed = completed, message = message
+                    transferId = transferId,
+                    completed = completed,
+                    message = message
                 )
             )
             return true
@@ -1551,52 +1492,21 @@ actual class P2PEngine actual constructor() {
     }
 
     private enum class DesktopNotificationLevel {
-        INFO, ERROR
-    }
-
-    private enum class NatReachability {
-        UNKNOWN, PRIVATE, PUBLIC
+        INFO, WARNING, ERROR
     }
 
     private enum class StreamState {
         READING_CONTROL, WAITING_FOR_RESPONSE, SENDING_FILE, WAITING_FOR_COMPLETION, RECEIVING_FILE, CLOSED
     }
 
-    private data class BootstrapRelayEndpoint(
-        val peerId: PeerId,
-        val dialAddresses: List<Multiaddr>
-    )
-
-    private data class BootstrapRelay(
-        val peerId: PeerId,
-        val dialAddresses: List<Multiaddr>
-    ) {
-        fun toCandidateRelay(): RelayTransport.CandidateRelay {
-            return RelayTransport.CandidateRelay(peerId, dialAddresses)
-        }
-    }
-
     private companion object {
-        private val NoRelayManager = object : CircuitHopProtocol.RelayManager {
-            override fun hasReservation(peerId: PeerId): Boolean = false
-
-            override fun createReservation(peerId: PeerId, observedAddress: Multiaddr): Optional<CircuitHopProtocol.Reservation> {
-                return Optional.empty()
-            }
-
-            override fun allowConnection(source: PeerId, destination: PeerId): Optional<CircuitHopProtocol.Reservation> {
-                return Optional.empty()
-            }
-        }
-
         const val DEFAULT_PORT = 4101
         const val FILE_PROTOCOL_ID = "/sharething/files/1.0.0"
         const val FILE_CHUNK_SIZE = 64 * 1024
         const val TRANSFER_COMPLETION_TIMEOUT_MILLIS = 15_000L
         const val MAX_CONTROL_FRAME_BYTES = 1 * 1024 * 1024
-        const val AUTONAT_POLL_INTERVAL_MILLIS = 30_000L
-        const val RELAY_ADDRESS_TTL_MILLIS = 10 * 60 * 1000L
-        const val DEFAULT_RELAY_RESERVATIONS = 1
-        val DEFAULT_BOOTSTRAP_RELAYS: List<String> = emptyList()
+        const val ACK_INTERVAL_BYTES = 1 * 1024 * 1024L
+        const val MAX_UNACKED_BYTES = 4 * 1024 * 1024L
+        const val ACK_TIMEOUT_MILLIS = 30_000L
     }
 }
