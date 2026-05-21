@@ -538,8 +538,14 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _sendFileToPeer(String peerId) async {
-    final result = await FilePicker.platform.pickFiles();
-    final filePath = result?.files.singleOrNull?.path;
+    final String? filePath;
+    if (Platform.isLinux) {
+      if (!mounted) return;
+      filePath = await _pickFileLinux(context);
+    } else {
+      final result = await FilePicker.platform.pickFiles();
+      filePath = result?.files.singleOrNull?.path;
+    }
     if (filePath == null || filePath.isEmpty) {
       return;
     }
@@ -577,6 +583,108 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  Future<String?> _pickFileLinux(BuildContext context) async {
+    for (final tool in ['zenity', 'kdialog', 'yad']) {
+      final which = await Process.run('which', [tool]);
+      if (which.exitCode != 0) continue;
+
+      final ProcessResult result;
+      if (tool == 'zenity') {
+        result = await Process.run('zenity', ['--file-selection', '--title=Select file to send']);
+      } else if (tool == 'kdialog') {
+        result = await Process.run('kdialog', ['--getopenfilename', Platform.environment['HOME'] ?? '/']);
+      } else {
+        result = await Process.run('yad', ['--file-selection', '--title=Select file to send']);
+      }
+
+      if (result.exitCode == 0) {
+        final path = result.stdout.toString().trim();
+        if (path.isNotEmpty) return path;
+      }
+      return null;
+    }
+
+    if (!context.mounted) return null;
+    return _showManualPathDialog(context, title: 'File path to send', hint: 'Enter full path to file');
+  }
+
+  Future<String?> _saveFileLinux(BuildContext context, String suggestedName) async {
+    final home = Platform.environment['HOME'] ?? '/tmp';
+    final suggested = '$home/$suggestedName';
+
+    for (final tool in ['zenity', 'kdialog', 'yad']) {
+      final which = await Process.run('which', [tool]);
+      if (which.exitCode != 0) continue;
+
+      final ProcessResult result;
+      if (tool == 'zenity') {
+        result = await Process.run('zenity', [
+          '--file-selection', '--save', '--confirm-overwrite',
+          '--title=Save incoming file',
+          '--filename=$suggested',
+        ]);
+      } else if (tool == 'kdialog') {
+        result = await Process.run('kdialog', ['--getsavefilename', suggested]);
+      } else {
+        result = await Process.run('yad', [
+          '--file-selection', '--save',
+          '--title=Save incoming file',
+          '--filename=$suggested',
+        ]);
+      }
+
+      if (result.exitCode == 0) {
+        final path = result.stdout.toString().trim();
+        if (path.isNotEmpty) return path;
+      }
+      return null;
+    }
+
+    if (!context.mounted) return null;
+    return _showManualPathDialog(context, title: 'Save file as', initialValue: suggested, hint: 'Enter full path including filename');
+  }
+
+  Future<String?> _showManualPathDialog(
+    BuildContext context, {
+    required String title,
+    String? initialValue,
+    String? hint,
+  }) async {
+    final controller = TextEditingController(text: initialValue ?? '');
+    final result = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(title),
+        content: SizedBox(
+          width: 460,
+          child: TextField(
+            controller: controller,
+            autofocus: true,
+            decoration: InputDecoration(
+              labelText: 'Path',
+              hintText: hint,
+              border: const OutlineInputBorder(),
+            ),
+            onSubmitted: (value) => Navigator.of(ctx).pop(value.trim()),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(null),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(controller.text.trim()),
+            child: const Text('OK'),
+          ),
+        ],
+      ),
+    );
+    controller.dispose();
+    final path = result?.trim();
+    return (path == null || path.isEmpty) ? null : path;
+  }
+
   Future<void> _acceptIncomingRequest(IncomingFileRequest request) async {
     final String? savePath;
     if (Platform.isAndroid) {
@@ -586,6 +694,9 @@ class _MyHomePageState extends State<MyHomePage> {
     } else if (Platform.isIOS) {
       final dir = await const AppStoragePaths().receivedFilesDirectory();
       savePath = '${dir.path}/${request.fileName}';
+    } else if (Platform.isLinux) {
+      if (!mounted) return;
+      savePath = await _saveFileLinux(context, request.fileName);
     } else {
       savePath = await FilePicker.platform.saveFile(
         dialogTitle: 'Save incoming file',
