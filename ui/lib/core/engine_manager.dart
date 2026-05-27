@@ -157,6 +157,27 @@ class EngineManager {
     await _sendDesktopCommand(payload);
   }
 
+  Future<void> sendText({
+    required String targetPeerId,
+    required String text,
+    List<String> knownAddresses = const [],
+  }) async {
+    appLogger.i('engine.sendText targetPeerId=$targetPeerId');
+    final payload = {
+      'type': 'SEND_TEXT',
+      'targetPeerId': targetPeerId,
+      'text': text,
+      'knownAddresses': knownAddresses,
+    };
+
+    if (Platform.isAndroid) {
+      await _sendAndroidCommand(payload);
+      return;
+    }
+
+    await _sendDesktopCommand(payload);
+  }
+
   Future<void> openFileLocation(String path) async {
     if (!Platform.isAndroid) return;
     await _sendAndroidCommand({'type': 'OPEN_FILE_LOCATION', 'path': path});

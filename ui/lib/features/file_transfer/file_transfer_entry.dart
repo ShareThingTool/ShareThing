@@ -1,3 +1,7 @@
+import 'virustotal_service.dart';
+
+export 'virustotal_service.dart' show VtScanResult, VtScanStatus;
+
 enum FileTransferDirection { incoming, outgoing }
 
 enum FileTransferStatus { queued, inProgress, completed, failed }
@@ -16,6 +20,9 @@ class FileTransferEntry {
     this.error,
     this.startedAt,
     this.completedAt,
+    this.vtScanResult,
+    this.blake3Hash,
+    this.textContent,
   });
 
   final String id;
@@ -30,6 +37,9 @@ class FileTransferEntry {
   final String? error;
   final DateTime? startedAt;
   final DateTime? completedAt;
+  final VtScanResult? vtScanResult;
+  final String? blake3Hash;
+  final String? textContent;
 
   double get progress {
     if (totalBytes <= 0) {
@@ -51,6 +61,9 @@ class FileTransferEntry {
     String? error,
     DateTime? startedAt,
     DateTime? completedAt,
+    VtScanResult? vtScanResult,
+    String? blake3Hash,
+    String? textContent,
   }) {
     return FileTransferEntry(
       id: id ?? this.id,
@@ -65,6 +78,9 @@ class FileTransferEntry {
       error: error ?? this.error,
       startedAt: startedAt ?? this.startedAt,
       completedAt: completedAt ?? this.completedAt,
+      vtScanResult: vtScanResult ?? this.vtScanResult,
+      blake3Hash: blake3Hash ?? this.blake3Hash,
+      textContent: textContent ?? this.textContent,
     );
   }
 
@@ -95,6 +111,13 @@ class FileTransferEntry {
       completedAt: json['completedAt'] != null
           ? DateTime.tryParse(json['completedAt'].toString())
           : null,
+      vtScanResult: json['vtScanResult'] != null
+          ? VtScanResult.fromJson(
+              Map<String, dynamic>.from(json['vtScanResult'] as Map),
+            )
+          : null,
+      blake3Hash: json['blake3Hash']?.toString(),
+      textContent: json['textContent']?.toString(),
     );
   }
 
@@ -112,6 +135,11 @@ class FileTransferEntry {
       if (error != null) 'error': error,
       if (startedAt != null) 'startedAt': startedAt!.toIso8601String(),
       if (completedAt != null) 'completedAt': completedAt!.toIso8601String(),
+      if (vtScanResult != null &&
+          vtScanResult!.status != VtScanStatus.scanning)
+        'vtScanResult': vtScanResult!.toJson(),
+      if (blake3Hash != null) 'blake3Hash': blake3Hash,
+      if (textContent != null) 'textContent': textContent,
     };
   }
 }

@@ -36,6 +36,13 @@ sealed class EngineCommand {
     data class RejectFile(
         val transferId: String
     ) : EngineCommand()
+
+    @Serializable
+    @SerialName("SEND_TEXT")
+    data class SendText(
+        val targetPeerId: String,
+        val text: String
+    ) : EngineCommand()
 }
 
 @Serializable
@@ -103,7 +110,9 @@ sealed class EngineEvent {
         val status: String,
         val peerId: String? = null,
         val filename: String? = null,
-        val message: String? = null
+        val message: String? = null,
+        val blake3Hash: String? = null,
+        val textContent: String? = null
     ) : EngineEvent()
 
     @Serializable

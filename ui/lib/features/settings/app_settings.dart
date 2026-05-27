@@ -1,9 +1,15 @@
 import 'dart:io';
 
 class AppSettings {
-  const AppSettings({required this.nickname});
+  const AppSettings({
+    required this.nickname,
+    this.virusTotalApiKey,
+    this.showBlakeHash = false,
+  });
 
   final String nickname;
+  final String? virusTotalApiKey;
+  final bool showBlakeHash;
 
   factory AppSettings.defaults() {
     final hostname = _sanitizeHostname(Platform.localHostname);
@@ -14,22 +20,39 @@ class AppSettings {
 
   factory AppSettings.fromJson(Map<String, dynamic> json) {
     final nickname = json['nickname']?.toString().trim();
+    final vtKey = json['virusTotalApiKey']?.toString().trim();
     return AppSettings(
       nickname: (nickname == null || nickname.isEmpty)
           ? AppSettings.defaults().nickname
           : nickname,
+      virusTotalApiKey: (vtKey == null || vtKey.isEmpty) ? null : vtKey,
+      showBlakeHash: json['showBlakeHash'] as bool? ?? false,
     );
   }
 
   Map<String, dynamic> toJson() {
-    return {'nickname': nickname};
+    return {
+      'nickname': nickname,
+      if (virusTotalApiKey != null) 'virusTotalApiKey': virusTotalApiKey,
+      'showBlakeHash': showBlakeHash,
+    };
   }
 
-  AppSettings copyWith({String? nickname}) {
+  AppSettings copyWith({
+    String? nickname,
+    Object? virusTotalApiKey = _sentinel,
+    bool? showBlakeHash,
+  }) {
     return AppSettings(
       nickname: nickname ?? this.nickname,
+      virusTotalApiKey: virusTotalApiKey == _sentinel
+          ? this.virusTotalApiKey
+          : virusTotalApiKey as String?,
+      showBlakeHash: showBlakeHash ?? this.showBlakeHash,
     );
   }
+
+  static const Object _sentinel = Object();
 
   static String _sanitizeHostname(String hostname) {
     return hostname

@@ -1,7 +1,10 @@
 package com.example.sharething
 
+import android.Manifest
 import android.app.DownloadManager
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import io.flutter.embedding.android.FlutterActivity
@@ -17,8 +20,19 @@ class MainActivity : FlutterActivity() {
         private var eventSink: EventChannel.EventSink? = null
         private val mainHandler = Handler(Looper.getMainLooper())
 
+        private val pendingEvents = ArrayDeque<Map<String, Any?>>()
+        private const val MAX_PENDING = 64
+
         fun emitEvent(payload: Map<String, Any?>) {
-            mainHandler.post { eventSink?.success(payload) }
+            mainHandler.post {
+                val sink = eventSink
+                if (sink != null) {
+                    sink.success(payload)
+                } else {
+                    if (pendingEvents.size >= MAX_PENDING) pendingEvents.removeFirst()
+                    pendingEvents.addLast(payload)
+                }
+            }
         }
     }
 
@@ -48,12 +62,28 @@ class MainActivity : FlutterActivity() {
             .setStreamHandler(object : EventChannel.StreamHandler {
                 override fun onListen(arguments: Any?, sink: EventChannel.EventSink) {
                     eventSink = sink
+                    val buffered = pendingEvents.toList()
+                    pendingEvents.clear()
+                    buffered.forEach { sink.success(it) }
                 }
 
                 override fun onCancel(arguments: Any?) {
                     eventSink = null
                 }
             })
+    }
+
+    override fun onStart() {
+        super.onStart()
+        requestNotificationPermissionIfNeeded()
+    }
+
+    private fun requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
+            }
+        }
     }
 
     private fun handleJsonCommand(
@@ -136,6 +166,23 @@ class MainActivity : FlutterActivity() {
                         result.success(null)
                     } catch (e: Exception) {
                         result.error("REJECT_FILE_FAILED", e.message, null)
+                    }
+                }.start()
+            }
+
+            "SEND_TEXT" -> {
+                val targetPeerId = json.optString("targetPeerId")
+                val text = json.optString("text")
+                val addrsArray = json.optJSONArray("knownAddresses")
+                val knownAddresses = if (addrsArray != null)
+                    (0 until addrsArray.length()).joinToString(";") { addrsArray.getString(it) }
+                else ""
+                Thread {
+                    try {
+                        P2p.sendText(targetPeerId, text, knownAddresses)
+                        result.success(null)
+                    } catch (e: Exception) {
+                        result.error("SEND_TEXT_FAILED", e.message, null)
                     }
                 }.start()
             }

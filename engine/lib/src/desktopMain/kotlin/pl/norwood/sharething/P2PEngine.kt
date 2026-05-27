@@ -36,6 +36,7 @@ import pl.norwood.sharething.data.KnownPeer
 import pl.norwood.sharething.data.OutgoingTransfer
 import pl.norwood.sharething.data.PendingIncomingTransfer
 import pl.norwood.sharething.data.StoredIdentity
+import org.bouncycastle.crypto.digests.Blake3Digest
 import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -180,7 +181,6 @@ actual class P2PEngine actual constructor() {
         val transfer = OutgoingTransfer(
             transferId = transferId,
             targetPeerId = targetPeerId,
-            targetNickname = target.nickname,
             file = file
         )
         log.i {
@@ -258,6 +258,46 @@ actual class P2PEngine actual constructor() {
         } catch (e: Exception) {
             EngineEvent.Error(e.message ?: "Failed to accept transfer")
         }
+    }
+
+    actual fun sendText(targetPeerId: String, text: String): EngineEvent {
+        host ?: return EngineEvent.Error("Desktop node is not running")
+        val target = knownPeers[targetPeerId] ?: return EngineEvent.Error("Unknown peer: $targetPeerId")
+
+        val transferId = UUID.randomUUID().toString()
+        val totalBytes = text.toByteArray(Charsets.UTF_8).size.toLong()
+
+        emitTransferUpdate(
+            transferId = transferId, direction = "OUTGOING",
+            bytesTransferred = 0, totalBytes = totalBytes, speedBps = 0,
+            status = "QUEUED", peerId = targetPeerId, filename = "<text>",
+            textContent = text
+        )
+
+        scope.launch {
+            try {
+                val nodeRef = host ?: throw IllegalStateException("Desktop node is not running")
+                val peerIdObj = PeerId.fromBase58(target.peerId)
+                val addresses = target.addresses.map { Multiaddr(it) }.toTypedArray()
+                val handler = fileBinding.dial(nodeRef, peerIdObj, *addresses).controller.await()
+                handler.initiateTextSend(transferId, targetPeerId, text)
+            } catch (e: Exception) {
+                log.e(e) { "send_text dial_failed id=$transferId target=$targetPeerId" }
+                emitTransferUpdate(
+                    transferId = transferId, direction = "OUTGOING",
+                    bytesTransferred = 0, totalBytes = totalBytes, speedBps = 0,
+                    status = "FAILED", peerId = targetPeerId, filename = "<text>",
+                    message = e.message, textContent = text
+                )
+            }
+        }
+
+        return EngineEvent.TransferUpdate(
+            transferId = transferId, direction = "OUTGOING",
+            bytesTransferred = 0, totalBytes = totalBytes, speedBps = 0,
+            status = "QUEUED", peerId = targetPeerId, filename = "<text>",
+            textContent = text
+        )
     }
 
     actual fun rejectFile(transferId: String): EngineEvent {
@@ -690,13 +730,26 @@ actual class P2PEngine actual constructor() {
             val socket = try {
                 MulticastSocket(port).apply {
                     soTimeout = 1000
-                    if (iface != null) {
-                        joinGroup(InetSocketAddress(group, port), iface)
-                    } else {
-                        joinGroup(group)
+                    // Use the older joinGroup(InetAddress, NetworkInterface) API which is more
+                    // compatible across JVM versions and platforms (macOS, Windows) than the
+                    // SocketAddress variant that can fail silently on some platforms.
+                    try {
+                        if (iface != null) {
+                            joinGroup(group, iface)
+                        } else {
+                            joinGroup(group)
+                        }
+                    } catch (e: Exception) {
+                        log.w(e) { "lan_broadcast_join_failed iface=${iface?.name}, retrying without interface" }
+                        try { joinGroup(group) } catch (e2: Exception) {
+                            log.w(e2) { "lan_broadcast_join_fallback_failed" }
+                        }
                     }
                 }
-            } catch (_: Exception) { return@launch }
+            } catch (e: Exception) {
+                log.w(e) { "lan_broadcast_socket_failed port=$port" }
+                return@launch
+            }
             try {
                 val buf = ByteArray(4096)
                 while (isActive) {
@@ -715,7 +768,7 @@ actual class P2PEngine actual constructor() {
                 }
             } finally {
                 try {
-                    if (iface != null) socket.leaveGroup(InetSocketAddress(group, port), iface)
+                    if (iface != null) socket.leaveGroup(group, iface)
                     else socket.leaveGroup(group)
                 } catch (_: Exception) {}
                 socket.close()
@@ -728,7 +781,10 @@ actual class P2PEngine actual constructor() {
                     if (iface != null) networkInterface = iface
                     timeToLive = 4
                 }
-            } catch (_: Exception) { return@launch }
+            } catch (e: Exception) {
+                log.w(e) { "lan_broadcast_send_socket_failed" }
+                return@launch
+            }
             try {
                 while (isActive) {
                     try {
@@ -843,7 +899,9 @@ actual class P2PEngine actual constructor() {
         status: String,
         peerId: String? = null,
         filename: String? = null,
-        message: String? = null
+        message: String? = null,
+        blake3Hash: String? = null,
+        textContent: String? = null
     ) {
         CommandDispatcher.emit(
             EngineEvent.TransferUpdate(
@@ -855,7 +913,9 @@ actual class P2PEngine actual constructor() {
                 status = status,
                 peerId = peerId,
                 filename = filename,
-                message = message
+                message = message,
+                blake3Hash = blake3Hash,
+                textContent = textContent
             )
         )
         log.d {
@@ -990,6 +1050,9 @@ actual class P2PEngine actual constructor() {
         private val transferJson = Json { ignoreUnknownKeys = true }
         val activeFuture = CompletableFuture<FileTransferMessageHandler>()
 
+        private var outboundHasher: Blake3Digest? = null
+        private var outboundHash: String? = null
+
         private var state = StreamState.READING_CONTROL
         private var expectedControlLength = -1
         private var controlHeaderBytesRead = 0
@@ -1029,6 +1092,25 @@ actual class P2PEngine actual constructor() {
             log.v { "data_stream_activated outbound=${outboundTransfer != null}" }
         }
 
+        fun initiateTextSend(id: String, targetPeerId: String, text: String) {
+            transferId = id
+            remotePeerId = targetPeerId
+            val bytes = text.toByteArray(Charsets.UTF_8)
+            totalBytes = bytes.size.toLong()
+            state = StreamState.WAITING_FOR_RESPONSE
+            val offer = FileTransferControl.Offer(
+                transferId = id,
+                peerId = host?.peerId?.toBase58() ?: "",
+                nickname = nickname,
+                filename = "<text>",
+                totalBytes = totalBytes,
+                textContent = text
+            )
+            logControl(offer, "text-outbound")
+            writeControl(offer)
+            log.i { "text_offer_sent id=$id target=$targetPeerId bytes=$totalBytes" }
+        }
+
         fun initiateSend(transfer: OutgoingTransfer) {
             outboundTransfer = transfer
             transferId = transfer.transferId
@@ -1040,6 +1122,8 @@ actual class P2PEngine actual constructor() {
             transferStartMillis = 0L
             completionSent = false
             streamClosed = false
+            outboundHasher = Blake3Digest(32)
+            outboundHash = null
             if (transferCompletion.isCompleted) {
                 // New handler instances are created per stream, but keep this safe if reused.
                 log.w { "data_initiate_send called with pre-completed completion future id=$transferId" }
@@ -1125,10 +1209,12 @@ actual class P2PEngine actual constructor() {
 
             // Decoupled disk writing coroutine
             diskWriteJob = scope.launch(Dispatchers.IO) {
+                val inboundHasher = Blake3Digest(32)
                 try {
                     destination.outputStream().use { output ->
                         for (chunk in diskWriteChannel) {
                             output.write(chunk)
+                            inboundHasher.update(chunk, 0, chunk.size)
                             bytesTransferred += chunk.size
 
                             if (bytesTransferred >= nextAckAt) {
@@ -1154,6 +1240,11 @@ actual class P2PEngine actual constructor() {
 
                     val completed = bytesTransferred == totalBytes
                     val failureMessage = if (completed) null else "Received $bytesTransferred/$totalBytes bytes"
+                    val blake3Hash = if (completed) {
+                        val hashBytes = ByteArray(32)
+                        inboundHasher.doFinal(hashBytes, 0)
+                        buildString { for (b in hashBytes) append("%02x".format(b.toInt() and 0xFF)) }
+                    } else null
                     emitTransferUpdate(
                         transferId = transferId,
                         direction = "INCOMING",
@@ -1163,10 +1254,11 @@ actual class P2PEngine actual constructor() {
                         status = if (completed) "COMPLETED" else "FAILED",
                         peerId = remotePeerId,
                         filename = fileName,
-                        message = failureMessage
+                        message = failureMessage,
+                        blake3Hash = blake3Hash
                     )
                     incomingTransfers.remove(transferId)
-                    if (sendCompletion(completed = completed, message = failureMessage)) {
+                    if (sendCompletion(completed = completed, message = failureMessage, blake3Hash = blake3Hash)) {
                         delay(50.milliseconds)
                     }
                     stream.close()
@@ -1246,6 +1338,26 @@ actual class P2PEngine actual constructor() {
                         remotePeerId = control.peerId
                         fileName = control.filename
                         totalBytes = control.totalBytes
+
+                        if (control.textContent != null) {
+                            // Auto-accept text transfers — no file path needed
+                            writeControl(FileTransferControl.Response(transferId = transferId, accepted = true))
+                            writeControl(FileTransferControl.Completion(transferId = transferId, completed = true))
+                            emitTransferUpdate(
+                                transferId = transferId, direction = "INCOMING",
+                                bytesTransferred = totalBytes, totalBytes = totalBytes, speedBps = 0,
+                                status = "COMPLETED", peerId = remotePeerId, filename = "<text>",
+                                textContent = control.textContent
+                            )
+                            notifyDesktop(
+                                title = "ShareThing",
+                                text = "Text received from $remotePeerId",
+                                level = DesktopNotificationLevel.INFO
+                            )
+                            stream.close()
+                            return
+                        }
+
                         incomingTransfers[transferId] = PendingIncomingTransfer(
                             transferId = transferId,
                             peerId = remotePeerId,
@@ -1287,6 +1399,22 @@ actual class P2PEngine actual constructor() {
                                 message = control.message ?: "Rejected"
                             )
                             stream.close()
+                            return
+                        }
+
+                        // Text transfer: receiver auto-accepted, we're done
+                        if (outboundTransfer == null && fileName == "<text>") {
+                            emitTransferUpdate(
+                                transferId = transferId,
+                                direction = "OUTGOING",
+                                bytesTransferred = totalBytes,
+                                totalBytes = totalBytes,
+                                speedBps = 0,
+                                status = "COMPLETED",
+                                peerId = remotePeerId,
+                                filename = "<text>"
+                            )
+                            state = StreamState.WAITING_FOR_COMPLETION
                             return
                         }
 
@@ -1334,6 +1462,7 @@ actual class P2PEngine actual constructor() {
 
                         val read = input.read(buffer)
                         if (read < 0) break
+                        outboundHasher?.update(buffer, 0, read)
                         val bytes = buffer.copyOf(read)
                         val buf = Unpooled.wrappedBuffer(bytes)
 
@@ -1359,21 +1488,38 @@ actual class P2PEngine actual constructor() {
                     }
                 }
 
+                outboundHasher?.let {
+                    val hashBytes = ByteArray(32)
+                    it.doFinal(hashBytes, 0)
+                    outboundHash = buildString { for (b in hashBytes) append("%02x".format(b.toInt() and 0xFF)) }
+                }
+                outboundHasher = null
+
                 state = StreamState.WAITING_FOR_COMPLETION
                 val completion = withTimeout(TRANSFER_COMPLETION_TIMEOUT_MILLIS) {
                     transferCompletion.await()
                 }
 
+                val hashMismatch = outboundHash != null
+                    && completion.blake3Hash != null
+                    && outboundHash != completion.blake3Hash
+                val finalCompleted = completion.completed && !hashMismatch
+                val finalMessage = when {
+                    hashMismatch -> "Hash mismatch: sender=${outboundHash}, receiver=${completion.blake3Hash}"
+                    !completion.completed -> completion.message
+                    else -> null
+                }
                 emitTransferUpdate(
                     transferId = transfer.transferId,
                     direction = "OUTGOING",
                     bytesTransferred = bytesTransferred,
                     totalBytes = transfer.file.length(),
                     speedBps = calculateSpeed(bytesTransferred, transferStartMillis),
-                    status = if (completion.completed) "COMPLETED" else "FAILED",
+                    status = if (finalCompleted) "COMPLETED" else "FAILED",
                     peerId = transfer.targetPeerId,
                     filename = transfer.file.name,
-                    message = if (completion.completed) null else completion.message
+                    message = finalMessage,
+                    blake3Hash = if (finalCompleted) outboundHash else null
                 )
                 log.i { "data_send_done id=${transfer.transferId} status=${if (completion.completed) "COMPLETED" else "FAILED"}" }
                 stream.close()
@@ -1464,7 +1610,8 @@ actual class P2PEngine actual constructor() {
 
         private fun sendCompletion(
             completed: Boolean,
-            message: String? = null
+            message: String? = null,
+            blake3Hash: String? = null
         ): Boolean {
             if (completionSent || streamClosed) return false
             completionSent = true
@@ -1472,7 +1619,8 @@ actual class P2PEngine actual constructor() {
                 FileTransferControl.Completion(
                     transferId = transferId,
                     completed = completed,
-                    message = message
+                    message = message,
+                    blake3Hash = blake3Hash
                 )
             )
             return true

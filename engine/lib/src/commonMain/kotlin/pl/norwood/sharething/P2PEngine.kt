@@ -14,4 +14,6 @@ expect class P2PEngine() {
     fun acceptFile(transferId: String, savePath: String): EngineEvent
 
     fun rejectFile(transferId: String): EngineEvent
+
+    fun sendText(targetPeerId: String, text: String): EngineEvent
 }

@@ -8,7 +8,8 @@ sealed class FileTransferControl {
     @Serializable
     @SerialName("OFFER")
     data class Offer(
-        val transferId: String, val peerId: String, val nickname: String, val filename: String, val totalBytes: Long
+        val transferId: String, val peerId: String, val nickname: String, val filename: String, val totalBytes: Long,
+        val textContent: String? = null
     ) : FileTransferControl()
 
     @Serializable
@@ -20,7 +21,8 @@ sealed class FileTransferControl {
     @Serializable
     @SerialName("COMPLETION")
     data class Completion(
-        val transferId: String, val completed: Boolean, val message: String? = null
+        val transferId: String, val completed: Boolean, val message: String? = null,
+        val blake3Hash: String? = null
     ) : FileTransferControl()
 
     @Serializable

@@ -26,4 +26,8 @@ actual class P2PEngine actual constructor() {
     actual fun rejectFile(transferId: String): EngineEvent {
         return EngineEvent.Error("Android engine is provided by the Go bridge in the Flutter app.")
     }
+
+    actual fun sendText(targetPeerId: String, text: String): EngineEvent {
+        return EngineEvent.Error("Android engine is provided by the Go bridge in the Flutter app.")
+    }
 }

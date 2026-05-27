@@ -54,6 +54,12 @@ object CommandDispatcher {
                         engine.rejectFile(command.transferId)
                     )
                 )
+
+                is EngineCommand.SendText -> DispatchResult(
+                    eventJson = encodeEvent(
+                        engine.sendText(command.targetPeerId, command.text)
+                    )
+                )
             }
         } catch (e: Exception) {
             log.e(e) { "dispatch_failed inputBytes=${input.length}" }

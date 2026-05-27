@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,6 +24,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	"github.com/multiformats/go-multiaddr"
+	"lukechampine.com/blake3"
 )
 
 const (
@@ -93,6 +95,8 @@ type controlMsg struct {
 	Completed     *bool  `json:"completed,omitempty"`
 	Message       string `json:"message,omitempty"`
 	BytesReceived int64  `json:"bytesReceived,omitempty"`
+	Blake3Hash    string `json:"blake3Hash,omitempty"`
+	TextContent   string `json:"textContent,omitempty"`
 }
 
 type discoveryRegisterRequest struct {
@@ -300,11 +304,11 @@ func SendFile(peerID, filePath, addrsStr string) error {
 	totalBytes := info.Size()
 	filename := filepath.Base(filePath)
 
-	emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "QUEUED", peerID, filename, "")
+	emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "QUEUED", peerID, filename, "", "")
 
 	go func() {
 		if err := doSendFile(h, kp, transferID, filePath, filename, totalBytes); err != nil {
-			emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "FAILED", peerID, filename, err.Error())
+			emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "FAILED", peerID, filename, err.Error(), "")
 		}
 	}()
 	return nil
@@ -396,7 +400,7 @@ func doSendFile(h host.Host, kp *knownPeer, transferID, filePath, filename strin
 		if msg == "" {
 			msg = "rejected"
 		}
-		emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "FAILED", kp.PeerID, filename, msg)
+		emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "FAILED", kp.PeerID, filename, msg, "")
 		return nil
 	}
 
@@ -438,10 +442,11 @@ func doSendFile(h host.Host, kp *knownPeer, transferID, filePath, filename strin
 		}
 	}
 
+	hasher := blake3.New(32, nil)
 	buf := make([]byte, 64*1024)
 	var sent, ackedBytes int64
 	start := time.Now()
-	emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "IN_PROGRESS", kp.PeerID, filename, "")
+	emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "IN_PROGRESS", kp.PeerID, filename, "", "")
 
 	for {
 		if err := drainACKs(&ackedBytes); err != nil {
@@ -465,11 +470,12 @@ func doSendFile(h host.Host, kp *knownPeer, transferID, filePath, filename strin
 
 		n, readErr := f.Read(buf)
 		if n > 0 {
+			hasher.Write(buf[:n])
 			if _, writeErr := stream.Write(buf[:n]); writeErr != nil {
 				return fmt.Errorf("send: %w", writeErr)
 			}
 			sent += int64(n)
-			emitTransferUpdate(transferID, "OUTGOING", sent, totalBytes, calcSpeed(sent, start), "IN_PROGRESS", kp.PeerID, filename, "")
+			emitTransferUpdate(transferID, "OUTGOING", sent, totalBytes, calcSpeed(sent, start), "IN_PROGRESS", kp.PeerID, filename, "", "")
 		}
 		if readErr == io.EOF {
 			break
@@ -479,6 +485,7 @@ func doSendFile(h host.Host, kp *knownPeer, transferID, filePath, filename strin
 		}
 	}
 
+	sentHash := hex.EncodeToString(hasher.Sum(nil))
 	stream.CloseWrite()
 
 	for {
@@ -489,14 +496,135 @@ func doSendFile(h host.Host, kp *knownPeer, transferID, filePath, filename strin
 		if res.msg.Type == "COMPLETION" {
 			status := "COMPLETED"
 			msg := ""
+			finalHash := ""
 			if res.msg.Completed == nil || !*res.msg.Completed {
 				status = "FAILED"
 				msg = res.msg.Message
+			} else if res.msg.Blake3Hash != "" && res.msg.Blake3Hash != sentHash {
+				status = "FAILED"
+				msg = fmt.Sprintf("hash mismatch: sender=%s receiver=%s", sentHash, res.msg.Blake3Hash)
+			} else {
+				finalHash = sentHash
 			}
-			emitTransferUpdate(transferID, "OUTGOING", sent, totalBytes, 0, status, kp.PeerID, filename, msg)
+			emitTransferUpdate(transferID, "OUTGOING", sent, totalBytes, 0, status, kp.PeerID, filename, msg, finalHash)
 			return nil
 		}
 	}
+}
+
+func SendText(peerID, text, addrsStr string) error {
+	h := node
+	if h == nil {
+		return fmt.Errorf("node not running")
+	}
+
+	peersMu.RLock()
+	kp := knownPeers[peerID]
+	peersMu.RUnlock()
+
+	if kp == nil {
+		pid, err := peer.Decode(peerID)
+		if err != nil {
+			return fmt.Errorf("unknown peer: %s", peerID)
+		}
+
+		addrs := h.Peerstore().Addrs(pid)
+		if len(addrs) == 0 && addrsStr != "" {
+			for _, s := range strings.Split(addrsStr, ";") {
+				s = strings.TrimSpace(s)
+				if s == "" {
+					continue
+				}
+				ma, err := multiaddr.NewMultiaddr(s)
+				if err == nil {
+					addrs = append(addrs, ma)
+				}
+			}
+		}
+
+		if len(addrs) == 0 {
+			return fmt.Errorf("unknown peer: %s", peerID)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: addrs}); err != nil {
+			return fmt.Errorf("could not connect to peer: %w", err)
+		}
+
+		var addrStrs []string
+		for _, a := range addrs {
+			addrStrs = append(addrStrs, fmt.Sprintf("%s/p2p/%s", a, peerID))
+		}
+		upsertPeer(peerID, peerID, addrStrs)
+
+		peersMu.RLock()
+		kp = knownPeers[peerID]
+		peersMu.RUnlock()
+	}
+
+	transferID := newUUID()
+	totalBytes := int64(len([]byte(text)))
+
+	emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "QUEUED", peerID, "<text>", "", "")
+
+	go func() {
+		if err := doSendText(h, kp, transferID, text, totalBytes); err != nil {
+			emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "FAILED", peerID, "<text>", err.Error(), "")
+		}
+	}()
+	return nil
+}
+
+func doSendText(h host.Host, kp *knownPeer, transferID, text string, totalBytes int64) error {
+	pid, err := peer.Decode(kp.PeerID)
+	if err != nil {
+		return fmt.Errorf("peer id: %w", err)
+	}
+
+	dialAddrs := parseDialAddrs(kp.Addresses, pid)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: dialAddrs}); err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+
+	stream, err := h.NewStream(ctx, pid, fileProtocol)
+	if err != nil {
+		return fmt.Errorf("stream: %w", err)
+	}
+	defer stream.Close()
+
+	offer := controlMsg{
+		Type:        "OFFER",
+		TransferID:  transferID,
+		PeerID:      h.ID().String(),
+		Nickname:    nodeNickname,
+		Filename:    "<text>",
+		TotalBytes:  totalBytes,
+		TextContent: text,
+	}
+	if err := writeControl(stream, offer); err != nil {
+		return fmt.Errorf("offer: %w", err)
+	}
+
+	var resp controlMsg
+	if err := readControl(stream, &resp); err != nil {
+		return fmt.Errorf("response: %w", err)
+	}
+	if resp.Accepted == nil || !*resp.Accepted {
+		msg := resp.Message
+		if msg == "" {
+			msg = "rejected"
+		}
+		emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "FAILED", kp.PeerID, "<text>", msg, "")
+		return nil
+	}
+
+	emitTransferUpdateWithText(transferID, "OUTGOING", totalBytes, totalBytes, 0, "COMPLETED", kp.PeerID, "<text>", "", "", text)
+	return nil
 }
 
 func handleIncomingStream(stream network.Stream) {
@@ -506,6 +634,14 @@ func handleIncomingStream(stream network.Stream) {
 
 	var offer controlMsg
 	if err := readControl(stream, &offer); err != nil || offer.Type != "OFFER" {
+		return
+	}
+
+	if offer.TextContent != "" {
+		boolTrue := true
+		writeControl(stream, controlMsg{Type: "RESPONSE", TransferID: offer.TransferID, Accepted: &boolTrue})
+		totalBytes := int64(len([]byte(offer.TextContent)))
+		emitTransferUpdateWithText(offer.TransferID, "INCOMING", totalBytes, totalBytes, 0, "COMPLETED", remotePeerID, "<text>", "", "", offer.TextContent)
 		return
 	}
 
@@ -548,7 +684,7 @@ func handleIncomingStream(stream network.Stream) {
 	if !decision.accepted {
 		boolFalse := false
 		writeControl(stream, controlMsg{Type: "RESPONSE", TransferID: offer.TransferID, Accepted: &boolFalse, Message: "Rejected by user"})
-		emitTransferUpdate(offer.TransferID, "INCOMING", 0, offer.TotalBytes, 0, "FAILED", remotePeerID, offer.Filename, "Rejected by user")
+		emitTransferUpdate(offer.TransferID, "INCOMING", 0, offer.TotalBytes, 0, "FAILED", remotePeerID, offer.Filename, "Rejected by user", "")
 		return
 	}
 
@@ -569,7 +705,7 @@ func receiveFile(stream network.Stream, transferID, peerID, filename string, tot
 	if err := os.MkdirAll(filepath.Dir(savePath), 0755); err != nil {
 		boolFalse := false
 		writeControl(stream, controlMsg{Type: "COMPLETION", TransferID: transferID, Completed: &boolFalse, Message: err.Error()})
-		emitTransferUpdate(transferID, "INCOMING", 0, totalBytes, 0, "FAILED", peerID, filename, err.Error())
+		emitTransferUpdate(transferID, "INCOMING", 0, totalBytes, 0, "FAILED", peerID, filename, err.Error(), "")
 		return
 	}
 
@@ -577,15 +713,16 @@ func receiveFile(stream network.Stream, transferID, peerID, filename string, tot
 	if err != nil {
 		boolFalse := false
 		writeControl(stream, controlMsg{Type: "COMPLETION", TransferID: transferID, Completed: &boolFalse, Message: err.Error()})
-		emitTransferUpdate(transferID, "INCOMING", 0, totalBytes, 0, "FAILED", peerID, filename, err.Error())
+		emitTransferUpdate(transferID, "INCOMING", 0, totalBytes, 0, "FAILED", peerID, filename, err.Error(), "")
 		return
 	}
 
+	hasher := blake3.New(32, nil)
 	buf := make([]byte, 64*1024)
 	var received int64
 	var nextAckAt int64 = ackInterval
 	start := time.Now()
-	emitTransferUpdate(transferID, "INCOMING", 0, totalBytes, 0, "IN_PROGRESS", peerID, filename, "")
+	emitTransferUpdate(transferID, "INCOMING", 0, totalBytes, 0, "IN_PROGRESS", peerID, filename, "", "")
 
 	var writeErr error
 	for received < totalBytes {
@@ -595,6 +732,7 @@ func receiveFile(stream network.Stream, transferID, peerID, filename string, tot
 		}
 		n, readErr := stream.Read(buf[:toRead])
 		if n > 0 {
+			hasher.Write(buf[:n])
 			if _, we := f.Write(buf[:n]); we != nil {
 				writeErr = we
 				break
@@ -604,7 +742,7 @@ func receiveFile(stream network.Stream, transferID, peerID, filename string, tot
 				writeControl(stream, controlMsg{Type: "DATA_ACK", TransferID: transferID, BytesReceived: received})
 				nextAckAt = received + ackInterval
 			}
-			emitTransferUpdate(transferID, "INCOMING", received, totalBytes, calcSpeed(received, start), "IN_PROGRESS", peerID, filename, "")
+			emitTransferUpdate(transferID, "INCOMING", received, totalBytes, calcSpeed(received, start), "IN_PROGRESS", peerID, filename, "", "")
 		}
 		if readErr == io.EOF {
 			break
@@ -622,7 +760,7 @@ func receiveFile(stream network.Stream, transferID, peerID, filename string, tot
 		os.Remove(partPath)
 		boolFalse := false
 		writeControl(stream, controlMsg{Type: "COMPLETION", TransferID: transferID, Completed: &boolFalse, Message: writeErr.Error()})
-		emitTransferUpdate(transferID, "INCOMING", received, totalBytes, 0, "FAILED", peerID, filename, writeErr.Error())
+		emitTransferUpdate(transferID, "INCOMING", received, totalBytes, 0, "FAILED", peerID, filename, writeErr.Error(), "")
 		return
 	}
 
@@ -630,13 +768,14 @@ func receiveFile(stream network.Stream, transferID, peerID, filename string, tot
 		os.Remove(partPath)
 		boolFalse := false
 		writeControl(stream, controlMsg{Type: "COMPLETION", TransferID: transferID, Completed: &boolFalse, Message: err.Error()})
-		emitTransferUpdate(transferID, "INCOMING", received, totalBytes, 0, "FAILED", peerID, filename, err.Error())
+		emitTransferUpdate(transferID, "INCOMING", received, totalBytes, 0, "FAILED", peerID, filename, err.Error(), "")
 		return
 	}
 
+	receivedHash := hex.EncodeToString(hasher.Sum(nil))
 	boolTrue := true
-	writeControl(stream, controlMsg{Type: "COMPLETION", TransferID: transferID, Completed: &boolTrue})
-	emitTransferUpdate(transferID, "INCOMING", received, totalBytes, 0, "COMPLETED", peerID, filename, "")
+	writeControl(stream, controlMsg{Type: "COMPLETION", TransferID: transferID, Completed: &boolTrue, Blake3Hash: receivedHash})
+	emitTransferUpdate(transferID, "INCOMING", received, totalBytes, 0, "COMPLETED", peerID, filename, "", receivedHash)
 }
 
 type mdnsNotifee struct{ h host.Host }
@@ -917,7 +1056,11 @@ func emitJSON(v map[string]interface{}) {
 	eventListener.OnEvent(string(b))
 }
 
-func emitTransferUpdate(transferID, direction string, bytesTransferred, totalBytes, speedBps int64, status, peerID, filename, message string) {
+func emitTransferUpdate(transferID, direction string, bytesTransferred, totalBytes, speedBps int64, status, peerID, filename, message, blake3Hash string) {
+	emitTransferUpdateWithText(transferID, direction, bytesTransferred, totalBytes, speedBps, status, peerID, filename, message, blake3Hash, "")
+}
+
+func emitTransferUpdateWithText(transferID, direction string, bytesTransferred, totalBytes, speedBps int64, status, peerID, filename, message, blake3Hash, textContent string) {
 	ev := map[string]interface{}{
 		"type":             "TRANSFER_UPDATE",
 		"transferId":       transferID,
@@ -931,6 +1074,12 @@ func emitTransferUpdate(transferID, direction string, bytesTransferred, totalByt
 	}
 	if message != "" {
 		ev["message"] = message
+	}
+	if blake3Hash != "" {
+		ev["blake3Hash"] = blake3Hash
+	}
+	if textContent != "" {
+		ev["textContent"] = textContent
 	}
 	emitJSON(ev)
 }

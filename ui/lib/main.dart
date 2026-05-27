@@ -13,6 +13,7 @@ import 'features/discovery/discovered_peer.dart';
 import 'features/file_transfer/file_transfer_entry.dart';
 import 'features/file_transfer/incoming_file_request.dart';
 import 'features/file_transfer/transfer_history_repository.dart';
+import 'features/file_transfer/virustotal_service.dart';
 import 'features/friends/friend.dart';
 import 'features/friends/friends_repository.dart';
 import 'features/settings/app_settings.dart';
@@ -459,6 +460,8 @@ class _MyHomePageState extends State<MyHomePage> {
 
         final existing = _transfers[transferId];
         final now = DateTime.now();
+        final incomingHash = event['blake3Hash']?.toString();
+        final incomingText = event['textContent']?.toString();
         final updated = FileTransferEntry(
           id: transferId,
           direction: direction,
@@ -475,7 +478,7 @@ class _MyHomePageState extends State<MyHomePage> {
           error: status == FileTransferStatus.failed
               ? (event['message']?.toString() ?? existing?.error)
               : existing?.error,
-          localPath: _pendingSavePaths[transferId] ?? existing?.localPath,
+          localPath: _pendingSavePaths[transferId] ?? event['localPath']?.toString() ?? existing?.localPath,
           startedAt: existing?.startedAt ??
               (status == FileTransferStatus.queued ||
                       status == FileTransferStatus.inProgress
@@ -485,6 +488,12 @@ class _MyHomePageState extends State<MyHomePage> {
                   status == FileTransferStatus.failed)
               ? (existing?.completedAt ?? now)
               : existing?.completedAt,
+          blake3Hash: (incomingHash != null && incomingHash.isNotEmpty)
+              ? incomingHash
+              : existing?.blake3Hash,
+          textContent: (incomingText != null && incomingText.isNotEmpty)
+              ? incomingText
+              : existing?.textContent,
         );
 
         final terminal = status == FileTransferStatus.completed ||
@@ -570,6 +579,47 @@ class _MyHomePageState extends State<MyHomePage> {
       );
     } catch (error) {
       appLogger.e('ui.sendFile.failed', error: error);
+      if (!mounted) return;
+      setState(() {
+        _errorMessage = '$error';
+      });
+    } finally {
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+    }
+  }
+
+  Future<void> _sendTextToPeer(String peerId) async {
+    if (!mounted) return;
+    final text = await showDialog<String>(
+      context: context,
+      builder: (ctx) => _SendTextDialog(),
+    );
+    if (text == null || text.isEmpty) return;
+
+    setState(() {
+      _busy = true;
+      _errorMessage = null;
+    });
+
+    final knownAddresses = {
+      ...?_discoveredPeers[peerId]?.addresses,
+      for (final f in _friends)
+        if (f.peerId == peerId) ...f.addresses,
+    }.toList(growable: false);
+
+    try {
+      appLogger.i('ui.sendText targetPeerId=$peerId');
+      await widget.engine.sendText(
+        targetPeerId: peerId,
+        text: text,
+        knownAddresses: knownAddresses,
+      );
+    } catch (error) {
+      appLogger.e('ui.sendText.failed', error: error);
       if (!mounted) return;
       setState(() {
         _errorMessage = '$error';
@@ -769,6 +819,65 @@ class _MyHomePageState extends State<MyHomePage> {
     }
   }
 
+  Future<void> _scanWithVirusTotal(String transferId) async {
+    final transfer = _transfers[transferId];
+    final localPath = transfer?.localPath;
+    final apiKey = _settings.virusTotalApiKey;
+    if (transfer == null || localPath == null || apiKey == null) return;
+
+    setState(() {
+      _transfers = {
+        ..._transfers,
+        transferId: transfer.copyWith(
+          vtScanResult: const VtScanResult(status: VtScanStatus.scanning),
+        ),
+      };
+    });
+
+    try {
+      final result = await VirusTotalService.scan(
+        localPath,
+        apiKey,
+        onStatus: (status) {
+          if (!mounted) return;
+          setState(() {
+            _transfers = {
+              ..._transfers,
+              if (_transfers.containsKey(transferId))
+                transferId: _transfers[transferId]!.copyWith(
+                  vtScanResult: VtScanResult(status: status),
+                ),
+            };
+          });
+        },
+      );
+      if (!mounted) return;
+      setState(() {
+        _transfers = {
+          ..._transfers,
+          if (_transfers.containsKey(transferId))
+            transferId: _transfers[transferId]!.copyWith(vtScanResult: result),
+        };
+      });
+    } catch (e) {
+      appLogger.e('virustotal.scan.failed', error: e);
+      if (!mounted) return;
+      setState(() {
+        _transfers = {
+          ..._transfers,
+          if (_transfers.containsKey(transferId))
+            transferId: _transfers[transferId]!.copyWith(
+              vtScanResult: VtScanResult(
+                status: VtScanStatus.error,
+                errorMessage: e.toString().replaceFirst('Exception: ', ''),
+              ),
+            ),
+        };
+      });
+    }
+    unawaited(_saveTransferHistory());
+  }
+
   String? _validateFriend(
     String peerId,
     String nickname, {
@@ -856,6 +965,19 @@ class _MyHomePageState extends State<MyHomePage> {
         .where((candidate) => candidate.peerId != friend.peerId)
         .toList(growable: false);
     await _saveFriends(updatedFriends);
+  }
+
+  Future<void> _showSettingsPopup() async {
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => _SettingsPopup(
+        initialVtKey: _settings.virusTotalApiKey,
+        showBlakeHash: _settings.showBlakeHash,
+        onSave: (vtKey, showBlake) => _saveSettings(
+          _settings.copyWith(virusTotalApiKey: vtKey, showBlakeHash: showBlake),
+        ),
+      ),
+    );
   }
 
   Future<void> _showNicknameEditor() async {
@@ -1057,6 +1179,14 @@ class _MyHomePageState extends State<MyHomePage> {
                 label: const Text('Send File'),
               ),
               OutlinedButton.icon(
+                key: ValueKey('friend-sendtext-${friend.peerId}'),
+                onPressed: _busy || !_running
+                    ? null
+                    : () => _sendTextToPeer(friend.peerId),
+                icon: const Icon(Icons.text_snippet_outlined),
+                label: const Text('Send Text'),
+              ),
+              OutlinedButton.icon(
                 key: ValueKey('friend-edit-${friend.peerId}'),
                 onPressed: () => _showFriendEditor(initialFriend: friend),
                 icon: const Icon(Icons.edit_outlined),
@@ -1169,6 +1299,14 @@ class _MyHomePageState extends State<MyHomePage> {
                     : () => _sendFileToPeer(peer.peerId),
                 icon: const Icon(Icons.upload_file_outlined),
                 label: const Text('Send File'),
+              ),
+              OutlinedButton.icon(
+                key: ValueKey('discovered-sendtext-${peer.peerId}'),
+                onPressed: _busy || !_running
+                    ? null
+                    : () => _sendTextToPeer(peer.peerId),
+                icon: const Icon(Icons.text_snippet_outlined),
+                label: const Text('Send Text'),
               ),
               if (!isSaved)
                 OutlinedButton.icon(
@@ -1425,7 +1563,7 @@ class _MyHomePageState extends State<MyHomePage> {
               ],
             ],
           ),
-          if (active) ...[
+          if (active && transfer.fileName != '<text>') ...[
             const SizedBox(height: 8),
             LinearProgressIndicator(value: transfer.progress),
             const SizedBox(height: 4),
@@ -1441,28 +1579,190 @@ class _MyHomePageState extends State<MyHomePage> {
               style: TextStyle(color: colors.error, fontSize: 12),
             ),
           ],
-          if (transfer.status == FileTransferStatus.completed &&
+          if (transfer.textContent != null) ...[
+            const SizedBox(height: 8),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: colors.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: SelectableText(
+                transfer.textContent!,
+                style: const TextStyle(fontSize: 13),
+              ),
+            ),
+          ],
+          if (_settings.showBlakeHash && transfer.blake3Hash != null) ...[
+            const SizedBox(height: 6),
+            Row(
+              children: [
+                Icon(Icons.tag, size: 13, color: colors.onSurfaceVariant),
+                const SizedBox(width: 4),
+                Expanded(
+                  child: SelectableText(
+                    transfer.blake3Hash!,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontFamily: 'monospace',
+                      color: colors.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ],
+          if (transfer.fileName != '<text>' &&
+              transfer.status == FileTransferStatus.completed &&
               transfer.direction == FileTransferDirection.incoming &&
               transfer.localPath != null) ...[
             const SizedBox(height: 4),
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton.icon(
-                onPressed: () => unawaited(
-                  _openFileLocation(context, transfer.localPath!),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.end,
+              children: [
+                TextButton.icon(
+                  onPressed: () => unawaited(
+                    _openFileLocation(context, transfer.localPath!),
+                  ),
+                  icon: const Icon(Icons.folder_open_outlined, size: 16),
+                  label: Text(_showInFilesLabel),
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 4,
+                    ),
+                    tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  ),
                 ),
-                icon: const Icon(Icons.folder_open_outlined, size: 16),
-                label: Text(_showInFilesLabel),
-                style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-              ),
+                ..._buildVtScanWidget(context, transfer),
+              ],
             ),
           ],
         ],
       ),
     );
+  }
+
+  List<Widget> _buildVtScanWidget(
+    BuildContext context,
+    FileTransferEntry transfer,
+  ) {
+    final vt = transfer.vtScanResult;
+    final apiKey = _settings.virusTotalApiKey;
+    final colors = Theme.of(context).colorScheme;
+
+    if (vt?.status == VtScanStatus.scanning) {
+      return [
+        const SizedBox(width: 8),
+        const SizedBox(
+          width: 12,
+          height: 12,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        const SizedBox(width: 6),
+        Text('Scanning...', style: TextStyle(fontSize: 12, color: colors.onSurfaceVariant)),
+      ];
+    }
+
+    if (vt?.status == VtScanStatus.uploading) {
+      return [
+        const SizedBox(width: 8),
+        const SizedBox(
+          width: 12,
+          height: 12,
+          child: CircularProgressIndicator(strokeWidth: 2),
+        ),
+        const SizedBox(width: 6),
+        Text('Uploading...', style: TextStyle(fontSize: 12, color: colors.onSurfaceVariant)),
+      ];
+    }
+
+    if (vt != null && vt.status != VtScanStatus.none && vt.status != VtScanStatus.error) {
+      final (label, color, icon) = switch (vt.status) {
+        VtScanStatus.clean => (
+          'Clean (${vt.totalEngines - vt.malicious - vt.suspicious}/${vt.totalEngines})',
+          Colors.green,
+          Icons.check_circle_outline,
+        ),
+        VtScanStatus.suspicious => (
+          'Suspicious ${vt.suspicious}/${vt.totalEngines}',
+          Colors.orange,
+          Icons.warning_amber_outlined,
+        ),
+        VtScanStatus.malicious => (
+          'Malicious ${vt.malicious}/${vt.totalEngines}',
+          colors.error,
+          Icons.dangerous_outlined,
+        ),
+        _ => ('Unknown', colors.onSurfaceVariant, Icons.help_outline),
+      };
+      return [
+        const SizedBox(width: 8),
+        Icon(icon, size: 14, color: color),
+        const SizedBox(width: 4),
+        Text(label, style: TextStyle(fontSize: 12, color: color)),
+        if (vt.permalink != null) ...[
+          const SizedBox(width: 4),
+          TextButton(
+            onPressed: () async {
+              await Clipboard.setData(ClipboardData(text: vt.permalink!));
+              if (!context.mounted) return;
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Report link copied')),
+              );
+            },
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            child: const Text('Copy Link', style: TextStyle(fontSize: 12)),
+          ),
+        ],
+      ];
+    }
+
+    if (vt?.status == VtScanStatus.error) {
+      return [
+        const SizedBox(width: 8),
+        Icon(Icons.error_outline, size: 14, color: colors.error),
+        const SizedBox(width: 4),
+        Flexible(
+          child: Text(
+            vt!.errorMessage ?? 'Scan failed',
+            style: TextStyle(fontSize: 12, color: colors.error),
+            overflow: TextOverflow.ellipsis,
+          ),
+        ),
+        if (apiKey != null) ...[
+          const SizedBox(width: 4),
+          TextButton(
+            onPressed: () => unawaited(_scanWithVirusTotal(transfer.id)),
+            style: TextButton.styleFrom(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+              tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+            ),
+            child: const Text('Retry', style: TextStyle(fontSize: 12)),
+          ),
+        ],
+      ];
+    }
+
+    if (apiKey != null) {
+      return [
+        TextButton.icon(
+          onPressed: () => unawaited(_scanWithVirusTotal(transfer.id)),
+          icon: const Icon(Icons.shield_outlined, size: 16),
+          label: const Text('Scan with VirusTotal'),
+          style: TextButton.styleFrom(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          ),
+        ),
+      ];
+    }
+
+    return const [];
   }
 
   String _formatBytes(int bytes) {
@@ -1567,7 +1867,16 @@ class _MyHomePageState extends State<MyHomePage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('ShareThing')),
+      appBar: AppBar(
+        centerTitle: false,
+        title: const Text('ShareThing'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: _showSettingsPopup,
+          ),
+        ],
+      ),
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.all(16),
@@ -1758,6 +2067,143 @@ class _FriendEditorDialogState extends State<_FriendEditorDialog> {
             ));
           },
           child: Text(isEditing ? 'Save' : 'Add'),
+        ),
+      ],
+    );
+  }
+}
+
+class _SendTextDialog extends StatefulWidget {
+  @override
+  State<_SendTextDialog> createState() => _SendTextDialogState();
+}
+
+class _SendTextDialogState extends State<_SendTextDialog> {
+  final _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Send Text'),
+      content: SizedBox(
+        width: 460,
+        child: TextField(
+          controller: _controller,
+          autofocus: true,
+          maxLines: 8,
+          minLines: 3,
+          decoration: const InputDecoration(
+            hintText: 'Type or paste text here...',
+            border: OutlineInputBorder(),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(null),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final text = _controller.text.trim();
+            if (text.isEmpty) return;
+            Navigator.of(context).pop(text);
+          },
+          child: const Text('Send'),
+        ),
+      ],
+    );
+  }
+}
+
+class _SettingsPopup extends StatefulWidget {
+  const _SettingsPopup({
+    required this.initialVtKey,
+    required this.showBlakeHash,
+    required this.onSave,
+  });
+
+  final String? initialVtKey;
+  final bool showBlakeHash;
+  final void Function(String? vtKey, bool showBlake) onSave;
+
+  @override
+  State<_SettingsPopup> createState() => _SettingsPopupState();
+}
+
+class _SettingsPopupState extends State<_SettingsPopup> {
+  late final TextEditingController _vtController;
+  late bool _showBlake;
+  bool _vtKeyVisible = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _vtController = TextEditingController(text: widget.initialVtKey ?? '');
+    _showBlake = widget.showBlakeHash;
+  }
+
+  @override
+  void dispose() {
+    _vtController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Settings'),
+      content: SizedBox(
+        width: 420,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
+              controller: _vtController,
+              obscureText: !_vtKeyVisible,
+              decoration: InputDecoration(
+                labelText: 'VirusTotal API Key',
+                hintText: 'Paste your VT API key here',
+                helperText: 'Free key supports 4 requests/min.',
+                border: const OutlineInputBorder(),
+                suffixIcon: IconButton(
+                  icon: Icon(
+                    _vtKeyVisible ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+                  ),
+                  onPressed: () => setState(() => _vtKeyVisible = !_vtKeyVisible),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            SwitchListTile(
+              value: _showBlake,
+              onChanged: (v) => setState(() => _showBlake = v),
+              title: const Text('Show Blake3 Hash'),
+              subtitle: const Text('Display integrity hash on completed transfers'),
+              contentPadding: EdgeInsets.zero,
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () {
+            final key = _vtController.text.trim();
+            widget.onSave(key.isEmpty ? null : key, _showBlake);
+            Navigator.of(context).pop();
+          },
+          child: const Text('Save'),
         ),
       ],
     );
