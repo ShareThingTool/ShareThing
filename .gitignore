@@ -3,6 +3,7 @@
 *.iml
 *.log
 .vscode/
+.codex
 
 /.dart_tool/
 /.dart_tool_bak/

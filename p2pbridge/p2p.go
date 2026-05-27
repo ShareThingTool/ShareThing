@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -40,14 +42,23 @@ type EventListener interface {
 	OnEvent(eventJson string)
 }
 
+type StartConfig struct {
+	Nickname            string
+	DiscoveryServersRaw string
+	RelayAddrsRaw       string
+	DeviceIP            string
+	Platform            string
+}
+
 var (
-	nodeMu   sync.Mutex
-	node     host.Host
-	nodeKey  crypto.PrivKey
+	nodeMu  sync.Mutex
+	node    host.Host
+	nodeKey crypto.PrivKey
 
 	dataDir      string
 	nodePeerID   string
 	nodeNickname string
+	nodePlatform string
 	cancelFn     context.CancelFunc
 
 	eventListener EventListener
@@ -124,6 +135,10 @@ func SetDataDir(path string) {
 	dataDir = path
 }
 
+func SetPlatform(platform string) {
+	nodePlatform = strings.TrimSpace(platform)
+}
+
 // Start launches the libp2p node.
 //
 // relayAddrs is a semicolon-separated list of relay multiaddresses
@@ -131,6 +146,16 @@ func SetDataDir(path string) {
 // enables AutoRelay (connecting to those relays) and hole punching via
 // DCUtR so it can reach peers behind NAT.
 func Start(nick, discoveryServers, relayAddrs, deviceIP string) error {
+	return StartWithConfig(StartConfig{
+		Nickname:            nick,
+		DiscoveryServersRaw: discoveryServers,
+		RelayAddrsRaw:       relayAddrs,
+		DeviceIP:            deviceIP,
+		Platform:            "android",
+	})
+}
+
+func StartWithConfig(cfg StartConfig) error {
 	nodeMu.Lock()
 	defer nodeMu.Unlock()
 
@@ -138,14 +163,24 @@ func Start(nick, discoveryServers, relayAddrs, deviceIP string) error {
 		return nil
 	}
 
-	nodeNickname = nick
+	nodeNickname = cfg.Nickname
+	nodePlatform = strings.TrimSpace(cfg.Platform)
+	if nodePlatform == "" {
+		nodePlatform = defaultPlatformLabel()
+	}
+	if strings.TrimSpace(dataDir) == "" {
+		dataDir = defaultDataDir(nodePlatform)
+	}
+	if cfg.DeviceIP == "" {
+		cfg.DeviceIP = preferredLocalIPv4()
+	}
 
 	privKey, err := loadOrCreateKey()
 	if err != nil {
 		return fmt.Errorf("identity: %w", err)
 	}
 
-	relayInfos := parseRelayAddrs(relayAddrs)
+	relayInfos := parseRelayAddrs(cfg.RelayAddrsRaw)
 
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
@@ -159,9 +194,9 @@ func Start(nick, discoveryServers, relayAddrs, deviceIP string) error {
 		libp2p.NATPortMap(),
 	}
 
-	if deviceIP != "" {
-		tcpMA, err1 := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", deviceIP, defaultPort))
-		quicMA, err2 := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", deviceIP, defaultPort))
+	if cfg.DeviceIP != "" {
+		tcpMA, err1 := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/tcp/%d", cfg.DeviceIP, defaultPort))
+		quicMA, err2 := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1", cfg.DeviceIP, defaultPort))
 		var announced []multiaddr.Multiaddr
 		if err1 == nil {
 			announced = append(announced, tcpMA)
@@ -207,19 +242,14 @@ func Start(nick, discoveryServers, relayAddrs, deviceIP string) error {
 	go runPeerSweep(ctx)
 	go runLANBroadcast(ctx, h)
 
-	servers := splitServers(discoveryServers)
+	servers := splitServers(cfg.DiscoveryServersRaw)
 	if len(servers) > 0 {
 		go runDiscoveryLoop(ctx, h, servers)
-	}
-
-	var addrs []string
-	for _, a := range h.Addrs() {
-		addrs = append(addrs, fmt.Sprintf("%s/p2p/%s", a, h.ID()))
 	}
 	emitJSON(map[string]interface{}{
 		"type":            "NODE_STARTED",
 		"peerId":          nodePeerID,
-		"listenAddresses": addrs,
+		"listenAddresses": currentListenAddresses(h, cfg.DeviceIP),
 	})
 	return nil
 }
@@ -322,6 +352,7 @@ func AcceptFile(transferID, savePath string) error {
 		return fmt.Errorf("unknown transfer: %s", transferID)
 	}
 	pt.resolve(transferDecision{accepted: true, savePath: savePath})
+	emitTransferUpdate(transferID, "INCOMING", 0, pt.TotalBytes, 0, "IN_PROGRESS", pt.PeerID, pt.Filename, "", "")
 	return nil
 }
 
@@ -566,11 +597,11 @@ func SendText(peerID, text, addrsStr string) error {
 	transferID := newUUID()
 	totalBytes := int64(len([]byte(text)))
 
-	emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "QUEUED", peerID, "<text>", "", "")
+	emitTransferUpdateWithText(transferID, "OUTGOING", 0, totalBytes, 0, "QUEUED", peerID, "<text>", "", "", text)
 
 	go func() {
 		if err := doSendText(h, kp, transferID, text, totalBytes); err != nil {
-			emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "FAILED", peerID, "<text>", err.Error(), "")
+			emitTransferUpdateWithText(transferID, "OUTGOING", 0, totalBytes, 0, "FAILED", peerID, "<text>", err.Error(), "", text)
 		}
 	}()
 	return nil
@@ -619,7 +650,7 @@ func doSendText(h host.Host, kp *knownPeer, transferID, text string, totalBytes 
 		if msg == "" {
 			msg = "rejected"
 		}
-		emitTransferUpdate(transferID, "OUTGOING", 0, totalBytes, 0, "FAILED", kp.PeerID, "<text>", msg, "")
+		emitTransferUpdateWithText(transferID, "OUTGOING", 0, totalBytes, 0, "FAILED", kp.PeerID, "<text>", msg, "", text)
 		return nil
 	}
 
@@ -826,15 +857,12 @@ func runDiscoveryLoop(ctx context.Context, h host.Host, servers []string) {
 }
 
 func registerWithServers(h host.Host, servers []string) {
-	var addrs []string
-	for _, a := range h.Addrs() {
-		addrs = append(addrs, fmt.Sprintf("%s/p2p/%s", a, h.ID()))
-	}
+	addrs := currentListenAddresses(h, preferredLocalIPv4())
 	payload, _ := json.Marshal(discoveryRegisterRequest{
 		PeerID:    h.ID().String(),
 		Nick:      nodeNickname,
 		Addresses: addrs,
-		Platform:  "android",
+		Platform:  nodePlatform,
 	})
 	client := &http.Client{Timeout: 5 * time.Second}
 	for _, s := range servers {
@@ -927,19 +955,39 @@ func sweepPeers() {
 	threshold := time.Duration(peerStaleMillis) * time.Millisecond
 	now := time.Now()
 
-	peersMu.Lock()
-	var stale []string
+	peersMu.RLock()
+	type stalePeer struct {
+		id string
+		kp knownPeer
+	}
+	var stale []stalePeer
 	for id, kp := range knownPeers {
 		if now.Sub(kp.LastSeen) > threshold {
-			stale = append(stale, id)
+			stale = append(stale, stalePeer{id: id, kp: *kp})
 		}
 	}
-	for _, id := range stale {
-		delete(knownPeers, id)
-	}
-	peersMu.Unlock()
+	peersMu.RUnlock()
 
-	for _, id := range stale {
+	var offline []string
+	for _, candidate := range stale {
+		if verifyPeerReachability(&candidate.kp) {
+			peersMu.Lock()
+			if current := knownPeers[candidate.id]; current != nil {
+				current.LastSeen = time.Now()
+			}
+			peersMu.Unlock()
+			continue
+		}
+
+		peersMu.Lock()
+		if current := knownPeers[candidate.id]; current != nil && now.Sub(current.LastSeen) > threshold {
+			delete(knownPeers, candidate.id)
+			offline = append(offline, candidate.id)
+		}
+		peersMu.Unlock()
+	}
+
+	for _, id := range offline {
 		emitJSON(map[string]interface{}{"type": "PEER_OFFLINE", "peerId": id})
 	}
 }
@@ -949,15 +997,17 @@ func upsertPeer(peerID, nickname string, addresses []string) {
 	existing, isNew := knownPeers[peerID], knownPeers[peerID] == nil
 	var oldNickname string
 	var mergedAddrs []string
+	var addressChanged bool
 	if isNew {
 		knownPeers[peerID] = &knownPeer{PeerID: peerID, Nickname: nickname, Addresses: addresses, LastSeen: time.Now()}
 		mergedAddrs = addresses
 	} else {
 		oldNickname = existing.Nickname
 		existing.LastSeen = time.Now()
-		existing.Addresses = mergeAddresses(existing.Addresses, addresses)
+		mergedAddrs = mergeAddresses(existing.Addresses, addresses)
+		addressChanged = !sameStringSlice(existing.Addresses, mergedAddrs)
+		existing.Addresses = mergedAddrs
 		existing.Nickname = nickname
-		mergedAddrs = existing.Addresses
 	}
 	peersMu.Unlock()
 
@@ -974,6 +1024,13 @@ func upsertPeer(peerID, nickname string, addresses []string) {
 				"type":        "PEER_NICKNAME_CHANGED",
 				"peerId":      peerID,
 				"newNickname": nickname,
+			})
+		}
+		if addressChanged {
+			emitJSON(map[string]interface{}{
+				"type":         "PEER_ADDRESSES_CHANGED",
+				"peerId":       peerID,
+				"newAddresses": mergedAddrs,
 			})
 		}
 		emitJSON(map[string]interface{}{
@@ -1016,13 +1073,10 @@ func readControl(r io.Reader, msg *controlMsg) error {
 }
 
 func loadOrCreateKey() (crypto.PrivKey, error) {
-	if dataDir != "" {
-		keyPath := filepath.Join(dataDir, "sharething_identity.key")
+	for _, keyPath := range identityCandidatePaths() {
 		if data, err := os.ReadFile(keyPath); err == nil {
-			if decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(string(data))); err == nil {
-				if key, err := crypto.UnmarshalPrivateKey(decoded); err == nil {
-					return key, nil
-				}
+			if key, ok := decodeStoredPrivateKey(keyPath, data); ok {
+				return key, nil
 			}
 		}
 	}
@@ -1032,16 +1086,7 @@ func loadOrCreateKey() (crypto.PrivKey, error) {
 		return nil, err
 	}
 
-	if dataDir != "" {
-		os.MkdirAll(dataDir, 0700)
-		if b, err := crypto.MarshalPrivateKey(privKey); err == nil {
-			os.WriteFile(
-				filepath.Join(dataDir, "sharething_identity.key"),
-				[]byte(base64.StdEncoding.EncodeToString(b)),
-				0600,
-			)
-		}
-	}
+	persistPrivateKey(privKey)
 	return privKey, nil
 }
 
@@ -1141,7 +1186,7 @@ func mergeAddresses(existing, incoming []string) []string {
 func splitServers(raw string) []string {
 	var result []string
 	for _, s := range strings.Split(raw, ";") {
-		s = strings.TrimSpace(s)
+		s = normalizeDiscoveryServer(s)
 		if s != "" {
 			result = append(result, s)
 		}
@@ -1207,10 +1252,7 @@ func lanMulticastSend(ctx context.Context, h host.Host) {
 	defer ticker.Stop()
 	addr := &net.UDPAddr{IP: net.ParseIP(lanDiscoveryGroup), Port: lanDiscoveryPort}
 	send := func() {
-		var addrs []string
-		for _, a := range h.Addrs() {
-			addrs = append(addrs, fmt.Sprintf("%s/p2p/%s", a, h.ID()))
-		}
+		addrs := currentListenAddresses(h, preferredLocalIPv4())
 		payload, _ := json.Marshal(lanBroadcastMsg{
 			PeerID:    h.ID().String(),
 			Nickname:  nodeNickname,
@@ -1232,4 +1274,256 @@ func lanMulticastSend(ctx context.Context, h host.Host) {
 			send()
 		}
 	}
+}
+
+func currentListenAddresses(h host.Host, deviceIP string) []string {
+	peerID := h.ID().String()
+	seen := map[string]struct{}{}
+	var addrs []string
+
+	appendAddr := func(addr string) {
+		if addr == "" {
+			return
+		}
+		if _, ok := seen[addr]; ok {
+			return
+		}
+		seen[addr] = struct{}{}
+		addrs = append(addrs, addr)
+	}
+
+	for _, addr := range h.Addrs() {
+		appendAddr(fmt.Sprintf("%s/p2p/%s", addr, peerID))
+	}
+
+	advertisedIP := strings.TrimSpace(deviceIP)
+	if advertisedIP == "" {
+		advertisedIP = preferredLocalIPv4()
+	}
+	if advertisedIP != "" {
+		if tcpPort := currentPort(h, "tcp"); tcpPort > 0 {
+			appendAddr(fmt.Sprintf("/ip4/%s/tcp/%d/p2p/%s", advertisedIP, tcpPort, peerID))
+		}
+		if quicPort := currentPort(h, "quic-v1"); quicPort > 0 {
+			appendAddr(fmt.Sprintf("/ip4/%s/udp/%d/quic-v1/p2p/%s", advertisedIP, quicPort, peerID))
+		}
+	}
+
+	sort.Strings(addrs)
+	return addrs
+}
+
+func currentPort(h host.Host, protocol string) int {
+	for _, addr := range h.Addrs() {
+		if protocol == "tcp" {
+			value, err := addr.ValueForProtocol(multiaddr.P_TCP)
+			if err == nil {
+				var port int
+				if _, scanErr := fmt.Sscanf(value, "%d", &port); scanErr == nil {
+					return port
+				}
+			}
+		}
+		if protocol == "quic-v1" {
+			if _, err := addr.ValueForProtocol(multiaddr.P_QUIC_V1); err == nil {
+				value, udpErr := addr.ValueForProtocol(multiaddr.P_UDP)
+				if udpErr == nil {
+					var port int
+					if _, scanErr := fmt.Sscanf(value, "%d", &port); scanErr == nil {
+						return port
+					}
+				}
+			}
+		}
+	}
+	return 0
+}
+
+func verifyPeerReachability(kp *knownPeer) bool {
+	h := node
+	if h == nil {
+		return false
+	}
+	pid, err := peer.Decode(kp.PeerID)
+	if err != nil {
+		return false
+	}
+	addrs := parseDialAddrs(kp.Addresses, pid)
+	if len(addrs) == 0 {
+		addrs = h.Peerstore().Addrs(pid)
+	}
+	if len(addrs) == 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: addrs}) == nil
+}
+
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func decodeStoredPrivateKey(path string, data []byte) (crypto.PrivKey, bool) {
+	trimmed := strings.TrimSpace(string(data))
+	if strings.HasSuffix(path, ".json") {
+		var stored struct {
+			PrivateKey string `json:"privateKey"`
+		}
+		if err := json.Unmarshal(data, &stored); err != nil || strings.TrimSpace(stored.PrivateKey) == "" {
+			return nil, false
+		}
+		trimmed = strings.TrimSpace(stored.PrivateKey)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(trimmed)
+	if err != nil {
+		return nil, false
+	}
+	key, err := crypto.UnmarshalPrivateKey(decoded)
+	if err != nil {
+		return nil, false
+	}
+	return key, true
+}
+
+func persistPrivateKey(privKey crypto.PrivKey) {
+	if strings.TrimSpace(dataDir) == "" {
+		return
+	}
+	if err := os.MkdirAll(dataDir, 0700); err != nil {
+		return
+	}
+	raw, err := crypto.MarshalPrivateKey(privKey)
+	if err != nil {
+		return
+	}
+	encoded := base64.StdEncoding.EncodeToString(raw)
+	_ = os.WriteFile(filepath.Join(dataDir, "sharething_identity.key"), []byte(encoded), 0600)
+	legacyPayload, err := json.Marshal(struct {
+		PrivateKey string `json:"privateKey"`
+	}{PrivateKey: encoded})
+	if err == nil {
+		_ = os.WriteFile(filepath.Join(dataDir, "identity.json"), legacyPayload, 0600)
+	}
+}
+
+func identityCandidatePaths() []string {
+	if strings.TrimSpace(dataDir) == "" {
+		return nil
+	}
+	return []string{
+		filepath.Join(dataDir, "identity.json"),
+		filepath.Join(dataDir, "sharething_identity.key"),
+	}
+}
+
+func normalizeDiscoveryServer(server string) string {
+	trimmed := strings.TrimSpace(strings.TrimSuffix(server, "/"))
+	switch {
+	case strings.HasPrefix(trimmed, "wss://"):
+		return "https://" + strings.TrimPrefix(trimmed, "wss://")
+	case strings.HasPrefix(trimmed, "ws://"):
+		return "http://" + strings.TrimPrefix(trimmed, "ws://")
+	default:
+		return trimmed
+	}
+}
+
+func defaultPlatformLabel() string {
+	switch runtime.GOOS {
+	case "android":
+		return "android"
+	default:
+		return "desktop"
+	}
+}
+
+func defaultDataDir(platform string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return ""
+	}
+	switch platform {
+	case "android":
+		return ""
+	case "desktop":
+		switch runtime.GOOS {
+		case "windows":
+			base := os.Getenv("LOCALAPPDATA")
+			if strings.TrimSpace(base) == "" {
+				base = filepath.Join(home, "AppData", "Local")
+			}
+			return filepath.Join(base, "ShareThing")
+		case "darwin":
+			return filepath.Join(home, "Library", "Application Support", "ShareThing", "data")
+		default:
+			base := os.Getenv("XDG_DATA_HOME")
+			if strings.TrimSpace(base) == "" {
+				base = filepath.Join(home, ".local", "share")
+			}
+			return filepath.Join(base, "sharething")
+		}
+	default:
+		return ""
+	}
+}
+
+func preferredLocalIPv4() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	virtualKeywords := []string{"virtualbox", "vmware", "hyper-v", "vethernet", "vbox", "virtual"}
+	match := func(name string) bool {
+		lower := strings.ToLower(name)
+		for _, keyword := range virtualKeywords {
+			if strings.Contains(lower, keyword) {
+				return true
+			}
+		}
+		return false
+	}
+
+	var fallback string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, addrErr := iface.Addrs()
+		if addrErr != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			var ip net.IP
+			switch value := addr.(type) {
+			case *net.IPNet:
+				ip = value.IP
+			case *net.IPAddr:
+				ip = value.IP
+			}
+			if ip == nil {
+				continue
+			}
+			ip = ip.To4()
+			if ip == nil || ip.IsLoopback() {
+				continue
+			}
+			if !match(iface.Name) && !match(iface.HardwareAddr.String()) {
+				return ip.String()
+			}
+			if fallback == "" {
+				fallback = ip.String()
+			}
+		}
+	}
+	return fallback
 }
