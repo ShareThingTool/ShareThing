@@ -159,7 +159,12 @@ func StartWithConfig(cfg StartConfig) error {
 	nodeMu.Lock()
 	defer nodeMu.Unlock()
 
+	if cfg.DeviceIP == "" {
+		cfg.DeviceIP = preferredLocalIPv4()
+	}
+
 	if node != nil {
+		emitNodeStarted(node, cfg.DeviceIP)
 		return nil
 	}
 
@@ -171,10 +176,6 @@ func StartWithConfig(cfg StartConfig) error {
 	if strings.TrimSpace(dataDir) == "" {
 		dataDir = defaultDataDir(nodePlatform)
 	}
-	if cfg.DeviceIP == "" {
-		cfg.DeviceIP = preferredLocalIPv4()
-	}
-
 	privKey, err := loadOrCreateKey()
 	if err != nil {
 		return fmt.Errorf("identity: %w", err)
@@ -246,11 +247,7 @@ func StartWithConfig(cfg StartConfig) error {
 	if len(servers) > 0 {
 		go runDiscoveryLoop(ctx, h, servers)
 	}
-	emitJSON(map[string]interface{}{
-		"type":            "NODE_STARTED",
-		"peerId":          nodePeerID,
-		"listenAddresses": currentListenAddresses(h, cfg.DeviceIP),
-	})
+	emitNodeStarted(h, cfg.DeviceIP)
 	return nil
 }
 
@@ -270,6 +267,10 @@ func Stop() {
 	peersMu.Lock()
 	knownPeers = map[string]*knownPeer{}
 	peersMu.Unlock()
+
+	pendingMu.Lock()
+	pendingTransfers = map[string]*pendingTransfer{}
+	pendingMu.Unlock()
 
 	emitJSON(map[string]interface{}{"type": "NODE_STOPPED"})
 }
@@ -1101,6 +1102,14 @@ func emitJSON(v map[string]interface{}) {
 	eventListener.OnEvent(string(b))
 }
 
+func emitNodeStarted(h host.Host, deviceIP string) {
+	emitJSON(map[string]interface{}{
+		"type":            "NODE_STARTED",
+		"peerId":          h.ID().String(),
+		"listenAddresses": currentListenAddresses(h, deviceIP),
+	})
+}
+
 func emitTransferUpdate(transferID, direction string, bytesTransferred, totalBytes, speedBps int64, status, peerID, filename, message, blake3Hash string) {
 	emitTransferUpdateWithText(transferID, direction, bytesTransferred, totalBytes, speedBps, status, peerID, filename, message, blake3Hash, "")
 }
@@ -1426,7 +1435,8 @@ func identityCandidatePaths() []string {
 }
 
 func normalizeDiscoveryServer(server string) string {
-	trimmed := strings.TrimSpace(strings.TrimSuffix(server, "/"))
+	trimmed := strings.TrimSpace(server)
+	trimmed = strings.TrimSuffix(trimmed, "/")
 	switch {
 	case strings.HasPrefix(trimmed, "wss://"):
 		return "https://" + strings.TrimPrefix(trimmed, "wss://")

@@ -2,7 +2,10 @@ package p2p
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +17,18 @@ import (
 	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 )
+
+type captureListener struct {
+	events []map[string]any
+}
+
+func (l *captureListener) OnEvent(eventJSON string) {
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(eventJSON), &payload); err != nil {
+		return
+	}
+	l.events = append(l.events, payload)
+}
 
 func newRelayHost(t *testing.T) (host.Host, peer.AddrInfo) {
 	t.Helper()
@@ -66,7 +81,6 @@ func connectToRelay(ctx context.Context, t *testing.T, h host.Host, relayInfo pe
 	return fullAddr
 }
 
-
 func TestRelayHostStart(t *testing.T) {
 	_, info := newRelayHost(t)
 	if info.ID == "" {
@@ -78,7 +92,6 @@ func TestRelayHostStart(t *testing.T) {
 	t.Logf("relay %s @ %v", info.ID, info.Addrs)
 }
 
-
 func TestClientHostWithRelay(t *testing.T) {
 	_, relayInfo := newRelayHost(t)
 	_, clientInfo := newClientHost(t, &relayInfo)
@@ -87,7 +100,6 @@ func TestClientHostWithRelay(t *testing.T) {
 	}
 	t.Logf("client %s", clientInfo.ID)
 }
-
 
 func TestRelayConnectivity(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -207,11 +219,110 @@ func TestParseRelayAddrs(t *testing.T) {
 	}
 }
 
-
 func TestParseRelayAddrsEmpty(t *testing.T) {
 	for _, raw := range []string{"", "   ", ";;;"} {
 		if got := parseRelayAddrs(raw); len(got) != 0 {
 			t.Fatalf("expected 0 for %q, got %d", raw, len(got))
 		}
+	}
+}
+
+func TestStartWithConfigEmitsNodeStartedWhenAlreadyRunning(t *testing.T) {
+	t.Cleanup(func() {
+		SetEventListener(nil)
+		Stop()
+		dataDir = ""
+	})
+
+	listener := &captureListener{}
+	SetEventListener(listener)
+
+	dataDir = t.TempDir()
+	if err := StartWithConfig(StartConfig{
+		Nickname: "alpha",
+		Platform: "desktop",
+		DeviceIP: "127.0.0.1",
+	}); err != nil {
+		t.Fatalf("initial start: %v", err)
+	}
+
+	if err := StartWithConfig(StartConfig{
+		Nickname: "beta",
+		Platform: "desktop",
+		DeviceIP: "127.0.0.1",
+	}); err != nil {
+		t.Fatalf("second start: %v", err)
+	}
+
+	var nodeStarted []map[string]any
+	for _, event := range listener.events {
+		if event["type"] == "NODE_STARTED" {
+			nodeStarted = append(nodeStarted, event)
+		}
+	}
+	if len(nodeStarted) != 2 {
+		t.Fatalf("expected 2 NODE_STARTED events, got %d (%v)", len(nodeStarted), listener.events)
+	}
+
+	firstPeerID, _ := nodeStarted[0]["peerId"].(string)
+	secondPeerID, _ := nodeStarted[1]["peerId"].(string)
+	if firstPeerID == "" || firstPeerID != secondPeerID {
+		t.Fatalf("expected repeated start to report same peer ID, got %q and %q", firstPeerID, secondPeerID)
+	}
+
+	if addrs, ok := nodeStarted[1]["listenAddresses"].([]any); !ok || len(addrs) == 0 {
+		t.Fatalf("expected listen addresses on repeated start, got %T %#v", nodeStarted[1]["listenAddresses"], nodeStarted[1]["listenAddresses"])
+	}
+}
+
+func TestStopClearsPendingTransfers(t *testing.T) {
+	t.Cleanup(func() {
+		pendingMu.Lock()
+		pendingTransfers = map[string]*pendingTransfer{}
+		pendingMu.Unlock()
+	})
+
+	pendingMu.Lock()
+	pendingTransfers = map[string]*pendingTransfer{
+		"test-transfer": {
+			TransferID: "test-transfer",
+			PeerID:     "peer-1",
+			Filename:   "payload.txt",
+			TotalBytes: 7,
+			decision:   make(chan transferDecision, 1),
+			once:       sync.Once{},
+		},
+	}
+	pendingMu.Unlock()
+
+	Stop()
+
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+	if len(pendingTransfers) != 0 {
+		t.Fatalf("expected pending transfers to be cleared on stop, got %d", len(pendingTransfers))
+	}
+}
+
+func TestStartWithConfigNormalizesDiscoveryServers(t *testing.T) {
+	t.Cleanup(func() {
+		Stop()
+		dataDir = ""
+	})
+
+	dataDir = t.TempDir()
+	if err := StartWithConfig(StartConfig{
+		Nickname:            "alpha",
+		Platform:            "desktop",
+		DeviceIP:            "127.0.0.1",
+		DiscoveryServersRaw: " ws://example.test/one/ ; wss://example.test/two/ ; https://example.test/three/ ",
+	}); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	servers := splitServers(" ws://example.test/one/ ; wss://example.test/two/ ; https://example.test/three/ ")
+	joined := strings.Join(servers, ",")
+	if joined != "http://example.test/one,https://example.test/two,https://example.test/three" {
+		t.Fatalf("unexpected normalized servers: %q", joined)
 	}
 }
