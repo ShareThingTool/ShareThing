@@ -9,11 +9,11 @@ ShareThing is a privacy-first peer-to-peer file sharing client split into a Flut
   - stores config and local friend data as JSON files
   - does not perform peer discovery, transport negotiation, or file byte streaming
 - `engine/`
-  - headless Kotlin JVM node for desktop
+  - legacy Kotlin JVM desktop node source
   - communicates with Flutter over newline-delimited JSON on stdin/stdout
 - `p2pbridge/`
-  - Go libp2p bridge for Android
-  - invoked from the Android host layer
+  - Go libp2p implementation used by Android and desktop
+  - exposes the shared node runtime plus a native desktop executable
 
 ## JSON Contract
 
@@ -60,8 +60,8 @@ Client data is stored in platform-appropriate application directories:
 ### Desktop Engine
 
 ```bash
-cd engine
-JAVA_HOME=/usr/lib/jvm/java-21-openjdk ./gradlew :lib:desktopJar :lib:syncDesktopJar --no-daemon
+cd p2pbridge
+./build.sh
 ```
 
 ### Flutter UI
@@ -103,3 +103,12 @@ This produces two files: `p2p.aar` and `p2p-sources.jar`.
 cp p2p.aar ../ui/android/app/libs/
 cp p2p-sources.jar ../ui/android/app/libs/
 ```
+
+## Desktop Packaging
+
+The desktop app now launches a native Go executable from `ui/assets/engine/`.
+Development builds look for `p2pbridge/build/p2p_engine[.exe]` first, then fall back
+to the bundled Flutter asset.
+
+The desktop engine should always be built with `CGO_ENABLED=0` so the resulting binary
+is statically linked and can replace the previous jar-based package cleanly.

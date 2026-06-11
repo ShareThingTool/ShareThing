@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Required for mDNS multicast and LAN broadcast discovery -->
+	<key>com.apple.developer.networking.multicast</key>
+	<true/>
+	<!-- Required for binding to port 4101 -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+	<!-- Required for outbound connections -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- Allows reading current WiFi SSID/BSSID for IP detection -->
+	<key>com.apple.developer.networking.wifi-info</key>
+	<true/>
+	<!-- Allows debugger attachment; harmless in production, useful on jailbreak -->
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>

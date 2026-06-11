@@ -1,8 +1,8 @@
 import 'dart:io';
 import 'dart:ffi';
 import 'package:path/path.dart' as p;
-import 'package:http/http.dart' as http; 
-import 'package:archive/archive_io.dart'; 
+import 'package:http/http.dart' as http;
+import 'package:archive/archive_io.dart';
 
 void main(List<String> args) async {
   final target = args.isNotEmpty ? args[0] : _detectHostTarget();
@@ -12,8 +12,7 @@ void main(List<String> args) async {
   print("\nStarting Build Pipeline for: $target");
   print("------------------------------------------");
 
-  final gradleCmd = await resolveGradle("engine");
-  await run("Building Engine", gradleCmd, ["lib:syncDesktopJar"], dir: "engine");
+  await buildDesktopEngine(target);
 
   final flutterContext = await resolveFlutter("ui");
 
@@ -25,12 +24,15 @@ void main(List<String> args) async {
 
   buildArgs.addAll(["build", platform]);
 
-
   buildArgs.add("--release");
 
-  await run("Building Flutter UI", flutterContext.executable, buildArgs, dir: "ui");
+  await run(
+    "Building Flutter UI",
+    flutterContext.executable,
+    buildArgs,
+    dir: "ui",
+  );
   await injectJRE(target);
-
 
   print("\n------------------------------------------");
   print("Build Complete!");
@@ -62,11 +64,11 @@ class ToolContext {
 }
 
 Future<ToolContext> resolveFlutter(String uiDir) async {
-    final fvmPath = await _which('fvm');
-    if (fvmPath != null) {
-      print("FVM detected. Using: $fvmPath");
-      return ToolContext(fvmPath, ["flutter"]);
-    }
+  final fvmPath = await _which('fvm');
+  if (fvmPath != null) {
+    print("FVM detected. Using: $fvmPath");
+    return ToolContext(fvmPath, ["flutter"]);
+  }
 
   final flutterPath = await _which('flutter');
   if (flutterPath != null) {
@@ -110,18 +112,112 @@ Future<String?> _which(String command) async {
   return null;
 }
 
-/// Generic process runner
-Future<void> run(String label, String cmd, List<String> args, {String? dir}) async {
-  print("\n$label...");
-  
-  final proc = await Process.start(
-    cmd, 
-    args, 
-    workingDirectory: dir, 
-    runInShell: true,
-    environment: Platform.environment, 
+Future<void> buildDesktopEngine(String target) async {
+  print("\nBuilding desktop Go engine...");
+
+  final env = Map<String, String>.from(Platform.environment);
+  final hostGoos = Platform.isMacOS
+      ? 'darwin'
+      : Platform.isWindows
+      ? 'windows'
+      : 'linux';
+  final hostGoarch = Abi.current().toString().toLowerCase().contains('arm')
+      ? 'arm64'
+      : 'amd64';
+
+  final targetParts = target.split('-');
+  final targetGoos = switch (targetParts.first) {
+    'mac' => 'darwin',
+    'windows' => 'windows',
+    _ => 'linux',
+  };
+  final targetGoarch = targetParts.length > 1 && targetParts[1] == 'aarch64'
+      ? 'arm64'
+      : 'amd64';
+
+  env['CGO_ENABLED'] = '0';
+  env['GOOS'] = hostGoos;
+  env['GOARCH'] = hostGoarch;
+  await run(
+    "Building host desktop engine",
+    'go',
+    [
+      'build',
+      '-trimpath',
+      '-ldflags=-s -w',
+      '-o',
+      'build/p2p_engine${Platform.isWindows ? '.exe' : ''}',
+      './cmd/engine',
+    ],
+    dir: 'p2pbridge',
+    environment: env,
   );
-  
+
+  final hostBinary = File(
+    p.join(
+      'p2pbridge',
+      'build',
+      'p2p_engine${Platform.isWindows ? '.exe' : ''}',
+    ),
+  );
+  final hostAsset = File(
+    p.join(
+      'ui',
+      'assets',
+      'engine',
+      'p2p_engine${Platform.isWindows ? '.exe' : ''}',
+    ),
+  );
+  await hostAsset.parent.create(recursive: true);
+  await hostBinary.copy(hostAsset.path);
+
+  if (targetGoos != hostGoos || targetGoarch != hostGoarch) {
+    final targetExt = targetGoos == 'windows' ? '.exe' : '';
+    env['GOOS'] = targetGoos;
+    env['GOARCH'] = targetGoarch;
+    await run(
+      "Building target desktop engine",
+      'go',
+      [
+        'build',
+        '-trimpath',
+        '-ldflags=-s -w',
+        '-o',
+        'build/p2p_engine$targetExt',
+        './cmd/engine',
+      ],
+      dir: 'p2pbridge',
+      environment: env,
+    );
+    final targetBinary = File(
+      p.join('p2pbridge', 'build', 'p2p_engine$targetExt'),
+    );
+    if (targetBinary.path != hostBinary.path) {
+      await targetBinary.copy(
+        p.join('ui', 'assets', 'engine', 'p2p_engine$targetExt'),
+      );
+    }
+  }
+}
+
+/// Generic process runner
+Future<void> run(
+  String label,
+  String cmd,
+  List<String> args, {
+  String? dir,
+  Map<String, String>? environment,
+}) async {
+  print("\n$label...");
+
+  final proc = await Process.start(
+    cmd,
+    args,
+    workingDirectory: dir,
+    runInShell: true,
+    environment: environment ?? Platform.environment,
+  );
+
   stdout.addStream(proc.stdout);
   stderr.addStream(proc.stderr);
 
@@ -136,11 +232,13 @@ Future<void> injectJRE(String target) async {
   final parts = target.split('-');
   final platform = parts[0];
   final arch = parts.length > 1 ? parts[1] : 'x64';
-  
+
   final bundlePath = p.join("ui", "build", platform, arch, "release", "bundle");
   final jreSource = Directory(p.join("vendor", "jres", target));
-  
-  final jreDest = Directory(p.join(bundlePath, "data", "flutter_assets", "assets", "jre"));
+
+  final jreDest = Directory(
+    p.join(bundlePath, "data", "flutter_assets", "assets", "jre"),
+  );
   await jreDest.create(recursive: true);
   await ensureJreExists(target);
 
@@ -148,7 +246,7 @@ Future<void> injectJRE(String target) async {
     print("\nInjecting JRE for $target...");
     if (await jreDest.exists()) await jreDest.delete(recursive: true);
     await _copyDirectory(jreSource, jreDest);
-    
+
     if (!Platform.isWindows) {
       final javaBin = p.join(jreDest.path, 'bin', 'java');
       await Process.run('chmod', ['+x', javaBin]);
@@ -161,18 +259,18 @@ Future<void> injectJRE(String target) async {
 
 Future<void> ensureJreExists(String target) async {
   final jreDir = Directory(p.join("vendor", "jres", target));
-  if(await jreDir.exists()) return;
+  if (await jreDir.exists()) return;
   await jreDir.create(recursive: true);
 
-
   print("JRE for $target not found. Downloading from Adoptium...");
-  
+
   final parts = target.split('-');
-  final os = parts[0];  //linux, windows, macos
-  final arch = parts[1] == 'x64' ? 'x64' : 'aarch64'; 
-  
-  final url = "https://api.adoptium.net/v3/binary/latest/21/ga/$os/$arch/jre/hotspot/normal/eclipse";
-  
+  final os = parts[0]; //linux, windows, macos
+  final arch = parts[1] == 'x64' ? 'x64' : 'aarch64';
+
+  final url =
+      "https://api.adoptium.net/v3/binary/latest/21/ga/$os/$arch/jre/hotspot/normal/eclipse";
+
   final response = await http.get(Uri.parse(url));
   if (response.statusCode != 200) {
     print("Failed to download JRE: ${response.statusCode}");
@@ -188,7 +286,13 @@ Future<void> ensureJreExists(String target) async {
     final archive = ZipDecoder().decodeBytes(bytes);
     extractArchiveToDisk(archive, jreDir.path);
   } else {
-    await Process.run('tar', ['-xzf', tempFile.path, '-C', jreDir.path, '--strip-components=1']);
+    await Process.run('tar', [
+      '-xzf',
+      tempFile.path,
+      '-C',
+      jreDir.path,
+      '--strip-components=1',
+    ]);
   }
 
   await tempFile.delete();

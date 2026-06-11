@@ -11,7 +11,7 @@ import 'app_logger.dart';
 class EngineManager {
   static const _commandChannel = MethodChannel('engine/commands');
   static const _eventChannel = EventChannel('engine/events');
-  static const _desktopJarAsset = 'assets/engine/p2p_engine.jar';
+  static const _desktopEngineBaseAsset = 'assets/engine/p2p_engine';
 
   Process? _engineProcess;
   Completer<void>? _desktopReady;
@@ -19,8 +19,9 @@ class EngineManager {
   final _eventController = StreamController<Map<String, dynamic>>.broadcast();
 
   Stream<Map<String, dynamic>> get updates => _eventController.stream;
+  bool get _isNativePlatform => Platform.isAndroid || Platform.isIOS;
   bool get isAlive =>
-      Platform.isAndroid ? _androidStarted : _engineProcess != null;
+      _isNativePlatform ? _androidStarted : _engineProcess != null;
   bool get supportsFileTransfers => true;
 
   bool _androidStarted = false;
@@ -34,7 +35,7 @@ class EngineManager {
       'engine.start requested platform=${Platform.operatingSystem} '
       'nickname=$nickname discoveryServers=$discoveryServers relayAddrs=$relayAddrs',
     );
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       if (_androidStarted) return;
       await _listenForAndroidEvents();
       final started = _waitForEventTypes({'NODE_STARTED', 'ERROR'});
@@ -65,7 +66,7 @@ class EngineManager {
 
   Future<void> stop() async {
     appLogger.i('engine.stop requested');
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       if (_androidStarted) {
         await _sendAndroidCommand({'type': 'STOP_NODE'});
         _androidStarted = false;
@@ -80,13 +81,11 @@ class EngineManager {
 
     try {
       await _sendDesktopCommand({'type': 'STOP_NODE'});
-    } catch (_) {
-    }
+    } catch (_) {}
 
     try {
       await process.stdin.close();
-    } catch (_) {
-    }
+    } catch (_) {}
 
     try {
       await process.exitCode.timeout(const Duration(seconds: 5));
@@ -94,8 +93,7 @@ class EngineManager {
       process.kill();
       try {
         await process.exitCode.timeout(const Duration(seconds: 2));
-      } catch (_) {
-      }
+      } catch (_) {}
     }
 
     _engineProcess = null;
@@ -118,7 +116,7 @@ class EngineManager {
       'knownAddresses': knownAddresses,
     };
 
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       await _sendAndroidCommand(payload);
       return;
     }
@@ -137,7 +135,7 @@ class EngineManager {
       'savePath': savePath,
     };
 
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       await _sendAndroidCommand(payload);
       return;
     }
@@ -149,7 +147,7 @@ class EngineManager {
     appLogger.i('engine.rejectFile transferId=$transferId');
     final payload = {'type': 'REJECT_FILE', 'transferId': transferId};
 
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       await _sendAndroidCommand(payload);
       return;
     }
@@ -170,7 +168,7 @@ class EngineManager {
       'knownAddresses': knownAddresses,
     };
 
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       await _sendAndroidCommand(payload);
       return;
     }
@@ -179,7 +177,7 @@ class EngineManager {
   }
 
   Future<void> openFileLocation(String path) async {
-    if (!Platform.isAndroid) return;
+    if (!_isNativePlatform) return;
     await _sendAndroidCommand({'type': 'OPEN_FILE_LOCATION', 'path': path});
   }
 
@@ -209,19 +207,11 @@ class EngineManager {
   }
 
   Future<void> _startDesktopProcess() async {
-    final jarPath = await _resolveDesktopJarPath();
-    final javaBin = await _findJava();
-    if (javaBin == null) {
-      throw StateError(
-        Platform.isWindows
-            ? 'Java 17+ was not found. Set JAVA_HOME to your JDK directory or add java.exe to PATH.'
-            : 'Java 17+ was not found. Set JAVA_HOME before starting ShareThing.',
-      );
-    }
+    final binaryPath = await _resolveDesktopEnginePath();
 
     _desktopReady = Completer<void>();
-    _engineProcess = await Process.start(javaBin, ['-jar', jarPath]);
-    appLogger.i('engine.desktop.process.started jarPath=$jarPath');
+    _engineProcess = await Process.start(binaryPath, const []);
+    appLogger.i('engine.desktop.process.started binaryPath=$binaryPath');
 
     _engineProcess!.stdout
         .transform(utf8.decoder)
@@ -304,150 +294,49 @@ class EngineManager {
     }
   }
 
-  Future<String> _resolveDesktopJarPath() async {
-    final developmentJar = File(
+  Future<String> _resolveDesktopEnginePath() async {
+    final executableName = _desktopExecutableName();
+    final developmentBinary = File(
       p.normalize(
         p.join(
           Directory.current.path,
           '..',
-          'engine',
-          'lib',
+          'p2pbridge',
           'build',
-          'libs',
-          'lib-desktop.jar',
+          executableName,
         ),
       ),
     );
 
-    if (await developmentJar.exists()) {
-      return developmentJar.path;
+    if (await developmentBinary.exists()) {
+      return developmentBinary.path;
     }
 
     try {
-      final bytes = await rootBundle.load(_desktopJarAsset);
-      final file = File('${Directory.systemTemp.path}/p2p_engine.jar');
+      final assetPath =
+          '$_desktopEngineBaseAsset${Platform.isWindows ? '.exe' : ''}';
+      final bytes = await rootBundle.load(assetPath);
+      final file = File(
+        p.join(
+          Directory.systemTemp.path,
+          'sharething_engine_${Platform.operatingSystem}${Platform.isWindows ? '.exe' : ''}',
+        ),
+      );
       await file.writeAsBytes(bytes.buffer.asUint8List(), flush: true);
+      if (!Platform.isWindows) {
+        await Process.run('chmod', ['755', file.path]);
+      }
       return file.path;
     } on FlutterError {
       throw StateError(
-        'Desktop engine JAR not found. Build it with `cd ../engine && ./gradlew :lib:desktopJar` '
-        'or `:lib:syncDesktopJar` before starting the desktop app.',
+        'Desktop engine binary not found. Build it with `cd ../p2pbridge && ./build.sh` '
+        'or the project builder before starting the desktop app.',
       );
     }
   }
 
-  Future<String?> _findJava() async {
-    if (Platform.isWindows) {
-      final home = Platform.environment['JAVA_HOME'];
-      if (home != null) {
-        final candidate = p.join(home.trim(), 'bin', 'java.exe');
-        if (await File(candidate).exists()) return candidate;
-      }
-
-      try {
-        final result = await Process.run('where', ['java.exe']);
-        if (result.exitCode == 0) {
-          final candidate =
-              (result.stdout as String).trim().split('\n').first.trim();
-          if (candidate.isNotEmpty) return candidate;
-        }
-      } catch (_) {}
-
-      for (final regKey in [
-        r'HKLM\SOFTWARE\JavaSoft\JDK',
-        r'HKLM\SOFTWARE\Eclipse Adoptium\JDK',
-        r'HKLM\SOFTWARE\Microsoft\JDK',
-        r'HKLM\SOFTWARE\Amazon Corretto\JDK',
-        r'HKLM\SOFTWARE\WOW6432Node\JavaSoft\JDK',
-      ]) {
-        try {
-          final listResult = await Process.run('reg', ['query', regKey]);
-          if (listResult.exitCode != 0) continue;
-          for (final line in (listResult.stdout as String).split('\n')) {
-            final subkey = line.trim();
-            if (!subkey.toUpperCase().startsWith('HKEY')) continue;
-            final homeResult =
-                await Process.run('reg', ['query', subkey, '/v', 'JavaHome']);
-            if (homeResult.exitCode != 0) continue;
-            final match = RegExp(r'JavaHome\s+REG_SZ\s+(.+)')
-                .firstMatch(homeResult.stdout as String);
-            if (match == null) continue;
-            final candidate =
-                p.join(match.group(1)!.trim(), 'bin', 'java.exe');
-            if (await File(candidate).exists()) return candidate;
-          }
-        } catch (_) {}
-      }
-
-      final bases = <String>[
-        Platform.environment['ProgramFiles'] ?? r'C:\Program Files',
-        Platform.environment['ProgramFiles(x86)'] ?? r'C:\Program Files (x86)',
-      ];
-      const vendors = [
-        'Java', 'Eclipse Adoptium', 'Microsoft', 'Amazon Corretto',
-        'BellSoft', 'Azul Systems',
-      ];
-      for (final base in bases) {
-        for (final vendor in vendors) {
-          final vendorDir = Directory(p.join(base, vendor));
-          if (!await vendorDir.exists()) continue;
-          await for (final entity in vendorDir.list()) {
-            if (entity is! Directory) continue;
-            final candidate = p.join(entity.path, 'bin', 'java.exe');
-            if (await File(candidate).exists()) return candidate;
-          }
-        }
-      }
-
-      final userHome = Platform.environment['USERPROFILE'];
-      if (userHome != null) {
-        for (final jdkRoot in [
-          p.join(userHome, '.jdks'),
-          p.join(userHome, '.gradle', 'jdks'),
-        ]) {
-          final dir = Directory(jdkRoot);
-          if (!await dir.exists()) continue;
-          await for (final entity in dir.list()) {
-            if (entity is! Directory) continue;
-            final candidate = p.join(entity.path, 'bin', 'java.exe');
-            if (await File(candidate).exists()) return candidate;
-          }
-        }
-      }
-
-      return null;
-    }
-
-    try {
-      final execDir = File(Platform.resolvedExecutable).parent.path;
-      final bundled = File(
-        p.join(execDir, 'data', 'flutter_assets', 'assets', 'jre', 'bin', 'java'),
-      );
-      if (await bundled.exists()) return bundled.path;
-    } catch (_) {}
-
-    final home = Platform.environment['JAVA_HOME'];
-    if (home != null) {
-      final candidate = p.join(home.trim(), 'bin', 'java');
-      if (await File(candidate).exists()) return candidate;
-    }
-
-    if (Platform.isMacOS) {
-      try {
-        final result = await Process.run('/usr/libexec/java_home', ['-v', '17']);
-        final resolvedHome = (result.stdout as String).trim();
-        if (resolvedHome.isNotEmpty) {
-          return p.join(resolvedHome, 'bin', 'java');
-        }
-      } catch (_) {}
-    }
-
-    try {
-      final result = await Process.run('which', ['java']);
-      final candidate = (result.stdout as String).trim();
-      if (candidate.isNotEmpty) return candidate;
-    } catch (_) {}
-
-    return null;
+  String _desktopExecutableName() {
+    if (Platform.isWindows) return 'p2p_engine.exe';
+    return 'p2p_engine';
   }
 }

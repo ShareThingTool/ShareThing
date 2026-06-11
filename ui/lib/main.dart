@@ -50,6 +50,7 @@ class ShareThingApp extends StatefulWidget {
 }
 
 class _ShareThingAppState extends State<ShareThingApp> {
+  ThemeMode _themeMode = ThemeMode.system;
   AppLifecycleListener? _appLifecycleListener;
   StreamSubscription<ProcessSignal>? _sigtermSubscription;
   StreamSubscription<ProcessSignal>? _sigintSubscription;
@@ -107,12 +108,21 @@ class _ShareThingAppState extends State<ShareThingApp> {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueGrey),
         useMaterial3: true,
       ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.blueGrey,
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+      ),
+      themeMode: _themeMode,
       home: MyHomePage(
         engine: widget.engine,
         friendsRepository: widget.friendsRepository,
         settingsRepository: widget.settingsRepository,
         transferHistoryRepository: widget.transferHistoryRepository,
         storagePaths: widget.storagePaths,
+        onThemeModeChanged: (mode) => setState(() => _themeMode = mode),
       ),
     );
   }
@@ -155,6 +165,7 @@ class MyHomePage extends StatefulWidget {
     required this.settingsRepository,
     required this.transferHistoryRepository,
     required this.storagePaths,
+    required this.onThemeModeChanged,
   });
 
   final EngineManager engine;
@@ -162,6 +173,7 @@ class MyHomePage extends StatefulWidget {
   final SettingsRepository settingsRepository;
   final TransferHistoryRepository transferHistoryRepository;
   final AppStoragePaths storagePaths;
+  final void Function(ThemeMode) onThemeModeChanged;
 
   @override
   State<MyHomePage> createState() => _MyHomePageState();
@@ -229,6 +241,7 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _settings = settings;
     });
+    widget.onThemeModeChanged(settings.themeMode);
   }
 
   Future<void> _saveSettings(AppSettings settings) async {
@@ -237,6 +250,7 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _settings = settings;
     });
+    widget.onThemeModeChanged(settings.themeMode);
 
     if (_running) {
       await _restartEngine();
@@ -281,6 +295,9 @@ class _MyHomePageState extends State<MyHomePage> {
       await widget.engine.start(
         nickname: _settings.nickname,
         discoveryServers: const [],
+        relayAddrs: _settings.relayAddress != null
+            ? [_settings.relayAddress!]
+            : const [],
       );
 
       if (!mounted) return;
@@ -507,6 +524,17 @@ class _MyHomePageState extends State<MyHomePage> {
         });
         if (terminal) _pendingSavePaths.remove(transferId);
         unawaited(_saveTransferHistory());
+
+        if (status == FileTransferStatus.completed &&
+            direction == FileTransferDirection.incoming &&
+            updated.textContent != null &&
+            updated.textContent!.isNotEmpty &&
+            existing?.status != FileTransferStatus.completed) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
+            unawaited(_showReceivedTextDialog(updated.textContent!, updated.peerLabel));
+          });
+        }
         break;
       case 'ERROR':
         setState(() {
@@ -736,6 +764,23 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _acceptIncomingRequest(IncomingFileRequest request) async {
+    if (request.fileName == '<text>') {
+      setState(() { _busy = true; _errorMessage = null; });
+      try {
+        await widget.engine.acceptFile(
+          transferId: request.transferId,
+          savePath: '',
+        );
+      } catch (error) {
+        appLogger.e('ui.acceptIncoming.text.failed', error: error);
+        if (!mounted) return;
+        setState(() { _errorMessage = '$error'; });
+      } finally {
+        if (mounted) setState(() { _busy = false; });
+      }
+      return;
+    }
+
     final String? savePath;
     if (Platform.isAndroid) {
       final dir = Directory('/storage/emulated/0/Download');
@@ -973,8 +1018,15 @@ class _MyHomePageState extends State<MyHomePage> {
       builder: (ctx) => _SettingsPopup(
         initialVtKey: _settings.virusTotalApiKey,
         showBlakeHash: _settings.showBlakeHash,
-        onSave: (vtKey, showBlake) => _saveSettings(
-          _settings.copyWith(virusTotalApiKey: vtKey, showBlakeHash: showBlake),
+        initialRelayAddress: _settings.relayAddress,
+        initialThemeMode: _settings.themeMode,
+        onSave: (vtKey, showBlake, relay, themeMode) => _saveSettings(
+          _settings.copyWith(
+            virusTotalApiKey: vtKey,
+            showBlakeHash: showBlake,
+            relayAddress: relay,
+            themeMode: themeMode,
+          ),
         ),
       ),
     );
@@ -997,6 +1049,14 @@ class _MyHomePageState extends State<MyHomePage> {
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(const SnackBar(content: Text('Peer ID copied')));
+  }
+
+  Future<void> _showReceivedTextDialog(String text, String from) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => _ReceivedTextDialog(text: text, from: from),
+    );
   }
 
   Widget _buildPresenceChip(BuildContext context, _FriendPresence presence) {
@@ -1364,6 +1424,7 @@ class _MyHomePageState extends State<MyHomePage> {
     BuildContext context,
     IncomingFileRequest request,
   ) {
+    final isText = request.fileName == '<text>';
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -1373,14 +1434,27 @@ class _MyHomePageState extends State<MyHomePage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            request.fileName,
-            style: Theme.of(context).textTheme.titleMedium,
+          Row(
+            children: [
+              Icon(
+                isText ? Icons.text_snippet_outlined : Icons.insert_drive_file_outlined,
+                size: 18,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  isText ? 'Text message' : request.fileName,
+                  style: Theme.of(context).textTheme.titleMedium,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: 8),
           Text('From: ${_friendLabel(request.peerId) ?? request.peerId}'),
           const SizedBox(height: 8),
-          Text('Size: ${request.totalBytes} bytes'),
+          if (!isText) Text('Size: ${request.totalBytes} bytes'),
           const SizedBox(height: 12),
           Wrap(
             spacing: 8,
@@ -1991,6 +2065,7 @@ class _FriendEditorDialog extends StatefulWidget {
 class _FriendEditorDialogState extends State<_FriendEditorDialog> {
   late final TextEditingController _peerIdController;
   late final TextEditingController _nicknameController;
+  late final TextEditingController _addressController;
   String? _validationError;
 
   @override
@@ -2002,13 +2077,26 @@ class _FriendEditorDialogState extends State<_FriendEditorDialog> {
     _nicknameController = TextEditingController(
       text: widget.initialFriend?.nickname ?? widget.discoveredPeer?.nickname ?? '',
     );
+    final existingAddresses = widget.initialFriend?.addresses ?? widget.discoveredPeer?.addresses ?? const [];
+    _addressController = TextEditingController(
+      text: existingAddresses.join('\n'),
+    );
   }
 
   @override
   void dispose() {
     _peerIdController.dispose();
     _nicknameController.dispose();
+    _addressController.dispose();
     super.dispose();
+  }
+
+  List<String> _parseAddresses() {
+    return _addressController.text
+        .split('\n')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList(growable: false);
   }
 
   @override
@@ -2033,6 +2121,18 @@ class _FriendEditorDialogState extends State<_FriendEditorDialog> {
               controller: _nicknameController,
               decoration: const InputDecoration(
                 labelText: 'Nickname',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _addressController,
+              maxLines: 3,
+              minLines: 1,
+              decoration: const InputDecoration(
+                labelText: 'Addresses (optional)',
+                hintText: '/ip4/10.0.2.2/tcp/4101/p2p/12D3...',
+                helperText: 'One multiaddr per line. Needed when peer is not auto-discovered.',
                 border: OutlineInputBorder(),
               ),
             ),
@@ -2063,7 +2163,7 @@ class _FriendEditorDialogState extends State<_FriendEditorDialog> {
             Navigator.of(context).pop(FriendEntry(
               peerId: peerId,
               nickname: nickname,
-              addresses: widget.initialFriend?.addresses ?? widget.discoveredPeer?.addresses ?? const [],
+              addresses: _parseAddresses(),
             ));
           },
           child: Text(isEditing ? 'Save' : 'Add'),
@@ -2122,16 +2222,61 @@ class _SendTextDialogState extends State<_SendTextDialog> {
   }
 }
 
+class _ReceivedTextDialog extends StatelessWidget {
+  const _ReceivedTextDialog({required this.text, required this.from});
+
+  final String text;
+  final String from;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Text from $from'),
+      content: SizedBox(
+        width: 480,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 360),
+          child: SingleChildScrollView(
+            child: SelectableText(text),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+        FilledButton.icon(
+          onPressed: () async {
+            await Clipboard.setData(ClipboardData(text: text));
+            if (!context.mounted) return;
+            Navigator.of(context).pop();
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Copied to clipboard')),
+            );
+          },
+          icon: const Icon(Icons.copy_outlined),
+          label: const Text('Copy to Clipboard'),
+        ),
+      ],
+    );
+  }
+}
+
 class _SettingsPopup extends StatefulWidget {
   const _SettingsPopup({
     required this.initialVtKey,
     required this.showBlakeHash,
+    required this.initialRelayAddress,
+    required this.initialThemeMode,
     required this.onSave,
   });
 
   final String? initialVtKey;
   final bool showBlakeHash;
-  final void Function(String? vtKey, bool showBlake) onSave;
+  final String? initialRelayAddress;
+  final ThemeMode initialThemeMode;
+  final void Function(String? vtKey, bool showBlake, String? relayAddress, ThemeMode themeMode) onSave;
 
   @override
   State<_SettingsPopup> createState() => _SettingsPopupState();
@@ -2139,19 +2284,24 @@ class _SettingsPopup extends StatefulWidget {
 
 class _SettingsPopupState extends State<_SettingsPopup> {
   late final TextEditingController _vtController;
+  late final TextEditingController _relayController;
   late bool _showBlake;
+  late ThemeMode _themeMode;
   bool _vtKeyVisible = false;
 
   @override
   void initState() {
     super.initState();
     _vtController = TextEditingController(text: widget.initialVtKey ?? '');
+    _relayController = TextEditingController(text: widget.initialRelayAddress ?? '');
     _showBlake = widget.showBlakeHash;
+    _themeMode = widget.initialThemeMode;
   }
 
   @override
   void dispose() {
     _vtController.dispose();
+    _relayController.dispose();
     super.dispose();
   }
 
@@ -2165,6 +2315,24 @@ class _SettingsPopupState extends State<_SettingsPopup> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            Row(
+              children: [
+                const Text('Theme'),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: SegmentedButton<ThemeMode>(
+                    segments: const [
+                      ButtonSegment(value: ThemeMode.system, label: Text('System'), icon: Icon(Icons.brightness_auto_outlined)),
+                      ButtonSegment(value: ThemeMode.light, label: Text('Light'), icon: Icon(Icons.light_mode_outlined)),
+                      ButtonSegment(value: ThemeMode.dark, label: Text('Dark'), icon: Icon(Icons.dark_mode_outlined)),
+                    ],
+                    selected: {_themeMode},
+                    onSelectionChanged: (s) => setState(() => _themeMode = s.first),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
             TextField(
               controller: _vtController,
               obscureText: !_vtKeyVisible,
@@ -2179,6 +2347,16 @@ class _SettingsPopupState extends State<_SettingsPopup> {
                   ),
                   onPressed: () => setState(() => _vtKeyVisible = !_vtKeyVisible),
                 ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _relayController,
+              decoration: const InputDecoration(
+                labelText: 'Relay Address (optional)',
+                hintText: '/ip4/1.2.3.4/tcp/4100/p2p/12D3...',
+                helperText: 'Required for cross-network transfers. Restart node after changing.',
+                border: OutlineInputBorder(),
               ),
             ),
             const SizedBox(height: 8),
@@ -2200,7 +2378,13 @@ class _SettingsPopupState extends State<_SettingsPopup> {
         FilledButton(
           onPressed: () {
             final key = _vtController.text.trim();
-            widget.onSave(key.isEmpty ? null : key, _showBlake);
+            final relay = _relayController.text.trim();
+            widget.onSave(
+              key.isEmpty ? null : key,
+              _showBlake,
+              relay.isEmpty ? null : relay,
+              _themeMode,
+            );
             Navigator.of(context).pop();
           },
           child: const Text('Save'),
