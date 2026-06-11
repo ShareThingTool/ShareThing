@@ -25,6 +25,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
 	"github.com/multiformats/go-multiaddr"
 	"lukechampine.com/blake3"
 )
@@ -54,6 +55,7 @@ var (
 	nodeMu  sync.Mutex
 	node    host.Host
 	nodeKey crypto.PrivKey
+	nodeDHT *dht.IpfsDHT
 
 	dataDir      string
 	nodePeerID   string
@@ -214,6 +216,8 @@ func StartWithConfig(cfg StartConfig) error {
 
 	if len(relayInfos) > 0 {
 		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(relayInfos))
+	} else {
+		opts = append(opts, libp2p.EnableAutoRelayWithPeerSource(bootstrapRelaySource))
 	}
 
 	h, err := libp2p.New(opts...)
@@ -239,6 +243,12 @@ func StartWithConfig(cfg StartConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancelFn = cancel
 
+	if d, dhtErr := dht.New(ctx, h, dht.Mode(dht.ModeAuto)); dhtErr == nil {
+		nodeDHT = d
+		_ = d.Bootstrap(ctx)
+		go connectBootstrapPeers(ctx, h)
+	}
+
 	go startMDNS(ctx, h)
 	go runPeerSweep(ctx)
 	go runLANBroadcast(ctx, h)
@@ -258,6 +268,10 @@ func Stop() {
 	if cancelFn != nil {
 		cancelFn()
 		cancelFn = nil
+	}
+	if nodeDHT != nil {
+		nodeDHT.Close()
+		nodeDHT = nil
 	}
 	if node != nil {
 		node.Close()
@@ -281,49 +295,9 @@ func SendFile(peerID, filePath, addrsStr string) error {
 		return fmt.Errorf("node not running")
 	}
 
-	peersMu.RLock()
-	kp := knownPeers[peerID]
-	peersMu.RUnlock()
-
-	if kp == nil {
-		pid, err := peer.Decode(peerID)
-		if err != nil {
-			return fmt.Errorf("unknown peer: %s", peerID)
-		}
-
-		addrs := h.Peerstore().Addrs(pid)
-		if len(addrs) == 0 && addrsStr != "" {
-			for _, s := range strings.Split(addrsStr, ";") {
-				s = strings.TrimSpace(s)
-				if s == "" {
-					continue
-				}
-				ma, err := multiaddr.NewMultiaddr(s)
-				if err == nil {
-					addrs = append(addrs, ma)
-				}
-			}
-		}
-
-		if len(addrs) == 0 {
-			return fmt.Errorf("unknown peer: %s", peerID)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: addrs}); err != nil {
-			return fmt.Errorf("could not connect to peer: %w", err)
-		}
-
-		var addrStrs []string
-		for _, a := range addrs {
-			addrStrs = append(addrStrs, fmt.Sprintf("%s/p2p/%s", a, peerID))
-		}
-		upsertPeer(peerID, peerID, addrStrs)
-
-		peersMu.RLock()
-		kp = knownPeers[peerID]
-		peersMu.RUnlock()
+	kp, err := resolvePeer(h, peerID, addrsStr)
+	if err != nil {
+		return err
 	}
 
 	info, err := os.Stat(filePath)
@@ -388,6 +362,103 @@ func ExportPrivateKey() string {
 		return ""
 	}
 	return base64.StdEncoding.EncodeToString(b)
+}
+
+func resolvePeer(h host.Host, peerID, addrsStr string) (*knownPeer, error) {
+	peersMu.RLock()
+	kp := knownPeers[peerID]
+	peersMu.RUnlock()
+	if kp != nil {
+		return kp, nil
+	}
+
+	pid, err := peer.Decode(peerID)
+	if err != nil {
+		return nil, fmt.Errorf("invalid peer id: %s", peerID)
+	}
+
+	addrs := h.Peerstore().Addrs(pid)
+	if len(addrs) == 0 && addrsStr != "" {
+		for _, s := range strings.Split(addrsStr, ";") {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			if ma, maErr := multiaddr.NewMultiaddr(s); maErr == nil {
+				addrs = append(addrs, ma)
+			}
+		}
+	}
+
+	if len(addrs) == 0 {
+		if d := nodeDHT; d != nil {
+			findCtx, findCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			info, dhtErr := d.FindPeer(findCtx, pid)
+			findCancel()
+			if dhtErr == nil {
+				addrs = info.Addrs
+			}
+		}
+	}
+
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("peer not found: %s", peerID)
+	}
+
+	connectCtx, connectCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	connectErr := h.Connect(connectCtx, peer.AddrInfo{ID: pid, Addrs: addrs})
+	connectCancel()
+	if connectErr != nil {
+		return nil, fmt.Errorf("could not connect to peer: %w", connectErr)
+	}
+
+	var addrStrs []string
+	for _, a := range addrs {
+		addrStrs = append(addrStrs, fmt.Sprintf("%s/p2p/%s", a, peerID))
+	}
+	upsertPeer(peerID, peerID, addrStrs)
+
+	peersMu.RLock()
+	kp = knownPeers[peerID]
+	peersMu.RUnlock()
+	return kp, nil
+}
+
+func connectBootstrapPeers(ctx context.Context, h host.Host) {
+	var wg sync.WaitGroup
+	for _, maddr := range dht.DefaultBootstrapPeers {
+		info, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			continue
+		}
+		wg.Add(1)
+		go func(pi peer.AddrInfo) {
+			defer wg.Done()
+			dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			defer cancel()
+			_ = h.Connect(dialCtx, pi)
+		}(*info)
+	}
+	wg.Wait()
+}
+
+func bootstrapRelaySource(ctx context.Context, num int) <-chan peer.AddrInfo {
+	ch := make(chan peer.AddrInfo, num)
+	go func() {
+		defer close(ch)
+		for _, maddr := range dht.DefaultBootstrapPeers {
+			info, err := peer.AddrInfoFromP2pAddr(maddr)
+			if err != nil || len(info.Addrs) == 0 {
+				continue
+			}
+			select {
+			case ch <- *info:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
 }
 
 func doSendFile(h host.Host, kp *knownPeer, transferID, filePath, filename string, totalBytes int64) error {
@@ -550,49 +621,9 @@ func SendText(peerID, text, addrsStr string) error {
 		return fmt.Errorf("node not running")
 	}
 
-	peersMu.RLock()
-	kp := knownPeers[peerID]
-	peersMu.RUnlock()
-
-	if kp == nil {
-		pid, err := peer.Decode(peerID)
-		if err != nil {
-			return fmt.Errorf("unknown peer: %s", peerID)
-		}
-
-		addrs := h.Peerstore().Addrs(pid)
-		if len(addrs) == 0 && addrsStr != "" {
-			for _, s := range strings.Split(addrsStr, ";") {
-				s = strings.TrimSpace(s)
-				if s == "" {
-					continue
-				}
-				ma, err := multiaddr.NewMultiaddr(s)
-				if err == nil {
-					addrs = append(addrs, ma)
-				}
-			}
-		}
-
-		if len(addrs) == 0 {
-			return fmt.Errorf("unknown peer: %s", peerID)
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := h.Connect(ctx, peer.AddrInfo{ID: pid, Addrs: addrs}); err != nil {
-			return fmt.Errorf("could not connect to peer: %w", err)
-		}
-
-		var addrStrs []string
-		for _, a := range addrs {
-			addrStrs = append(addrStrs, fmt.Sprintf("%s/p2p/%s", a, peerID))
-		}
-		upsertPeer(peerID, peerID, addrStrs)
-
-		peersMu.RLock()
-		kp = knownPeers[peerID]
-		peersMu.RUnlock()
+	kp, err := resolvePeer(h, peerID, addrsStr)
+	if err != nil {
+		return err
 	}
 
 	transferID := newUUID()

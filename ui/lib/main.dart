@@ -507,6 +507,17 @@ class _MyHomePageState extends State<MyHomePage> {
         });
         if (terminal) _pendingSavePaths.remove(transferId);
         unawaited(_saveTransferHistory());
+
+        if (status == FileTransferStatus.completed &&
+            direction == FileTransferDirection.incoming &&
+            updated.textContent != null &&
+            updated.textContent!.isNotEmpty &&
+            existing?.status != FileTransferStatus.completed) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (!mounted) return;
+            unawaited(_showReceivedTextDialog(updated.textContent!, updated.peerLabel));
+          });
+        }
         break;
       case 'ERROR':
         setState(() {
@@ -997,6 +1008,14 @@ class _MyHomePageState extends State<MyHomePage> {
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(const SnackBar(content: Text('Peer ID copied')));
+  }
+
+  Future<void> _showReceivedTextDialog(String text, String from) async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => _ReceivedTextDialog(text: text, from: from),
+    );
   }
 
   Widget _buildPresenceChip(BuildContext context, _FriendPresence presence) {
@@ -1991,6 +2010,7 @@ class _FriendEditorDialog extends StatefulWidget {
 class _FriendEditorDialogState extends State<_FriendEditorDialog> {
   late final TextEditingController _peerIdController;
   late final TextEditingController _nicknameController;
+  late final TextEditingController _addressController;
   String? _validationError;
 
   @override
@@ -2002,13 +2022,26 @@ class _FriendEditorDialogState extends State<_FriendEditorDialog> {
     _nicknameController = TextEditingController(
       text: widget.initialFriend?.nickname ?? widget.discoveredPeer?.nickname ?? '',
     );
+    final existingAddresses = widget.initialFriend?.addresses ?? widget.discoveredPeer?.addresses ?? const [];
+    _addressController = TextEditingController(
+      text: existingAddresses.join('\n'),
+    );
   }
 
   @override
   void dispose() {
     _peerIdController.dispose();
     _nicknameController.dispose();
+    _addressController.dispose();
     super.dispose();
+  }
+
+  List<String> _parseAddresses() {
+    return _addressController.text
+        .split('\n')
+        .map((s) => s.trim())
+        .where((s) => s.isNotEmpty)
+        .toList(growable: false);
   }
 
   @override
@@ -2033,6 +2066,18 @@ class _FriendEditorDialogState extends State<_FriendEditorDialog> {
               controller: _nicknameController,
               decoration: const InputDecoration(
                 labelText: 'Nickname',
+                border: OutlineInputBorder(),
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _addressController,
+              maxLines: 3,
+              minLines: 1,
+              decoration: const InputDecoration(
+                labelText: 'Addresses (optional)',
+                hintText: '/ip4/10.0.2.2/tcp/4101/p2p/12D3...',
+                helperText: 'One multiaddr per line. Needed when peer is not auto-discovered.',
                 border: OutlineInputBorder(),
               ),
             ),
@@ -2063,7 +2108,7 @@ class _FriendEditorDialogState extends State<_FriendEditorDialog> {
             Navigator.of(context).pop(FriendEntry(
               peerId: peerId,
               nickname: nickname,
-              addresses: widget.initialFriend?.addresses ?? widget.discoveredPeer?.addresses ?? const [],
+              addresses: _parseAddresses(),
             ));
           },
           child: Text(isEditing ? 'Save' : 'Add'),
@@ -2116,6 +2161,47 @@ class _SendTextDialogState extends State<_SendTextDialog> {
             Navigator.of(context).pop(text);
           },
           child: const Text('Send'),
+        ),
+      ],
+    );
+  }
+}
+
+class _ReceivedTextDialog extends StatelessWidget {
+  const _ReceivedTextDialog({required this.text, required this.from});
+
+  final String text;
+  final String from;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('Text from $from'),
+      content: SizedBox(
+        width: 480,
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxHeight: 360),
+          child: SingleChildScrollView(
+            child: SelectableText(text),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
+        ),
+        FilledButton.icon(
+          onPressed: () async {
+            await Clipboard.setData(ClipboardData(text: text));
+            if (!context.mounted) return;
+            Navigator.of(context).pop();
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Copied to clipboard')),
+            );
+          },
+          icon: const Icon(Icons.copy_outlined),
+          label: const Text('Copy to Clipboard'),
         ),
       ],
     );
