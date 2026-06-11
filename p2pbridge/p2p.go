@@ -68,6 +68,7 @@ var (
 	nodePlatform string
 	cancelFn     context.CancelFunc
 
+	eventListenerMu sync.RWMutex
 	eventListener EventListener
 
 	peersMu    sync.RWMutex
@@ -136,6 +137,8 @@ type discoveryPeersResponse struct {
 }
 
 func SetEventListener(l EventListener) {
+	eventListenerMu.Lock()
+	defer eventListenerMu.Unlock()
 	eventListener = l
 }
 
@@ -1358,14 +1361,22 @@ func loadOrCreateKey() (crypto.PrivKey, error) {
 }
 
 func emitJSON(v map[string]interface{}) {
-	if eventListener == nil {
+	eventListenerMu.RLock()
+	listener := eventListener
+	eventListenerMu.RUnlock()
+	if listener == nil {
 		return
 	}
 	b, err := json.Marshal(v)
 	if err != nil {
 		return
 	}
-	eventListener.OnEvent(string(b))
+	defer func() {
+		// The mobile bridge aborts the process on uncaught callback panics.
+		// Contain listener failures so late lifecycle events do not crash the app.
+		_ = recover()
+	}()
+	listener.OnEvent(string(b))
 }
 
 func emitNodeStarted(h host.Host, deviceIP string) {

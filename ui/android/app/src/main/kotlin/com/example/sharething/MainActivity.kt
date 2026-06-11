@@ -138,9 +138,9 @@ class MainActivity : FlutterActivity() {
                 Thread {
                     try {
                         P2p.sendFile(targetPeerId, filePath, knownAddresses)
-                        result.success(null)
+                        postResultSuccess(result)
                     } catch (e: Exception) {
-                        result.error("SEND_FILE_FAILED", e.message, null)
+                        postResultError(result, "SEND_FILE_FAILED", e.message)
                     }
                 }.start()
             }
@@ -151,9 +151,9 @@ class MainActivity : FlutterActivity() {
                 Thread {
                     try {
                         P2p.acceptFile(transferId, savePath)
-                        result.success(null)
+                        postResultSuccess(result)
                     } catch (e: Exception) {
-                        result.error("ACCEPT_FILE_FAILED", e.message, null)
+                        postResultError(result, "ACCEPT_FILE_FAILED", e.message)
                     }
                 }.start()
             }
@@ -163,9 +163,9 @@ class MainActivity : FlutterActivity() {
                 Thread {
                     try {
                         P2p.rejectFile(transferId)
-                        result.success(null)
+                        postResultSuccess(result)
                     } catch (e: Exception) {
-                        result.error("REJECT_FILE_FAILED", e.message, null)
+                        postResultError(result, "REJECT_FILE_FAILED", e.message)
                     }
                 }.start()
             }
@@ -180,9 +180,9 @@ class MainActivity : FlutterActivity() {
                 Thread {
                     try {
                         P2p.sendText(targetPeerId, text, knownAddresses)
-                        result.success(null)
+                        postResultSuccess(result)
                     } catch (e: Exception) {
-                        result.error("SEND_TEXT_FAILED", e.message, null)
+                        postResultError(result, "SEND_TEXT_FAILED", e.message)
                     }
                 }.start()
             }
@@ -201,5 +201,17 @@ class MainActivity : FlutterActivity() {
 
             else -> result.error("UNKNOWN_COMMAND", json.optString("type"), null)
         }
+    }
+
+    private fun postResultSuccess(result: MethodChannel.Result) {
+        mainHandler.post { result.success(null) }
+    }
+
+    private fun postResultError(
+        result: MethodChannel.Result,
+        code: String,
+        message: String?
+    ) {
+        mainHandler.post { result.error(code, message, null) }
     }
 }

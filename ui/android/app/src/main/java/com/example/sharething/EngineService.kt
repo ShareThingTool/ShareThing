@@ -105,10 +105,13 @@ class EngineService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        multicastLock?.release()
+        P2p.setEventListener(null)
+        try {
+            multicastLock?.release()
+        } catch (_: Exception) {
+        }
         multicastLock = null
         P2p.stop()
-        P2p.setEventListener(null)
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
