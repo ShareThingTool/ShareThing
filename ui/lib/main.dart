@@ -747,6 +747,23 @@ class _MyHomePageState extends State<MyHomePage> {
   }
 
   Future<void> _acceptIncomingRequest(IncomingFileRequest request) async {
+    if (request.fileName == '<text>') {
+      setState(() { _busy = true; _errorMessage = null; });
+      try {
+        await widget.engine.acceptFile(
+          transferId: request.transferId,
+          savePath: '',
+        );
+      } catch (error) {
+        appLogger.e('ui.acceptIncoming.text.failed', error: error);
+        if (!mounted) return;
+        setState(() { _errorMessage = '$error'; });
+      } finally {
+        if (mounted) setState(() { _busy = false; });
+      }
+      return;
+    }
+
     final String? savePath;
     if (Platform.isAndroid) {
       final dir = Directory('/storage/emulated/0/Download');
@@ -1383,6 +1400,7 @@ class _MyHomePageState extends State<MyHomePage> {
     BuildContext context,
     IncomingFileRequest request,
   ) {
+    final isText = request.fileName == '<text>';
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
@@ -1392,14 +1410,27 @@ class _MyHomePageState extends State<MyHomePage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            request.fileName,
-            style: Theme.of(context).textTheme.titleMedium,
+          Row(
+            children: [
+              Icon(
+                isText ? Icons.text_snippet_outlined : Icons.insert_drive_file_outlined,
+                size: 18,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  isText ? 'Text message' : request.fileName,
+                  style: Theme.of(context).textTheme.titleMedium,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
           ),
           const SizedBox(height: 8),
           Text('From: ${_friendLabel(request.peerId) ?? request.peerId}'),
           const SizedBox(height: 8),
-          Text('Size: ${request.totalBytes} bytes'),
+          if (!isText) Text('Size: ${request.totalBytes} bytes'),
           const SizedBox(height: 12),
           Wrap(
             spacing: 8,
