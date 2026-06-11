@@ -503,6 +503,29 @@ func bootstrapRelaySource(ctx context.Context, num int) <-chan peer.AddrInfo {
 	ch := make(chan peer.AddrInfo, num)
 	go func() {
 		defer close(ch)
+
+		// Prefer DHT relay discovery — finds nodes in the IPFS network that
+		// actually advertise circuit relay v2 HOP support.
+		if d := nodeDHT; d != nil {
+			rd := drouting.NewRoutingDiscovery(d)
+			findCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			if peerChan, err := rd.FindPeers(findCtx, "/libp2p/relay"); err == nil {
+				for p := range peerChan {
+					if len(p.Addrs) == 0 {
+						continue
+					}
+					select {
+					case ch <- p:
+					case <-ctx.Done():
+						return
+					}
+				}
+				return
+			}
+		}
+
+		// Fallback: bootstrap nodes (may or may not support HOP).
 		for _, maddr := range dht.DefaultBootstrapPeers {
 			info, err := peer.AddrInfoFromP2pAddr(maddr)
 			if err != nil || len(info.Addrs) == 0 {
