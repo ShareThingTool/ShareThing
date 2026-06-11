@@ -445,23 +445,33 @@ func runDHTDiscovery(ctx context.Context, h host.Host, d *dht.IpfsDHT, addrUpdat
 	}
 
 	rd := drouting.NewRoutingDiscovery(d)
+	fmt.Fprintf(os.Stderr, "[dht] advertising at rendezvous, network peers: %d\n", len(h.Network().Peers()))
 	dutil.Advertise(ctx, rd, dhtRendezvous)
 
 	scan := func() {
+		fmt.Fprintf(os.Stderr, "[dht] scanning rendezvous, network peers: %d\n", len(h.Network().Peers()))
 		peerChan, err := rd.FindPeers(ctx, dhtRendezvous)
 		if err != nil {
+			fmt.Fprintf(os.Stderr, "[dht] FindPeers error: %v\n", err)
 			return
 		}
+		found := 0
 		for p := range peerChan {
 			if p.ID.String() == nodePeerID || len(p.Addrs) == 0 {
 				continue
 			}
+			found++
+			fmt.Fprintf(os.Stderr, "[dht] found peer %s addrs=%v\n", p.ID, p.Addrs)
 			dialCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			if err := h.Connect(dialCtx, p); err == nil {
+				fmt.Fprintf(os.Stderr, "[dht] connected to %s\n", p.ID)
 				go sayHello(h, p.ID.String())
+			} else {
+				fmt.Fprintf(os.Stderr, "[dht] connect FAIL %s: %v\n", p.ID, err)
 			}
 			cancel()
 		}
+		fmt.Fprintf(os.Stderr, "[dht] scan done, found %d peers at rendezvous\n", found)
 	}
 
 	scan()
@@ -472,7 +482,7 @@ func runDHTDiscovery(ctx context.Context, h host.Host, d *dht.IpfsDHT, addrUpdat
 		case <-ctx.Done():
 			return
 		case <-addrUpdated:
-			// Relay address added — re-advertise immediately so peers find us.
+			fmt.Fprintf(os.Stderr, "[dht] addresses updated, re-advertising\n")
 			dutil.Advertise(ctx, rd, dhtRendezvous)
 		case <-ticker.C:
 			dutil.Advertise(ctx, rd, dhtRendezvous)
@@ -493,10 +503,15 @@ func connectBootstrapPeers(ctx context.Context, h host.Host) {
 			defer wg.Done()
 			dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 			defer cancel()
-			_ = h.Connect(dialCtx, pi)
+			if err := h.Connect(dialCtx, pi); err != nil {
+				fmt.Fprintf(os.Stderr, "[dht] bootstrap connect FAIL %s: %v\n", pi.ID, err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[dht] bootstrap connect OK  %s\n", pi.ID)
+			}
 		}(*info)
 	}
 	wg.Wait()
+	fmt.Fprintf(os.Stderr, "[dht] bootstrap done, peers connected: %d\n", len(h.Network().Peers()))
 }
 
 func bootstrapRelaySource(ctx context.Context, num int) <-chan peer.AddrInfo {
@@ -504,28 +519,29 @@ func bootstrapRelaySource(ctx context.Context, num int) <-chan peer.AddrInfo {
 	go func() {
 		defer close(ch)
 
-		// Prefer DHT relay discovery — finds nodes in the IPFS network that
-		// actually advertise circuit relay v2 HOP support.
-		if d := nodeDHT; d != nil {
-			rd := drouting.NewRoutingDiscovery(d)
-			findCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			if peerChan, err := rd.FindPeers(findCtx, "/libp2p/relay"); err == nil {
-				for p := range peerChan {
-					if len(p.Addrs) == 0 {
-						continue
-					}
-					select {
-					case ch <- p:
-					case <-ctx.Done():
-						return
-					}
+		// Use all currently connected peers as relay candidates — with 40+
+		// DHT peers connected, several will support circuit relay v2 HOP.
+		if h := node; h != nil {
+			peers := h.Network().Peers()
+			fmt.Fprintf(os.Stderr, "[relay] peer source called, offering %d connected peers\n", len(peers))
+			for _, pid := range peers {
+				addrs := h.Peerstore().Addrs(pid)
+				if len(addrs) == 0 {
+					continue
 				}
+				select {
+				case ch <- peer.AddrInfo{ID: pid, Addrs: addrs}:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if len(peers) > 0 {
 				return
 			}
 		}
 
-		// Fallback: bootstrap nodes (may or may not support HOP).
+		// Fallback when not yet connected: bootstrap nodes.
+		fmt.Fprintf(os.Stderr, "[relay] peer source fallback: using bootstrap nodes\n")
 		for _, maddr := range dht.DefaultBootstrapPeers {
 			info, err := peer.AddrInfoFromP2pAddr(maddr)
 			if err != nil || len(info.Addrs) == 0 {
@@ -980,9 +996,14 @@ func watchAddressChanges(ctx context.Context, h host.Host, deviceIP string, addr
 		select {
 		case <-ctx.Done():
 			return
-		case _, ok := <-sub.Out():
+		case evt, ok := <-sub.Out():
 			if !ok {
 				return
+			}
+			if update, ok2 := evt.(event.EvtLocalAddressesUpdated); ok2 {
+				for _, a := range update.Current {
+					fmt.Fprintf(os.Stderr, "[addr] new address: %s\n", a.Address)
+				}
 			}
 			emitNodeStarted(h, deviceIP)
 			select {
