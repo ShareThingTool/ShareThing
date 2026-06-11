@@ -1,30 +1,73 @@
-// This is a basic Flutter widget test.
-//
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+import 'dart:async';
 
-import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:sharething/core/engine_manager.dart';
+import 'package:sharething/features/file_transfer/file_transfer_entry.dart';
+import 'package:sharething/features/friends/friend.dart';
+import 'package:sharething/features/friends/friends_repository.dart';
+import 'package:sharething/features/settings/app_settings.dart';
+import 'package:sharething/features/settings/settings_repository.dart';
+import 'package:sharething/features/file_transfer/transfer_history_repository.dart';
 import 'package:sharething/main.dart';
 
+class FakeEngineManager extends EngineManager {
+  final _controller = StreamController<Map<String, dynamic>>.broadcast();
+
+  @override
+  Stream<Map<String, dynamic>> get updates => _controller.stream;
+
+  @override
+  Future<void> start({
+    required String nickname,
+    required List<String> discoveryServers,
+    List<String> relayAddrs = const [],
+  }) async {}
+
+  @override
+  Future<void> stop() async {}
+}
+
+class FakeFriendsRepository implements FriendsRepository {
+  @override
+  Future<List<FriendEntry>> loadFriends() async => const [];
+
+  @override
+  Future<void> saveFriends(List<FriendEntry> friends) async {}
+}
+
+class FakeSettingsRepository implements SettingsRepository {
+  @override
+  Future<AppSettings> loadSettings() async => AppSettings.defaults();
+
+  @override
+  Future<void> saveSettings(AppSettings settings) async {}
+}
+
+class FakeTransferHistoryRepository implements TransferHistoryRepository {
+  @override
+  Future<List<FileTransferEntry>> loadHistory() async => const [];
+
+  @override
+  Future<void> saveHistory(List<FileTransferEntry> entries) async {}
+}
+
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  testWidgets('ShareThing home page renders identity card', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(
+      ShareThingApp(
+        engine: FakeEngineManager(),
+        friendsRepository: FakeFriendsRepository(),
+        settingsRepository: FakeSettingsRepository(),
+        transferHistoryRepository: FakeTransferHistoryRepository(),
+      ),
+    );
+    await tester.pumpAndSettle();
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
-
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
-
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+    expect(find.text('ShareThing'), findsOneWidget);
+    expect(find.text('Copy Peer ID'), findsOneWidget);
+    expect(find.text('Friends'), findsOneWidget);
   });
 }

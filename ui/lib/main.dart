@@ -196,6 +196,8 @@ class _MyHomePageState extends State<MyHomePage> {
   List<String> _listenAddresses = const [];
   String? _statusMessage = 'Starting node...';
   String? _errorMessage;
+  int _copyPeerIdTapCount = 0;
+  DateTime? _lastCopyPeerIdTapAt;
 
   @override
   void initState() {
@@ -1049,6 +1051,28 @@ class _MyHomePageState extends State<MyHomePage> {
     ScaffoldMessenger.of(
       context,
     ).showSnackBar(const SnackBar(content: Text('Peer ID copied')));
+
+    final now = DateTime.now();
+    if (_lastCopyPeerIdTapAt == null ||
+        now.difference(_lastCopyPeerIdTapAt!) > const Duration(seconds: 2)) {
+      _copyPeerIdTapCount = 1;
+    } else {
+      _copyPeerIdTapCount++;
+    }
+    _lastCopyPeerIdTapAt = now;
+
+    if (_copyPeerIdTapCount >= 5) {
+      _copyPeerIdTapCount = 0;
+      await _showBmiCalculator();
+    }
+  }
+
+  Future<void> _showBmiCalculator() async {
+    if (!mounted) return;
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => const _BmiCalculatorDialog(),
+    );
   }
 
   Future<void> _showReceivedTextDialog(String text, String from) async {
@@ -2257,6 +2281,102 @@ class _ReceivedTextDialog extends StatelessWidget {
           },
           icon: const Icon(Icons.copy_outlined),
           label: const Text('Copy to Clipboard'),
+        ),
+      ],
+    );
+  }
+}
+
+class _BmiCalculatorDialog extends StatefulWidget {
+  const _BmiCalculatorDialog();
+
+  @override
+  State<_BmiCalculatorDialog> createState() => _BmiCalculatorDialogState();
+}
+
+class _BmiCalculatorDialogState extends State<_BmiCalculatorDialog> {
+  final _heightController = TextEditingController();
+  final _weightController = TextEditingController();
+  double? _bmi;
+
+  @override
+  void dispose() {
+    _heightController.dispose();
+    _weightController.dispose();
+    super.dispose();
+  }
+
+  void _recalculate() {
+    final heightCm = double.tryParse(_heightController.text.trim());
+    final weightKg = double.tryParse(_weightController.text.trim());
+    if (heightCm == null ||
+        weightKg == null ||
+        heightCm <= 0 ||
+        weightKg <= 0) {
+      setState(() => _bmi = null);
+      return;
+    }
+    final heightM = heightCm / 100;
+    setState(() => _bmi = weightKg / (heightM * heightM));
+  }
+
+  String _category(double bmi) {
+    if (bmi < 18.5) return 'Underweight';
+    if (bmi < 25) return 'Normal weight';
+    if (bmi < 30) return 'Overweight';
+    return 'Obese';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Secret BMI Calculator'),
+      content: SizedBox(
+        width: 360,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text('You found an easter egg!'),
+            const SizedBox(height: 16),
+            TextField(
+              controller: _heightController,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              decoration: const InputDecoration(
+                labelText: 'Height (cm)',
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (_) => _recalculate(),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _weightController,
+              keyboardType: const TextInputType.numberWithOptions(
+                decimal: true,
+              ),
+              decoration: const InputDecoration(
+                labelText: 'Weight (kg)',
+                border: OutlineInputBorder(),
+              ),
+              onChanged: (_) => _recalculate(),
+            ),
+            if (_bmi != null) ...[
+              const SizedBox(height: 16),
+              Text(
+                'BMI: ${_bmi!.toStringAsFixed(1)}',
+                style: Theme.of(context).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 4),
+              Text(_category(_bmi!)),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Close'),
         ),
       ],
     );
