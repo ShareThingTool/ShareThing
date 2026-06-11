@@ -21,6 +21,7 @@ import (
 
 	libp2p "github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/crypto"
+	"github.com/libp2p/go-libp2p/core/event"
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
@@ -249,13 +250,16 @@ func StartWithConfig(cfg StartConfig) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancelFn = cancel
 
+	addrUpdated := make(chan struct{}, 1)
+
 	if d, dhtErr := dht.New(ctx, h, dht.Mode(dht.ModeAuto)); dhtErr == nil {
 		nodeDHT = d
 		_ = d.Bootstrap(ctx)
 		go connectBootstrapPeers(ctx, h)
-		go runDHTDiscovery(ctx, h, d)
+		go runDHTDiscovery(ctx, h, d, addrUpdated)
 	}
 
+	go watchAddressChanges(ctx, h, cfg.DeviceIP, addrUpdated)
 	go startMDNS(ctx, h)
 	go runPeerSweep(ctx)
 	go runLANBroadcast(ctx, h)
@@ -432,7 +436,7 @@ func resolvePeer(h host.Host, peerID, addrsStr string) (*knownPeer, error) {
 	return kp, nil
 }
 
-func runDHTDiscovery(ctx context.Context, h host.Host, d *dht.IpfsDHT) {
+func runDHTDiscovery(ctx context.Context, h host.Host, d *dht.IpfsDHT, addrUpdated <-chan struct{}) {
 	// Give bootstrap connections time to establish before advertising.
 	select {
 	case <-time.After(5 * time.Second):
@@ -467,6 +471,9 @@ func runDHTDiscovery(ctx context.Context, h host.Host, d *dht.IpfsDHT) {
 		select {
 		case <-ctx.Done():
 			return
+		case <-addrUpdated:
+			// Relay address added — re-advertise immediately so peers find us.
+			dutil.Advertise(ctx, rd, dhtRendezvous)
 		case <-ticker.C:
 			dutil.Advertise(ctx, rd, dhtRendezvous)
 			scan()
@@ -938,6 +945,29 @@ func receiveFile(stream network.Stream, transferID, peerID, filename string, tot
 	boolTrue := true
 	writeControl(stream, controlMsg{Type: "COMPLETION", TransferID: transferID, Completed: &boolTrue, Blake3Hash: receivedHash})
 	emitTransferUpdate(transferID, "INCOMING", received, totalBytes, 0, "COMPLETED", peerID, filename, "", receivedHash)
+}
+
+func watchAddressChanges(ctx context.Context, h host.Host, deviceIP string, addrUpdated chan<- struct{}) {
+	sub, err := h.EventBus().Subscribe(new(event.EvtLocalAddressesUpdated))
+	if err != nil {
+		return
+	}
+	defer sub.Close()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case _, ok := <-sub.Out():
+			if !ok {
+				return
+			}
+			emitNodeStarted(h, deviceIP)
+			select {
+			case addrUpdated <- struct{}{}:
+			default:
+			}
+		}
+	}
 }
 
 func handleHelloStream(stream network.Stream) {
