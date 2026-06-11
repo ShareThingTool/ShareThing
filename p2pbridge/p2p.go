@@ -27,6 +27,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/discovery/mdns"
 	dht "github.com/libp2p/go-libp2p-kad-dht"
+	circuitclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	drouting "github.com/libp2p/go-libp2p/p2p/discovery/routing"
 	dutil "github.com/libp2p/go-libp2p/p2p/discovery/util"
 	"github.com/multiformats/go-multiaddr"
@@ -69,7 +70,10 @@ var (
 	cancelFn     context.CancelFunc
 
 	eventListenerMu sync.RWMutex
-	eventListener EventListener
+	eventListener   EventListener
+
+	relayMu          sync.RWMutex
+	configuredRelays []peer.AddrInfo
 
 	peersMu    sync.RWMutex
 	knownPeers = map[string]*knownPeer{}
@@ -193,6 +197,7 @@ func StartWithConfig(cfg StartConfig) error {
 	}
 
 	relayInfos := parseRelayAddrs(cfg.RelayAddrsRaw)
+	setConfiguredRelays(relayInfos)
 
 	opts := []libp2p.Option{
 		libp2p.Identity(privKey),
@@ -263,6 +268,7 @@ func StartWithConfig(cfg StartConfig) error {
 	}
 
 	go watchAddressChanges(ctx, h, cfg.DeviceIP, addrUpdated)
+	go runRelayReservations(ctx, h, relayInfos, cfg.DeviceIP, addrUpdated)
 	go startMDNS(ctx, h)
 	go runPeerSweep(ctx)
 	go runLANBroadcast(ctx, h)
@@ -299,6 +305,8 @@ func Stop() {
 	pendingMu.Lock()
 	pendingTransfers = map[string]*pendingTransfer{}
 	pendingMu.Unlock()
+
+	setConfiguredRelays(nil)
 
 	emitJSON(map[string]interface{}{"type": "NODE_STOPPED"})
 }
@@ -558,6 +566,51 @@ func bootstrapRelaySource(ctx context.Context, num int) <-chan peer.AddrInfo {
 		}
 	}()
 	return ch
+}
+
+func runRelayReservations(ctx context.Context, h host.Host, relayInfos []peer.AddrInfo, deviceIP string, addrUpdated chan<- struct{}) {
+	if len(relayInfos) == 0 {
+		return
+	}
+
+	reserved := make(map[peer.ID]bool, len(relayInfos))
+	reserveAll := func() {
+		for _, relayInfo := range relayInfos {
+			attemptCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+			err := h.Connect(attemptCtx, relayInfo)
+			if err == nil {
+				_, err = circuitclient.Reserve(attemptCtx, h, relayInfo)
+			}
+			cancel()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[relay] reserve FAIL %s: %v\n", relayInfo.ID, err)
+				continue
+			}
+			if reserved[relayInfo.ID] {
+				continue
+			}
+			reserved[relayInfo.ID] = true
+			fmt.Fprintf(os.Stderr, "[relay] reserve OK   %s\n", relayInfo.ID)
+			emitNodeStarted(h, deviceIP)
+			select {
+			case addrUpdated <- struct{}{}:
+			default:
+			}
+		}
+	}
+
+	reserveAll()
+
+	ticker := time.NewTicker(90 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			reserveAll()
+		}
+	}
 }
 
 func doSendFile(h host.Host, kp *knownPeer, transferID, filePath, filename string, totalBytes int64) error {
@@ -1425,6 +1478,7 @@ func calcSpeed(bytes int64, start time.Time) int64 {
 
 func parseRelayAddrs(raw string) []peer.AddrInfo {
 	var result []peer.AddrInfo
+	seen := make(map[string]struct{})
 	for _, s := range strings.Split(raw, ";") {
 		s = strings.TrimSpace(s)
 		if s == "" {
@@ -1434,7 +1488,39 @@ func parseRelayAddrs(raw string) []peer.AddrInfo {
 		if err != nil {
 			continue
 		}
+		if _, ok := seen[info.ID.String()]; ok {
+			continue
+		}
+		seen[info.ID.String()] = struct{}{}
 		result = append(result, *info)
+	}
+	return result
+}
+
+func setConfiguredRelays(relayInfos []peer.AddrInfo) {
+	relayMu.Lock()
+	defer relayMu.Unlock()
+
+	configuredRelays = make([]peer.AddrInfo, len(relayInfos))
+	for i, info := range relayInfos {
+		configuredRelays[i] = peer.AddrInfo{
+			ID:    info.ID,
+			Addrs: append([]multiaddr.Multiaddr(nil), info.Addrs...),
+		}
+	}
+}
+
+func relayCircuitAddresses(peerID string) []string {
+	relayMu.RLock()
+	relayInfos := make([]peer.AddrInfo, len(configuredRelays))
+	copy(relayInfos, configuredRelays)
+	relayMu.RUnlock()
+
+	var result []string
+	for _, relayInfo := range relayInfos {
+		for _, relayAddr := range relayInfo.Addrs {
+			result = append(result, fmt.Sprintf("%s/p2p/%s/p2p-circuit/p2p/%s", relayAddr, relayInfo.ID, peerID))
+		}
 	}
 	return result
 }
@@ -1580,6 +1666,9 @@ func currentListenAddresses(h host.Host, deviceIP string) []string {
 
 	for _, addr := range h.Addrs() {
 		appendAddr(fmt.Sprintf("%s/p2p/%s", addr, peerID))
+	}
+	for _, relayAddr := range relayCircuitAddresses(peerID) {
+		appendAddr(relayAddr)
 	}
 
 	advertisedIP := strings.TrimSpace(deviceIP)
