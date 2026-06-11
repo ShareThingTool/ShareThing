@@ -19,8 +19,9 @@ class EngineManager {
   final _eventController = StreamController<Map<String, dynamic>>.broadcast();
 
   Stream<Map<String, dynamic>> get updates => _eventController.stream;
+  bool get _isNativePlatform => Platform.isAndroid || Platform.isIOS;
   bool get isAlive =>
-      Platform.isAndroid ? _androidStarted : _engineProcess != null;
+      _isNativePlatform ? _androidStarted : _engineProcess != null;
   bool get supportsFileTransfers => true;
 
   bool _androidStarted = false;
@@ -34,7 +35,7 @@ class EngineManager {
       'engine.start requested platform=${Platform.operatingSystem} '
       'nickname=$nickname discoveryServers=$discoveryServers relayAddrs=$relayAddrs',
     );
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       if (_androidStarted) return;
       await _listenForAndroidEvents();
       final started = _waitForEventTypes({'NODE_STARTED', 'ERROR'});
@@ -65,7 +66,7 @@ class EngineManager {
 
   Future<void> stop() async {
     appLogger.i('engine.stop requested');
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       if (_androidStarted) {
         await _sendAndroidCommand({'type': 'STOP_NODE'});
         _androidStarted = false;
@@ -115,7 +116,7 @@ class EngineManager {
       'knownAddresses': knownAddresses,
     };
 
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       await _sendAndroidCommand(payload);
       return;
     }
@@ -134,7 +135,7 @@ class EngineManager {
       'savePath': savePath,
     };
 
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       await _sendAndroidCommand(payload);
       return;
     }
@@ -146,7 +147,7 @@ class EngineManager {
     appLogger.i('engine.rejectFile transferId=$transferId');
     final payload = {'type': 'REJECT_FILE', 'transferId': transferId};
 
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       await _sendAndroidCommand(payload);
       return;
     }
@@ -167,7 +168,7 @@ class EngineManager {
       'knownAddresses': knownAddresses,
     };
 
-    if (Platform.isAndroid) {
+    if (_isNativePlatform) {
       await _sendAndroidCommand(payload);
       return;
     }
@@ -176,7 +177,7 @@ class EngineManager {
   }
 
   Future<void> openFileLocation(String path) async {
-    if (!Platform.isAndroid) return;
+    if (!_isNativePlatform) return;
     await _sendAndroidCommand({'type': 'OPEN_FILE_LOCATION', 'path': path});
   }
 

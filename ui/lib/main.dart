@@ -50,6 +50,7 @@ class ShareThingApp extends StatefulWidget {
 }
 
 class _ShareThingAppState extends State<ShareThingApp> {
+  ThemeMode _themeMode = ThemeMode.system;
   AppLifecycleListener? _appLifecycleListener;
   StreamSubscription<ProcessSignal>? _sigtermSubscription;
   StreamSubscription<ProcessSignal>? _sigintSubscription;
@@ -107,12 +108,21 @@ class _ShareThingAppState extends State<ShareThingApp> {
         colorScheme: ColorScheme.fromSeed(seedColor: Colors.blueGrey),
         useMaterial3: true,
       ),
+      darkTheme: ThemeData(
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.blueGrey,
+          brightness: Brightness.dark,
+        ),
+        useMaterial3: true,
+      ),
+      themeMode: _themeMode,
       home: MyHomePage(
         engine: widget.engine,
         friendsRepository: widget.friendsRepository,
         settingsRepository: widget.settingsRepository,
         transferHistoryRepository: widget.transferHistoryRepository,
         storagePaths: widget.storagePaths,
+        onThemeModeChanged: (mode) => setState(() => _themeMode = mode),
       ),
     );
   }
@@ -155,6 +165,7 @@ class MyHomePage extends StatefulWidget {
     required this.settingsRepository,
     required this.transferHistoryRepository,
     required this.storagePaths,
+    required this.onThemeModeChanged,
   });
 
   final EngineManager engine;
@@ -162,6 +173,7 @@ class MyHomePage extends StatefulWidget {
   final SettingsRepository settingsRepository;
   final TransferHistoryRepository transferHistoryRepository;
   final AppStoragePaths storagePaths;
+  final void Function(ThemeMode) onThemeModeChanged;
 
   @override
   State<MyHomePage> createState() => _MyHomePageState();
@@ -229,6 +241,7 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _settings = settings;
     });
+    widget.onThemeModeChanged(settings.themeMode);
   }
 
   Future<void> _saveSettings(AppSettings settings) async {
@@ -237,6 +250,7 @@ class _MyHomePageState extends State<MyHomePage> {
     setState(() {
       _settings = settings;
     });
+    widget.onThemeModeChanged(settings.themeMode);
 
     if (_running) {
       await _restartEngine();
@@ -281,6 +295,9 @@ class _MyHomePageState extends State<MyHomePage> {
       await widget.engine.start(
         nickname: _settings.nickname,
         discoveryServers: const [],
+        relayAddrs: _settings.relayAddress != null
+            ? [_settings.relayAddress!]
+            : const [],
       );
 
       if (!mounted) return;
@@ -1001,8 +1018,15 @@ class _MyHomePageState extends State<MyHomePage> {
       builder: (ctx) => _SettingsPopup(
         initialVtKey: _settings.virusTotalApiKey,
         showBlakeHash: _settings.showBlakeHash,
-        onSave: (vtKey, showBlake) => _saveSettings(
-          _settings.copyWith(virusTotalApiKey: vtKey, showBlakeHash: showBlake),
+        initialRelayAddress: _settings.relayAddress,
+        initialThemeMode: _settings.themeMode,
+        onSave: (vtKey, showBlake, relay, themeMode) => _saveSettings(
+          _settings.copyWith(
+            virusTotalApiKey: vtKey,
+            showBlakeHash: showBlake,
+            relayAddress: relay,
+            themeMode: themeMode,
+          ),
         ),
       ),
     );
@@ -2243,12 +2267,16 @@ class _SettingsPopup extends StatefulWidget {
   const _SettingsPopup({
     required this.initialVtKey,
     required this.showBlakeHash,
+    required this.initialRelayAddress,
+    required this.initialThemeMode,
     required this.onSave,
   });
 
   final String? initialVtKey;
   final bool showBlakeHash;
-  final void Function(String? vtKey, bool showBlake) onSave;
+  final String? initialRelayAddress;
+  final ThemeMode initialThemeMode;
+  final void Function(String? vtKey, bool showBlake, String? relayAddress, ThemeMode themeMode) onSave;
 
   @override
   State<_SettingsPopup> createState() => _SettingsPopupState();
@@ -2256,19 +2284,24 @@ class _SettingsPopup extends StatefulWidget {
 
 class _SettingsPopupState extends State<_SettingsPopup> {
   late final TextEditingController _vtController;
+  late final TextEditingController _relayController;
   late bool _showBlake;
+  late ThemeMode _themeMode;
   bool _vtKeyVisible = false;
 
   @override
   void initState() {
     super.initState();
     _vtController = TextEditingController(text: widget.initialVtKey ?? '');
+    _relayController = TextEditingController(text: widget.initialRelayAddress ?? '');
     _showBlake = widget.showBlakeHash;
+    _themeMode = widget.initialThemeMode;
   }
 
   @override
   void dispose() {
     _vtController.dispose();
+    _relayController.dispose();
     super.dispose();
   }
 
@@ -2282,6 +2315,24 @@ class _SettingsPopupState extends State<_SettingsPopup> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            Row(
+              children: [
+                const Text('Theme'),
+                const SizedBox(width: 16),
+                Expanded(
+                  child: SegmentedButton<ThemeMode>(
+                    segments: const [
+                      ButtonSegment(value: ThemeMode.system, label: Text('System'), icon: Icon(Icons.brightness_auto_outlined)),
+                      ButtonSegment(value: ThemeMode.light, label: Text('Light'), icon: Icon(Icons.light_mode_outlined)),
+                      ButtonSegment(value: ThemeMode.dark, label: Text('Dark'), icon: Icon(Icons.dark_mode_outlined)),
+                    ],
+                    selected: {_themeMode},
+                    onSelectionChanged: (s) => setState(() => _themeMode = s.first),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
             TextField(
               controller: _vtController,
               obscureText: !_vtKeyVisible,
@@ -2296,6 +2347,16 @@ class _SettingsPopupState extends State<_SettingsPopup> {
                   ),
                   onPressed: () => setState(() => _vtKeyVisible = !_vtKeyVisible),
                 ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _relayController,
+              decoration: const InputDecoration(
+                labelText: 'Relay Address (optional)',
+                hintText: '/ip4/1.2.3.4/tcp/4100/p2p/12D3...',
+                helperText: 'Required for cross-network transfers. Restart node after changing.',
+                border: OutlineInputBorder(),
               ),
             ),
             const SizedBox(height: 8),
@@ -2317,7 +2378,13 @@ class _SettingsPopupState extends State<_SettingsPopup> {
         FilledButton(
           onPressed: () {
             final key = _vtController.text.trim();
-            widget.onSave(key.isEmpty ? null : key, _showBlake);
+            final relay = _relayController.text.trim();
+            widget.onSave(
+              key.isEmpty ? null : key,
+              _showBlake,
+              relay.isEmpty ? null : relay,
+              _themeMode,
+            );
             Navigator.of(context).pop();
           },
           child: const Text('Save'),
